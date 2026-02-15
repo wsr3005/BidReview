@@ -532,3 +532,104 @@ def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterabl
             )
         )
     return findings
+
+
+def _is_mappable_location(location: object) -> bool:
+    if not isinstance(location, dict):
+        return False
+    block_index = location.get("block_index")
+    page = location.get("page")
+    return (isinstance(block_index, int) and block_index > 0) or (isinstance(page, int) and page > 0)
+
+
+def enforce_evidence_quality_gate(
+    requirements: Iterable[Requirement],
+    findings: Iterable[Finding],
+    *,
+    min_excerpt_len: int = 20,
+) -> list[Finding]:
+    """Apply a minimal "evidence must be usable" gate.
+
+    Goals (R5):
+    - Avoid producing pass/risk conclusions that only cite directory-like references (reference_only),
+      or otherwise lack usable evidence excerpts/locations.
+    - Make downgrades traceable in decision_trace.
+    """
+
+    req_map = {req.requirement_id: req for req in requirements}
+    updated: list[Finding] = []
+
+    for finding in findings:
+        requirement = req_map.get(finding.requirement_id)
+        mandatory = bool(getattr(requirement, "mandatory", False))
+
+        evidence = finding.evidence if isinstance(finding.evidence, list) else []
+
+        def _excerpt_len(item: dict) -> int:
+            return len(str(item.get("excerpt") or "").strip())
+
+        has_mappable = any(_is_mappable_location(item.get("location")) for item in evidence if isinstance(item, dict))
+        has_reference_mappable = any(
+            bool(item.get("reference_only")) and _is_mappable_location(item.get("location"))
+            for item in evidence
+            if isinstance(item, dict)
+        )
+        has_non_reference_mappable = any(
+            (not bool(item.get("reference_only")))
+            and _is_mappable_location(item.get("location"))
+            and _excerpt_len(item) >= min_excerpt_len
+            for item in evidence
+            if isinstance(item, dict)
+        )
+
+        downgraded_to: str | None = None
+        downgraded_reason: str | None = None
+
+        if finding.status in {"pass", "risk"}:
+            # If the system claims pass/risk, we must have at least one usable, mappable, non-reference snippet.
+            if not evidence:
+                downgraded_to = "fail" if mandatory else "insufficient_evidence"
+                downgraded_reason = "缺少可定位证据（evidence为空）"
+            elif not has_mappable:
+                downgraded_to = "insufficient_evidence"
+                downgraded_reason = "缺少可定位证据（无page/block_index）"
+            elif not has_non_reference_mappable:
+                # Only reference-like hits (e.g. '见附件/扫描件') should not be treated as pass/risk.
+                if has_reference_mappable:
+                    downgraded_to = "needs_ocr"
+                    downgraded_reason = "仅命中扫描件/附件引用，需OCR复核图像证据"
+                else:
+                    downgraded_to = "insufficient_evidence"
+                    downgraded_reason = "证据摘录过短或不可用，需人工复核"
+
+        if downgraded_to:
+            finding.status = downgraded_to
+            if downgraded_to == "needs_ocr":
+                finding.severity = "medium"
+                finding.reason = downgraded_reason or finding.reason
+            elif downgraded_to == "insufficient_evidence":
+                finding.severity = "high" if mandatory else "medium"
+                finding.reason = downgraded_reason or finding.reason
+            elif downgraded_to == "fail":
+                finding.severity = "high"
+                finding.reason = downgraded_reason or finding.reason
+
+        trace = finding.decision_trace if isinstance(finding.decision_trace, dict) else {}
+        trace["evidence_gate"] = {
+            "min_excerpt_len": min_excerpt_len,
+            "has_mappable": has_mappable,
+            "has_reference_mappable": has_reference_mappable,
+            "has_non_reference_mappable": has_non_reference_mappable,
+            "downgraded_to": downgraded_to,
+            "downgraded_reason": downgraded_reason,
+        }
+        # Keep trace decision in sync when we downgrade after rule/llm steps.
+        trace.setdefault("decision", {})
+        if isinstance(trace.get("decision"), dict):
+            trace["decision"]["status"] = finding.status
+            trace["decision"]["reason"] = finding.reason
+        finding.decision_trace = trace
+
+        updated.append(finding)
+
+    return updated

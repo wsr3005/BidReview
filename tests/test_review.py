@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from bidagent.models import Block, Location, Requirement
-from bidagent.review import extract_requirements, review_requirements
+from bidagent.review import enforce_evidence_quality_gate, extract_requirements, review_requirements
 
 
 class ReviewTests(unittest.TestCase):
@@ -258,6 +258,57 @@ class ReviewTests(unittest.TestCase):
         ]
         findings = review_requirements(requirements, bid_blocks)
         self.assertEqual(findings[0].status, "needs_ocr")
+
+    def test_evidence_gate_downgrades_pass_when_only_reference_evidence(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="提供营业执照扫描件（见附件）",
+                category="资质与证照",
+                mandatory=False,
+                keywords=["营业执照", "扫描件"],
+                source={},
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="营业执照扫描件见附件",
+                location=Location(block_index=1, section="Normal"),
+            )
+        ]
+
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertEqual(findings[0].status, "pass")
+
+        gated = enforce_evidence_quality_gate(requirements=requirements, findings=findings, min_excerpt_len=10)
+        self.assertEqual(gated[0].status, "needs_ocr")
+        trace = gated[0].decision_trace or {}
+        self.assertEqual((trace.get("evidence_gate") or {}).get("downgraded_to"), "needs_ocr")
+
+    def test_evidence_gate_keeps_pass_when_non_reference_evidence_exists(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="提供营业执照复印件",
+                category="资质与证照",
+                mandatory=False,
+                keywords=["营业执照", "复印件"],
+                source={},
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="本公司营业执照复印件如下，统一社会信用代码：9134XXXXXXXXXXXX。",
+                location=Location(block_index=1, section="Normal"),
+            )
+        ]
+
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertEqual(findings[0].status, "pass")
+        gated = enforce_evidence_quality_gate(requirements=requirements, findings=findings, min_excerpt_len=10)
+        self.assertEqual(gated[0].status, "pass")
 
     def test_review_outputs_traceable_clause_and_evidence(self) -> None:
         requirements = [

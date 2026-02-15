@@ -12,7 +12,7 @@ from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, 
 from bidagent.llm import DeepSeekReviewer, apply_llm_review
 from bidagent.models import Block, Location, Requirement
 from bidagent.ocr import iter_document_ocr_blocks
-from bidagent.review import extract_requirements, review_requirements
+from bidagent.review import enforce_evidence_quality_gate, extract_requirements, review_requirements
 
 
 def _row_to_block(row: dict[str, Any]) -> Block:
@@ -187,6 +187,8 @@ def review(
 
     bid_blocks = _iter_blocks_from_jsonl(bid_path)
     findings = review_requirements(requirements=requirements, bid_blocks=bid_blocks)
+    # Apply a first-pass evidence gate to avoid wasting LLM calls on non-actionable findings.
+    findings = enforce_evidence_quality_gate(requirements=requirements, findings=findings)
 
     if ai_provider == "deepseek":
         api_key = _load_api_key(ai_provider, ai_api_key_file)
@@ -201,6 +203,8 @@ def review(
             reviewer=reviewer,
             max_workers=ai_workers,
         )
+        # Re-apply after LLM in case the model upgraded a finding without usable evidence.
+        findings = enforce_evidence_quality_gate(requirements=requirements, findings=findings)
 
     write_jsonl(findings_path, (item.to_dict() for item in findings))
 
