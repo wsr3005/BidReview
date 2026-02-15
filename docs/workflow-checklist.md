@@ -19,6 +19,7 @@ Use this checklist for each task lane.
 ## Before Handoff
 
 Run `.\scripts\verify.ps1` first, then fill gaps manually if needed.
+Optional discipline check: `.\scripts\check-task-cards.ps1` (use `-FailOnUntracked` to enforce).
 
 1. Run lint or static checks.
 2. Run relevant tests.
