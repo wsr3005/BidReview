@@ -62,7 +62,7 @@ class PipelineReviewTests(unittest.TestCase):
                 Finding("R0002", "risk", 1, "medium", "规则判定"),
             ]
 
-            def _fake_apply(requirements, findings, reviewer, max_workers):
+            def _fake_apply(requirements, findings, reviewer, max_workers, **_kwargs):
                 for item in findings:
                     item.llm = {"provider": "deepseek", "model": "deepseek-chat"}
                 return findings

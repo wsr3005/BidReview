@@ -172,6 +172,7 @@ def review(
     ai_api_key_file: Path | None = None,
     ai_base_url: str = "https://api.deepseek.com/v1",
     ai_workers: int = 4,
+    ai_min_confidence: float = 0.65,
 ) -> dict[str, Any]:
     req_path = out_dir / "requirements.jsonl"
     bid_path = out_dir / "ingest" / "bid_blocks.jsonl"
@@ -204,6 +205,7 @@ def review(
             findings=findings,
             reviewer=reviewer,
             max_workers=ai_workers,
+            min_confidence=ai_min_confidence,
         )
         # Re-apply after LLM in case the model upgraded a finding without usable evidence.
         findings = enforce_evidence_quality_gate(requirements=requirements, findings=findings)
@@ -664,6 +666,7 @@ def run_pipeline(
     ai_api_key_file: Path | None = None,
     ai_base_url: str = "https://api.deepseek.com/v1",
     ai_workers: int = 4,
+    ai_min_confidence: float = 0.65,
 ) -> dict[str, Any]:
     ensure_dir(out_dir)
     summary: dict[str, Any] = {}
@@ -684,6 +687,7 @@ def run_pipeline(
         ai_api_key_file=ai_api_key_file,
         ai_base_url=ai_base_url,
         ai_workers=ai_workers,
+        ai_min_confidence=ai_min_confidence,
     )
     downstream_resume = resume and ai_provider is None
     summary["annotate"] = annotate(

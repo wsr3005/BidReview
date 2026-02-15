@@ -42,6 +42,12 @@ def _common_parent() -> argparse.ArgumentParser:
     parent.add_argument("--ai-api-key-file", default=None, help="path to API key text file")
     parent.add_argument("--ai-workers", type=int, default=4, help="parallel workers for LLM review")
     parent.add_argument(
+        "--ai-min-confidence",
+        type=float,
+        default=0.65,
+        help="minimum LLM confidence required for auto-pass; low-confidence pass is downgraded to risk/high",
+    )
+    parent.add_argument(
         "--ai-base-url",
         default="https://api.deepseek.com/v1",
         help="LLM API base url",
@@ -113,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                 ai_api_key_file=ai_api_key_file,
                 ai_base_url=args.ai_base_url,
                 ai_workers=args.ai_workers,
+                ai_min_confidence=args.ai_min_confidence,
             )
         elif args.command == "annotate":
             bid_source = Path(args.bid_source) if getattr(args, "bid_source", None) else None
@@ -135,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                 ai_api_key_file=ai_api_key_file,
                 ai_base_url=args.ai_base_url,
                 ai_workers=args.ai_workers,
+                ai_min_confidence=args.ai_min_confidence,
             )
         else:
             parser.error(f"unsupported command: {args.command}")

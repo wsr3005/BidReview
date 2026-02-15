@@ -156,6 +156,38 @@ class LlmReviewTests(unittest.TestCase):
         self.assertEqual(result[0].severity, "medium")
         self.assertEqual((result[0].llm or {}).get("skipped"), "needs_ocr")
 
+    def test_apply_llm_review_downgrades_low_confidence_pass(self) -> None:
+        class _LowConfidenceReviewer:
+            provider = "deepseek"
+            model = "deepseek-chat"
+
+            def review(self, requirement: Requirement, finding: Finding) -> dict:
+                return {
+                    "status": "pass",
+                    "severity": "none",
+                    "reason": "符合",
+                    "confidence": 0.2,
+                }
+
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="必须提供营业执照",
+                category="资质与证照",
+                mandatory=True,
+                keywords=["营业执照"],
+            )
+        ]
+        findings = [
+            Finding(requirement_id="R0001", status="risk", score=1, severity="medium", reason="待确认"),
+        ]
+
+        result = apply_llm_review(requirements, findings, _LowConfidenceReviewer(), min_confidence=0.65)
+        self.assertEqual(result[0].status, "risk")
+        self.assertEqual(result[0].severity, "high")
+        trace = result[0].decision_trace or {}
+        self.assertEqual((trace.get("low_confidence_fallback") or {}).get("action"), "downgrade_pass_to_risk_high")
+
 
 if __name__ == "__main__":
     unittest.main()

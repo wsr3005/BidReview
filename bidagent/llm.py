@@ -162,6 +162,8 @@ def apply_llm_review(
     findings: list[Finding],
     reviewer: Reviewer,
     max_workers: int = 4,
+    *,
+    min_confidence: float = 0.65,
 ) -> list[Finding]:
     worker_count = max(1, int(max_workers))
     req_map = {item.requirement_id: item for item in requirements}
@@ -204,6 +206,20 @@ def apply_llm_review(
         finding.status = llm_result["status"]
         finding.severity = llm_result["severity"]
         finding.reason = llm_result["reason"] or finding.reason
+        # Low-confidence guardrail: do not allow low-confidence pass to slip through as "ok".
+        if finding.status == "pass" and llm_result["confidence"] < float(min_confidence):
+            previous = {"status": finding.status, "severity": finding.severity, "reason": finding.reason}
+            finding.status = "risk"
+            finding.severity = "high"
+            finding.reason = f"LLM置信度低({llm_result['confidence']:.2f})，需人工复核"
+            trace = finding.decision_trace if isinstance(finding.decision_trace, dict) else {}
+            trace["low_confidence_fallback"] = {
+                "min_confidence": float(min_confidence),
+                "confidence": llm_result["confidence"],
+                "previous": previous,
+                "action": "downgrade_pass_to_risk_high",
+            }
+            finding.decision_trace = trace
         trace = finding.decision_trace if isinstance(finding.decision_trace, dict) else {}
         trace.setdefault("decision", {})
         trace["decision"]["status"] = finding.status
