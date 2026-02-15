@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -50,10 +51,17 @@ class CliSmokeTests(unittest.TestCase):
                     str(out),
                     "--focus",
                     "business",
+                    "--ai-provider",
+                    "none",
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
+                env={
+                    **os.environ,
+                    # Offline CI/tests: review pipeline must still run deterministically without network.
+                    "BIDAGENT_ALLOW_NO_AI": "1",
+                },
             )
 
             self.assertEqual(process.returncode, 0, msg=process.stderr)

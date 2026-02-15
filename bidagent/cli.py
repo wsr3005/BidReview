@@ -28,16 +28,16 @@ def _common_parent() -> argparse.ArgumentParser:
     parent.add_argument(
         "--ocr-mode",
         choices=["off", "auto", "tesseract"],
-        default="off",
-        help="OCR mode for image-only evidence in bid documents",
+        default="auto",
+        help="OCR mode for image-only evidence in documents (required for real bid review)",
     )
     parent.add_argument("--workers", type=int, default=2, help="reserved for parallel stage workers")
     parent.add_argument("--batch-size", type=int, default=500, help="reserved for future batch operations")
     parent.add_argument(
         "--ai-provider",
         choices=["none", "deepseek"],
-        default="none",
-        help="optional LLM provider for secondary review",
+        default="deepseek",
+        help="LLM provider for secondary review (required for real bid review)",
     )
     parent.add_argument("--ai-model", default="deepseek-chat", help="LLM model name")
     parent.add_argument("--ai-api-key-file", default=None, help="path to API key text file")

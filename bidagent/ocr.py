@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -10,6 +12,26 @@ from bidagent.document import split_text_blocks
 from bidagent.models import Block, Location
 
 OCR_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+DEFAULT_TESSERACT_CANDIDATES = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+]
+
+
+def _resolve_tesseract_cmd() -> str | None:
+    env_cmd = os.getenv("TESSERACT_CMD")
+    if env_cmd:
+        p = Path(env_cmd)
+        if p.exists():
+            return str(p)
+    which = shutil.which("tesseract")
+    if which:
+        return which
+    for candidate in DEFAULT_TESSERACT_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return None
 
 
 def ocr_selfcheck(mode: str) -> dict[str, Any]:
@@ -39,16 +61,26 @@ def ocr_selfcheck(mode: str) -> dict[str, Any]:
             "reason": f"missing python deps: {exc.name}",
         }
 
+    cmd = _resolve_tesseract_cmd()
+    if not cmd:
+        return {
+            "mode": mode,
+            "engine": "tesseract",
+            "engine_available": False,
+            "reason": "tesseract binary not found (install it or set TESSERACT_CMD)",
+        }
+
     # Tesseract is an external binary; best-effort detect availability.
     version = None
     try:
         import pytesseract
 
+        pytesseract.pytesseract.tesseract_cmd = cmd
         version = str(pytesseract.get_tesseract_version())
     except Exception:
         try:
             proc = subprocess.run(
-                ["tesseract", "--version"],
+                [cmd, "--version"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -57,6 +89,14 @@ def ocr_selfcheck(mode: str) -> dict[str, Any]:
             version = (proc.stdout or proc.stderr or "").splitlines()[0].strip() if (proc.stdout or proc.stderr) else None
         except Exception:
             version = None
+
+    if not version:
+        return {
+            "mode": mode,
+            "engine": "tesseract",
+            "engine_available": False,
+            "reason": "tesseract binary detected but version check failed",
+        }
 
     return {
         "mode": mode,
@@ -72,6 +112,11 @@ def _load_tesseract_engine() -> Callable[[bytes], str] | None:
         import pytesseract
     except ModuleNotFoundError:
         return None
+
+    cmd = _resolve_tesseract_cmd()
+    if not cmd:
+        return None
+    pytesseract.pytesseract.tesseract_cmd = cmd
 
     def _extract(image_bytes: bytes) -> str:
         with Image.open(io.BytesIO(image_bytes)) as image:

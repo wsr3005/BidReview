@@ -67,6 +67,111 @@ def _load_api_key(provider: str | None, api_key_file: Path | None) -> str | None
     raise ValueError("DeepSeek API key not found. Set DEEPSEEK_API_KEY or provide --ai-api-key-file.")
 
 
+def _truthy_env(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _count_doc_media(path: Path, page_range: tuple[int, int] | None) -> dict[str, Any]:
+    """Best-effort doc stats for OCR gating and run introspection.
+
+    Notes:
+    - DOCX: counts embedded images under word/media/.
+    - PDF: counts images exposed by pypdf page.images (may be 0 for some PDFs).
+    - TXT: images=0.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".docx":
+        import zipfile
+
+        from bidagent.ocr import OCR_IMAGE_EXTENSIONS
+
+        images = 0
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                for name in zf.namelist():
+                    if not name.startswith("word/media/"):
+                        continue
+                    if Path(name).suffix.lower() in OCR_IMAGE_EXTENSIONS:
+                        images += 1
+        except Exception:  # noqa: BLE001
+            images = 0
+        return {"type": "docx", "images": images}
+
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ModuleNotFoundError:
+            return {"type": "pdf", "pages": None, "images": None}
+
+        try:
+            reader = PdfReader(str(path))
+            total_pages = len(reader.pages)
+        except Exception:  # noqa: BLE001
+            return {"type": "pdf", "pages": None, "images": None}
+
+        start_page, end_page = 1, total_pages
+        if page_range:
+            start_page, end_page = page_range
+            end_page = min(end_page, total_pages)
+
+        images = 0
+        for page_no in range(start_page, end_page + 1):
+            try:
+                page = reader.pages[page_no - 1]
+                page_images = list(getattr(page, "images", []) or [])
+                images += len(page_images)
+            except Exception:  # noqa: BLE001
+                continue
+        return {"type": "pdf", "pages": total_pages, "images": images, "page_range": [start_page, end_page]}
+
+    if suffix == ".txt":
+        return {"type": "txt", "images": 0}
+
+    return {"type": suffix.lstrip("."), "images": None}
+
+
+def _enforce_required_ai(ai_provider: str | None) -> None:
+    if ai_provider is not None:
+        return
+    if _truthy_env("BIDAGENT_ALLOW_NO_AI"):
+        return
+    raise ValueError(
+        "AI review is required. Use --ai-provider deepseek and provide an API key. "
+        "For offline tests only, set BIDAGENT_ALLOW_NO_AI=1."
+    )
+
+
+def _enforce_required_ocr(ocr_mode: str, *, doc_meta: dict[str, Any]) -> None:
+    if ocr_mode != "off":
+        return
+    if _truthy_env("BIDAGENT_ALLOW_NO_OCR"):
+        return
+    images = doc_meta.get("images")
+    if images is None or int(images) > 0:
+        raise ValueError(
+            "OCR is required (image evidence detected). "
+            "Install OCR deps + Tesseract, then rerun. "
+            "For offline tests only, set BIDAGENT_ALLOW_NO_OCR=1."
+        )
+
+
+def _enforce_ocr_engine_available(ocr_stats: dict[str, Any], *, doc_meta: dict[str, Any]) -> None:
+    images = doc_meta.get("images")
+    if images is not None and int(images) <= 0:
+        return
+    if bool(ocr_stats.get("engine_available")):
+        return
+    reason = ocr_stats.get("reason") or "OCR engine unavailable"
+    raise ValueError(
+        "OCR is required but not available. "
+        f"Reason: {reason}. "
+        "Install: pip install pillow pytesseract, and install Tesseract OCR (set TESSERACT_CMD if needed)."
+    )
+
+
 def _parse_manifest_page_range(value: Any) -> tuple[int, int] | None:
     if not isinstance(value, list) or len(value) != 2:
         return None
@@ -96,7 +201,17 @@ def ingest(
     bid_out = ingest_dir / "bid_blocks.jsonl"
     manifest_path = ingest_dir / "manifest.json"
 
-    summary: dict[str, Any] = {"tender_blocks": 0, "bid_blocks": 0, "bid_ocr_blocks": 0}
+    tender_meta = _count_doc_media(tender_path, page_range)
+    bid_meta = _count_doc_media(bid_path, page_range)
+    _enforce_required_ocr(ocr_mode, doc_meta=bid_meta)
+
+    summary: dict[str, Any] = {
+        "tender_blocks": 0,
+        "bid_blocks": 0,
+        "bid_ocr_blocks": 0,
+        "tender_meta": tender_meta,
+        "bid_meta": bid_meta,
+    }
     previous_manifest: dict[str, Any] = {}
     if manifest_path.exists():
         try:
@@ -125,6 +240,7 @@ def ingest(
         bid_text_count = write_jsonl(bid_out, bid_rows)
         ocr_stats: dict[str, Any] = {}
         ocr_stats.update(ocr_selfcheck(ocr_mode))
+        _enforce_ocr_engine_available(ocr_stats, doc_meta=bid_meta)
         ocr_rows = (
             block.to_dict()
             for block in iter_document_ocr_blocks(
@@ -161,6 +277,8 @@ def ingest(
         "page_range": list(page_range) if page_range else None,
         "ocr_mode": ocr_mode,
         "bid_ocr_blocks": summary["bid_ocr_blocks"],
+        "tender_meta": tender_meta,
+        "bid_meta": bid_meta,
         "ocr": summary.get("ocr", ocr_selfcheck(ocr_mode)),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -192,6 +310,7 @@ def review(
     ai_workers: int = 4,
     ai_min_confidence: float = 0.65,
 ) -> dict[str, Any]:
+    _enforce_required_ai(ai_provider)
     req_path = out_dir / "requirements.jsonl"
     bid_path = out_dir / "ingest" / "bid_blocks.jsonl"
     findings_path = out_dir / "findings.jsonl"

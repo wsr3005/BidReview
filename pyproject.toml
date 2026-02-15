@@ -9,6 +9,11 @@ description = "CLI pipeline for business-focused bid document review"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Codex" }]
+dependencies = [
+    "pillow>=12.1.1",
+    "pypdf>=6.7.0",
+    "pytesseract>=0.3.13",
+]
 
 [project.scripts]
 bidagent = "bidagent.cli:main"
