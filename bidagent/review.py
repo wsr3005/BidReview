@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from dataclasses import asdict
@@ -251,6 +252,14 @@ def _build_evidence_id(block: Block) -> str:
     return f"E-{block.doc_id}-p{page}-b{block.location.block_index}-s{section}"
 
 
+def _build_excerpt_hash(text: str) -> str:
+    # A stable-ish fingerprint for traceability across block_index drift.
+    # Intended as "find this snippet again", not a permanent primary key.
+    normalized = normalize_compact(text)[:2000]
+    digest = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()
+    return digest[:16]
+
+
 def _merge_keywords(base: list[str], extra: list[str], limit: int = 10) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
@@ -317,7 +326,8 @@ def extract_requirements(
                 requirement_id="",
                 text=text,
                 category=classify_category(text),
-                mandatory=any(token in text for token in MANDATORY_HINTS),
+                # "要求" is too generic; use strong obligation hints to reduce false mandatory flags.
+                mandatory=any(token in text for token in MANDATORY_STRONG_HINTS),
                 keywords=extract_keywords(text),
                 source={
                     "doc_id": source["doc_id"],
@@ -347,6 +357,7 @@ def _push_top_match(
 ) -> None:
     candidate = {
         "evidence_id": _build_evidence_id(block),
+        "excerpt_hash": _build_excerpt_hash(block.text),
         "score": score,
         "doc_id": block.doc_id,
         "location": asdict(block.location),
@@ -377,6 +388,7 @@ def _build_decision_trace(
     evidence_refs = [
         {
             "evidence_id": item.get("evidence_id"),
+            "excerpt_hash": item.get("excerpt_hash"),
             "doc_id": item.get("doc_id"),
             "location": item.get("location"),
             "score": item.get("score"),

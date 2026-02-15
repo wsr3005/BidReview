@@ -335,9 +335,14 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(finding.decision_trace["clause_id"], finding.requirement_id)
         self.assertEqual(finding.decision_trace["clause_source"]["location"]["block_index"], 7)
         self.assertTrue(finding.evidence[0]["evidence_id"].startswith("E-bid-"))
+        self.assertIn("excerpt_hash", finding.evidence[0])
         self.assertEqual(
             finding.decision_trace["evidence_refs"][0]["evidence_id"],
             finding.evidence[0]["evidence_id"],
+        )
+        self.assertEqual(
+            finding.decision_trace["evidence_refs"][0]["excerpt_hash"],
+            finding.evidence[0]["excerpt_hash"],
         )
         self.assertEqual(finding.decision_trace["rule"]["version"], "r1-trace-v1")
 

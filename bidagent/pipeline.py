@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -424,6 +425,17 @@ def _format_trace_location(location: Any) -> str:
     return f"block={location.get('block_index')} page={location.get('page')}"
 
 
+def _sanitize_md_text(value: Any, *, limit: int = 200) -> str:
+    text = str(value or "")
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    # Avoid breaking the surrounding quotes in report formatting.
+    text = text.replace('"', "'")
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
 def _is_mappable_location(location: Any) -> bool:
     if not isinstance(location, dict):
         return False
@@ -484,6 +496,12 @@ def _choose_alternate_evidence(
     status: str | None = None,
     limit: int = 2,
 ) -> list[dict[str, Any]]:
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     if not isinstance(evidence, list) or not evidence:
         return []
     primary_id = primary.get("evidence_id")
@@ -494,7 +512,7 @@ def _choose_alternate_evidence(
             1 if _is_mappable_location(item.get("location")) else 0,
             0 if status == "needs_ocr" and item.get("reference_only") else 1,
             0 if status != "needs_ocr" and item.get("reference_only") else 1,
-            int(item.get("score") or 0),
+            _safe_int(item.get("score") or 0),
             len(str(item.get("excerpt") or "")),
         ),
         reverse=True,
@@ -519,7 +537,7 @@ def _format_finding_trace(finding: dict[str, Any]) -> str:
             evidence_ref = f"{primary.get('evidence_id', 'N/A')}@{_format_trace_location(primary.get('location'))}"
         else:
             evidence_ref = "none"
-        return f"clause={clause_id}; evidence={evidence_ref}; rule=unknown"
+        return _sanitize_md_text(f"clause={clause_id}; evidence={evidence_ref}; rule=unknown", limit=240)
 
     clause_source = trace.get("clause_source", {})
     clause_location = _format_trace_location(clause_source.get("location"))
@@ -531,7 +549,10 @@ def _format_finding_trace(finding: dict[str, Any]) -> str:
         evidence_ref = "none"
     rule = trace.get("rule", {})
     rule_ref = f"{rule.get('engine', 'N/A')}:{rule.get('version', 'N/A')}"
-    return f"clause={clause_id}@{clause_location}; evidence={evidence_ref}; rule={rule_ref}"
+    return _sanitize_md_text(
+        f"clause={clause_id}@{clause_location}; evidence={evidence_ref}; rule={rule_ref}",
+        limit=240,
+    )
 
 
 def _format_primary_evidence(finding: dict[str, Any], limit: int = 80) -> str:
@@ -542,9 +563,7 @@ def _format_primary_evidence(finding: dict[str, Any], limit: int = 80) -> str:
     if not primary:
         return "evidence: none"
     location = primary.get("location")
-    excerpt = str(primary.get("excerpt") or "").strip().replace("\n", " ")
-    if len(excerpt) > limit:
-        excerpt = excerpt[:limit] + "..."
+    excerpt = _sanitize_md_text(primary.get("excerpt") or "", limit=limit)
     return (
         "evidence: "
         + f"{primary.get('evidence_id', 'N/A')} "
