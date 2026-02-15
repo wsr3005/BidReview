@@ -72,6 +72,7 @@ class DeepSeekReviewer:
             "requirement_text": requirement.text,
             "category": requirement.category,
             "mandatory": requirement.mandatory,
+            "constraints": getattr(requirement, "constraints", []),
             "rule_status": finding.status,
             "rule_severity": finding.severity,
             "rule_reason": finding.reason,

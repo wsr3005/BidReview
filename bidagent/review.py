@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import asdict
 from typing import Iterable
 
+from bidagent.constraints import extract_constraints
 from bidagent.models import Block, Finding, Requirement
 
 REVIEW_RULE_ENGINE = "keyword_match"
@@ -295,6 +296,11 @@ def _merge_requirement(existing: Requirement, candidate: Requirement) -> None:
         existing.text = candidate.text
     existing.mandatory = existing.mandatory or candidate.mandatory
     existing.keywords = _merge_keywords(existing.keywords, candidate.keywords)
+    # Keep union of constraints to preserve checkable fields across duplicates.
+    if isinstance(getattr(candidate, "constraints", None), list):
+        existing.constraints = list(existing.constraints) + [
+            item for item in candidate.constraints if item not in existing.constraints
+        ]
 
     merged_sources = existing.source.setdefault("merged_sources", [])
     incoming_sources = candidate.source.get("merged_sources", [])
@@ -329,6 +335,7 @@ def extract_requirements(
                 # "要求" is too generic; use strong obligation hints to reduce false mandatory flags.
                 mandatory=any(token in text for token in MANDATORY_STRONG_HINTS),
                 keywords=extract_keywords(text),
+                constraints=extract_constraints(text),
                 source={
                     "doc_id": source["doc_id"],
                     "location": source["location"],

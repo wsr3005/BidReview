@@ -42,6 +42,7 @@ def _row_to_requirement(row: dict[str, Any]) -> Requirement:
         category=row.get("category", "商务其他"),
         mandatory=bool(row.get("mandatory", False)),
         keywords=list(row.get("keywords", [])),
+        constraints=list(row.get("constraints", [])),
         source=row.get("source", {}),
     )
 
