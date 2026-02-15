@@ -37,6 +37,7 @@ TECHNICAL_HINTS = [
 ]
 
 MANDATORY_HINTS = ["必须", "应", "须", "不得", "严禁", "需", "要求"]
+MANDATORY_STRONG_HINTS = ["必须", "应", "须", "不得", "严禁", "需"]
 
 STOP_WORDS = {
     "投标",
@@ -52,6 +53,21 @@ STOP_WORDS = {
     "条款",
     "商务",
 }
+
+NON_CHECKABLE_HINTS = [
+    "目录",
+    "模板",
+    "格式",
+    "样式",
+    "示例",
+    "填写说明",
+    "盖章处",
+    "签字处",
+    "详见",
+    "参见",
+    "本表",
+    "附表",
+]
 
 
 def normalize_text(text: str) -> str:
@@ -103,10 +119,41 @@ def is_business_requirement(text: str, focus: str) -> bool:
     return False
 
 
+def split_candidate_sentences(text: str) -> list[str]:
+    parts = re.split(r"[。；;！？!\r\n]+", text)
+    return [item.strip() for item in parts if item and item.strip()]
+
+
+def is_catalog_or_heading(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text.strip())
+    if not compact:
+        return True
+    if compact in {"目录", "投标文件目录", "招标文件目录"}:
+        return True
+    if re.search(r"[\.·•…]{2,}\d+$", compact):
+        return True
+    if re.match(r"^第[一二三四五六七八九十百零0-9]+[章节条]\S{0,18}$", compact):
+        return True
+    if re.match(r"^\d+(\.\d+){1,}\S{0,20}$", compact):
+        return True
+    return False
+
+
+def is_checkable_statement(text: str) -> bool:
+    if is_catalog_or_heading(text):
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if any(token in compact for token in NON_CHECKABLE_HINTS):
+        return False
+    return True
+
+
 def is_requirement_sentence(text: str) -> bool:
     if len(text) < 10:
         return False
-    return any(token in text for token in MANDATORY_HINTS)
+    if any(token in text for token in MANDATORY_STRONG_HINTS):
+        return True
+    return bool(re.search(r"(符合|满足|达到).{0,12}要求", text))
 
 
 def _new_source(block: Block, text: str) -> dict:
@@ -168,35 +215,38 @@ def extract_requirements(
 ) -> list[Requirement]:
     merged_requirements: list[Requirement] = []
     for block in tender_blocks:
-        text = block.text.strip()
-        if not text:
-            continue
-        if not is_business_requirement(text, focus):
-            continue
-        if not is_requirement_sentence(text):
-            continue
-        source = _new_source(block, text)
-        candidate = Requirement(
-            requirement_id="",
-            text=text,
-            category=classify_category(text),
-            mandatory=any(token in text for token in MANDATORY_HINTS),
-            keywords=extract_keywords(text),
-            source={
-                "doc_id": source["doc_id"],
-                "location": source["location"],
-                "merged_count": 1,
-                "merged_sources": [source],
-            },
-        )
-        matched = False
-        for existing in merged_requirements:
-            if _same_requirement(existing, candidate):
-                _merge_requirement(existing, candidate)
-                matched = True
-                break
-        if not matched:
-            merged_requirements.append(candidate)
+        for sentence in split_candidate_sentences(block.text):
+            text = sentence.strip()
+            if not text:
+                continue
+            if not is_business_requirement(text, focus):
+                continue
+            if not is_checkable_statement(text):
+                continue
+            if not is_requirement_sentence(text):
+                continue
+            source = _new_source(block, text)
+            candidate = Requirement(
+                requirement_id="",
+                text=text,
+                category=classify_category(text),
+                mandatory=any(token in text for token in MANDATORY_HINTS),
+                keywords=extract_keywords(text),
+                source={
+                    "doc_id": source["doc_id"],
+                    "location": source["location"],
+                    "merged_count": 1,
+                    "merged_sources": [source],
+                },
+            )
+            matched = False
+            for existing in merged_requirements:
+                if _same_requirement(existing, candidate):
+                    _merge_requirement(existing, candidate)
+                    matched = True
+                    break
+            if not matched:
+                merged_requirements.append(candidate)
 
     for index, requirement in enumerate(merged_requirements, start=1):
         requirement.requirement_id = f"R{index:04d}"

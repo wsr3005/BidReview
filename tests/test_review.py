@@ -85,6 +85,45 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(findings[0].status, "risk")
         self.assertEqual(findings[0].severity, "high")
 
+    def test_extract_requirements_skips_catalog_and_template_noise(self) -> None:
+        blocks = [
+            Block(
+                doc_id="tender",
+                text="目录............12",
+                location=Location(block_index=1),
+            ),
+            Block(
+                doc_id="tender",
+                text="第六章 投标文件格式",
+                location=Location(block_index=2),
+            ),
+            Block(
+                doc_id="tender",
+                text="商务要求：投标文件格式要求详见附表模板并按样式填写。",
+                location=Location(block_index=3),
+            ),
+            Block(
+                doc_id="tender",
+                text="商务要求：投标人必须提供有效营业执照。",
+                location=Location(block_index=4),
+            ),
+        ]
+        requirements = extract_requirements(blocks, focus="business")
+        self.assertEqual(len(requirements), 1)
+        self.assertIn("营业执照", requirements[0].text)
+
+    def test_extract_requirements_splits_mixed_sentences(self) -> None:
+        blocks = [
+            Block(
+                doc_id="tender",
+                text="商务要求：投标人必须提供有效营业执照。技术参数必须满足性能指标。",
+                location=Location(block_index=1),
+            )
+        ]
+        requirements = extract_requirements(blocks, focus="business")
+        self.assertEqual(len(requirements), 1)
+        self.assertIn("营业执照", requirements[0].text)
+
 
 if __name__ == "__main__":
     unittest.main()

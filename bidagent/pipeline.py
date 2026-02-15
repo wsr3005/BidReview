@@ -59,6 +59,12 @@ def _load_api_key(provider: str | None, api_key_file: Path | None) -> str | None
     raise ValueError("DeepSeek API key not found. Set DEEPSEEK_API_KEY or provide --ai-api-key-file.")
 
 
+def _llm_coverage_complete(rows: list[dict[str, Any]], provider: str) -> bool:
+    if not rows:
+        return False
+    return all((row.get("llm") or {}).get("provider") == provider for row in rows)
+
+
 def ingest(
     tender_path: Path,
     bid_path: Path,
@@ -125,8 +131,7 @@ def review(
         if ai_provider is None:
             counts = Counter(row["status"] for row in existing_rows)
             return {"findings": sum(counts.values()), "status_counts": dict(counts)}
-        has_llm = any((row.get("llm") or {}).get("provider") == ai_provider for row in existing_rows)
-        if has_llm:
+        if _llm_coverage_complete(existing_rows, ai_provider):
             counts = Counter(row["status"] for row in existing_rows)
             return {"findings": sum(counts.values()), "status_counts": dict(counts)}
 
