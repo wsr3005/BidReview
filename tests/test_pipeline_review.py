@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import json
+
 from bidagent.io_utils import read_jsonl, write_jsonl
 from bidagent.models import Block, Finding, Location
 from bidagent.pipeline import ingest, review
@@ -128,7 +130,13 @@ class PipelineReviewTests(unittest.TestCase):
                     location=Location(block_index=2, section="OCR_MEDIA"),
                 )
             ]
-            with patch("bidagent.pipeline.iter_document_ocr_blocks", return_value=iter(fake_ocr_blocks)):
+            with (
+                patch("bidagent.pipeline.iter_document_ocr_blocks", return_value=iter(fake_ocr_blocks)),
+                patch(
+                    "bidagent.pipeline.ocr_selfcheck",
+                    return_value={"mode": "auto", "engine": "tesseract", "engine_available": True},
+                ),
+            ):
                 result = ingest(
                     tender_path=tender,
                     bid_path=bid,
@@ -138,6 +146,12 @@ class PipelineReviewTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["bid_ocr_blocks"], 1)
+            self.assertIn("ocr", result)
+            self.assertTrue((result.get("ocr") or {}).get("engine_available"))
+
+            manifest = json.loads((out_dir / "ingest" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertIn("ocr", manifest)
+            self.assertEqual((manifest.get("ocr") or {}).get("mode"), "auto")
             self.assertEqual(result["bid_blocks"], 2)
             rows = list(read_jsonl(out_dir / "ingest" / "bid_blocks.jsonl"))
             self.assertEqual(len(rows), 2)

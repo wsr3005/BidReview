@@ -13,7 +13,7 @@ from bidagent.document import iter_document_blocks
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm import DeepSeekReviewer, apply_llm_review
 from bidagent.models import Block, Location, Requirement
-from bidagent.ocr import iter_document_ocr_blocks
+from bidagent.ocr import iter_document_ocr_blocks, ocr_selfcheck
 from bidagent.review import enforce_evidence_quality_gate, extract_requirements, review_requirements
 
 
@@ -120,6 +120,8 @@ def ingest(
             for block in iter_document_blocks(bid_path, doc_id="bid", page_range=page_range)
         )
         bid_text_count = write_jsonl(bid_out, bid_rows)
+        ocr_stats: dict[str, Any] = {}
+        ocr_stats.update(ocr_selfcheck(ocr_mode))
         ocr_rows = (
             block.to_dict()
             for block in iter_document_ocr_blocks(
@@ -128,14 +130,26 @@ def ingest(
                 start_index=bid_text_count,
                 page_range=page_range,
                 ocr_mode=ocr_mode,
+                stats=ocr_stats,
             )
         )
         bid_ocr_count = append_jsonl(bid_out, ocr_rows)
         summary["bid_blocks"] = bid_text_count + bid_ocr_count
         summary["bid_ocr_blocks"] = bid_ocr_count
+        # Merge OCR stats for visibility and debugging.
+        summary["ocr"] = {
+            **ocr_stats,
+            "blocks_emitted": int(ocr_stats.get("blocks_emitted", bid_ocr_count) or 0),
+            "images_total": int(ocr_stats.get("images_total", 0) or 0),
+            "images_succeeded": int(ocr_stats.get("images_succeeded", 0) or 0),
+            "images_failed": int(ocr_stats.get("images_failed", 0) or 0),
+            "chars_total": int(ocr_stats.get("chars_total", 0) or 0),
+        }
     else:
         summary["bid_blocks"] = sum(1 for _ in read_jsonl(bid_out))
         summary["bid_ocr_blocks"] = int(previous_manifest.get("bid_ocr_blocks", 0))
+        if isinstance(previous_manifest.get("ocr"), dict):
+            summary["ocr"] = previous_manifest.get("ocr")
 
     manifest = {
         "tender_path": str(tender_path.resolve()),
@@ -144,6 +158,7 @@ def ingest(
         "page_range": list(page_range) if page_range else None,
         "ocr_mode": ocr_mode,
         "bid_ocr_blocks": summary["bid_ocr_blocks"],
+        "ocr": summary.get("ocr", ocr_selfcheck(ocr_mode)),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
