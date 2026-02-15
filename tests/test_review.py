@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from bidagent.models import Block, Location
+from bidagent.models import Block, Location, Requirement
 from bidagent.review import extract_requirements, review_requirements
 
 
@@ -123,6 +123,46 @@ class ReviewTests(unittest.TestCase):
         requirements = extract_requirements(blocks, focus="business")
         self.assertEqual(len(requirements), 1)
         self.assertIn("营业执照", requirements[0].text)
+
+    def test_review_ignores_catalog_heading_as_evidence(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="投标人必须提供授权委托书原件。",
+                category="资质与证照",
+                mandatory=True,
+                keywords=["授权委托书", "原件"],
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="5.3 授权委托书 ........ 45",
+                location=Location(block_index=1, section="Heading1"),
+            )
+        ]
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertEqual(findings[0].status, "fail")
+
+    def test_review_accepts_real_content_not_heading(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="投标人必须提供授权委托书原件。",
+                category="资质与证照",
+                mandatory=True,
+                keywords=["授权委托书", "原件"],
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="我方已提交授权委托书原件并加盖公章。",
+                location=Location(block_index=1, section="Normal"),
+            )
+        ]
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertEqual(findings[0].status, "pass")
 
 
 if __name__ == "__main__":

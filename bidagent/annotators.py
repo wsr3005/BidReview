@@ -174,16 +174,17 @@ def annotate_docx_copy(
 
         annotated_notes = 0
         annotated_paragraphs = 0
-        touched: set[int] = set()
+        touched_paragraph_ids: set[int] = set()
         next_comment_id = _next_comment_id(comments_root)
 
         for idx, notes in issues_by_block.items():
             paragraph = block_to_paragraph.get(idx)
             if paragraph is None:
                 continue
-            if idx not in touched:
+            paragraph_identity = id(paragraph)
+            if paragraph_identity not in touched_paragraph_ids:
                 annotated_paragraphs += 1
-                touched.add(idx)
+                touched_paragraph_ids.add(paragraph_identity)
             for note in notes:
                 comment_id = next_comment_id
                 next_comment_id += 1

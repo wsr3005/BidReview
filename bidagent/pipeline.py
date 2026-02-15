@@ -101,8 +101,9 @@ def ingest(
         summary["bid_blocks"] = sum(1 for _ in read_jsonl(bid_out))
 
     manifest = {
-        "tender_path": str(tender_path),
-        "bid_path": str(bid_path),
+        "tender_path": str(tender_path.resolve()),
+        "bid_path": str(bid_path.resolve()),
+        "ingest_cwd": str(Path.cwd().resolve()),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -171,7 +172,8 @@ def review(
 
 def _resolve_bid_source(out_dir: Path, bid_source: Path | None) -> Path | None:
     if bid_source:
-        return bid_source
+        resolved = bid_source.resolve()
+        return resolved if resolved.exists() else bid_source
     manifest_path = out_dir / "ingest" / "manifest.json"
     if not manifest_path.exists():
         return None
@@ -183,8 +185,19 @@ def _resolve_bid_source(out_dir: Path, bid_source: Path | None) -> Path | None:
     if not source:
         return None
     path = Path(source)
-    if path.exists():
-        return path
+    candidates: list[Path] = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        ingest_cwd = data.get("ingest_cwd")
+        if ingest_cwd:
+            candidates.append((Path(ingest_cwd) / path).resolve())
+        candidates.append((manifest_path.parent / path).resolve())
+        candidates.append(path.resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     return None
 
 
@@ -267,6 +280,15 @@ def annotate(
     except Exception as exc:  # noqa: BLE001
         result["annotated_copy"] = None
         result["annotation_warning"] = str(exc)
+        return result
+
+    if not output_path.exists():
+        result["annotated_copy"] = None
+        result["annotation_warning"] = (
+            "No document copy was generated because findings lack mappable locations "
+            "(block_index/page). Sidecar files were generated."
+        )
+        result.update(stats)
         return result
 
     result["annotated_copy"] = str(output_path)

@@ -148,6 +148,24 @@ def is_checkable_statement(text: str) -> bool:
     return True
 
 
+def is_substantive_bid_block(text: str, section: str | None) -> bool:
+    compact = re.sub(r"\s+", "", text.strip())
+    if not compact:
+        return False
+    if is_catalog_or_heading(compact):
+        return False
+    if re.search(r"[\.·•…]{2,}\d{1,4}$", compact):
+        return False
+    # Word heading styles often mark TOC/section titles rather than evidential content.
+    if section and re.search(r"(heading|标题)", section, flags=re.IGNORECASE):
+        if len(compact) <= 60 and not re.search(r"(提供|提交|附|响应|满足|承诺)", compact):
+            return False
+    # Very short title-like fragments are weak evidence and usually directory entries.
+    if len(compact) <= 20 and re.fullmatch(r"[0-9一二三四五六七八九十百零第章节条款\.（）()\-A-Za-z]+", compact):
+        return False
+    return True
+
+
 def is_requirement_sentence(text: str) -> bool:
     if len(text) < 10:
         return False
@@ -288,6 +306,8 @@ def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterabl
 
     req_scores: dict[int, list[dict]] = {index: [] for index in range(len(requirement_list))}
     for block in bid_blocks:
+        if not is_substantive_bid_block(block.text, block.location.section):
+            continue
         normalized_block = normalize_text(block.text)
         if not normalized_block:
             continue

@@ -101,6 +101,42 @@ class AnnotateOutputTests(unittest.TestCase):
                 self.assertIn("R0001", comments_xml)
                 self.assertIn("relationships/comments", rels_xml)
 
+    def test_annotate_returns_none_copy_when_locations_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            bid_docx = base / "bid.docx"
+            tender_txt = base / "tender.txt"
+            _create_minimal_docx(bid_docx, ["投标人必须提供营业执照", "其他内容"])
+            tender_txt.write_text("商务要求：投标人必须提供营业执照。", encoding="utf-8")
+
+            ingest(
+                tender_path=tender_txt,
+                bid_path=bid_docx,
+                out_dir=out_dir,
+                resume=False,
+            )
+
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "risk",
+                        "severity": "high",
+                        "reason": "证据不足",
+                        "evidence": [],
+                    }
+                ],
+            )
+
+            result = annotate(out_dir=out_dir, resume=False)
+            self.assertEqual(result["annotations"], 1)
+            self.assertIsNone(result.get("annotated_copy"))
+            self.assertIn("mappable locations", result.get("annotation_warning", ""))
+
     def test_annotate_returns_warning_for_missing_bid_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)
@@ -112,6 +148,54 @@ class AnnotateOutputTests(unittest.TestCase):
             self.assertEqual(result["annotations"], 1)
             self.assertIsNone(result.get("annotated_copy"))
             self.assertTrue(result.get("annotation_warning"))
+
+    def test_resolve_manifest_relative_path_after_cwd_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            bid_docx = base / "bid.docx"
+            _create_minimal_docx(bid_docx, ["投标人必须提供营业执照"])
+            rel_path = bid_docx.relative_to(base)
+            (ingest_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "bid_path": str(rel_path),
+                        "ingest_cwd": str(base),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "risk",
+                        "severity": "high",
+                        "reason": "证据不足",
+                        "evidence": [{"location": {"block_index": 1}}],
+                    }
+                ],
+            )
+
+            old_cwd = Path.cwd()
+            try:
+                # Change cwd to break naive relative-path resolution.
+                import os
+
+                os.chdir(Path(tempfile.gettempdir()))
+                result = annotate(out_dir=out_dir, resume=False)
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertTrue(result.get("annotated_copy"))
+            self.assertTrue(Path(result["annotated_copy"]).exists())
 
     @unittest.skipUnless(importlib.util.find_spec("pypdf") is not None, "pypdf is required")
     def test_annotate_generates_pdf_copy_with_annotations(self) -> None:
