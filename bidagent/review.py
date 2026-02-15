@@ -211,6 +211,13 @@ def is_substantive_bid_block(text: str, section: str | None) -> bool:
     compact = re.sub(r"\s+", "", text.strip())
     if not compact:
         return False
+    # OCR blocks are image-derived evidence; keep them unless they are obviously noise.
+    if section == "OCR_MEDIA":
+        if is_catalog_or_heading(compact):
+            return False
+        if len(compact) < 4:
+            return False
+        return True
     if section and re.search(r"(toc|目录)", section, flags=re.IGNORECASE):
         return False
     if is_catalog_or_heading(compact):

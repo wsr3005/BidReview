@@ -259,6 +259,27 @@ class ReviewTests(unittest.TestCase):
         findings = review_requirements(requirements, bid_blocks)
         self.assertEqual(findings[0].status, "needs_ocr")
 
+    def test_review_accepts_ocr_media_short_evidence_blocks(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="投标人必须提供投标保证金缴纳凭证或银行回单。",
+                category="保证金与担保",
+                mandatory=True,
+                keywords=["银行回单", "保证金"],
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="银行回单",
+                location=Location(block_index=1, section="OCR_MEDIA"),
+            )
+        ]
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertTrue(findings[0].evidence)
+        self.assertNotEqual(findings[0].status, "fail")
+
     def test_evidence_gate_downgrades_pass_when_only_reference_evidence(self) -> None:
         requirements = [
             Requirement(
