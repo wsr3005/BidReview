@@ -28,7 +28,7 @@ uv run bidagent run \
 - `ingest`: parse tender and bid files into JSONL blocks
 - `extract-req`: extract business requirements from tender blocks
 - `review`: check bid document against extracted requirements
-- `annotate`: generate issue annotations sidecar files
+- `annotate`: generate issue annotations sidecar files and annotated document copy (`.docx` / `.pdf`)
 - `checklist`: export manual review list (`fail` + `high risk`)
 - `report`: generate markdown summary report
 - `run`: execute the full pipeline

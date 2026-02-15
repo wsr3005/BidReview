@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
 from bidagent.document import iter_document_blocks
 from bidagent.io_utils import ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm import DeepSeekReviewer, apply_llm_review
@@ -76,6 +78,7 @@ def ingest(
     ensure_dir(ingest_dir)
     tender_out = ingest_dir / "tender_blocks.jsonl"
     bid_out = ingest_dir / "bid_blocks.jsonl"
+    manifest_path = ingest_dir / "manifest.json"
 
     summary: dict[str, Any] = {"tender_blocks": 0, "bid_blocks": 0}
 
@@ -96,6 +99,12 @@ def ingest(
         summary["bid_blocks"] = write_jsonl(bid_out, bid_rows)
     else:
         summary["bid_blocks"] = sum(1 for _ in read_jsonl(bid_out))
+
+    manifest = {
+        "tender_path": str(tender_path),
+        "bid_path": str(bid_path),
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return summary
 
@@ -160,13 +169,46 @@ def review(
     return {"findings": len(findings), "status_counts": dict(counts)}
 
 
-def annotate(out_dir: Path, resume: bool = False) -> dict[str, Any]:
+def _resolve_bid_source(out_dir: Path, bid_source: Path | None) -> Path | None:
+    if bid_source:
+        return bid_source
+    manifest_path = out_dir / "ingest" / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    source = data.get("bid_path")
+    if not source:
+        return None
+    path = Path(source)
+    if path.exists():
+        return path
+    return None
+
+
+def annotate(
+    out_dir: Path,
+    resume: bool = False,
+    bid_source: Path | None = None,
+) -> dict[str, Any]:
     annotations_path = out_dir / "annotations.jsonl"
     markdown_path = out_dir / "annotations.md"
     findings_path = out_dir / "findings.jsonl"
+
+    source_path = _resolve_bid_source(out_dir=out_dir, bid_source=bid_source)
+    expected_copy: Path | None = None
+    if source_path is not None:
+        expected_copy = out_dir / "annotated" / f"{source_path.stem}.annotated{source_path.suffix}"
+
     if path_ready(annotations_path, resume) and path_ready(markdown_path, resume):
         total = sum(1 for _ in read_jsonl(annotations_path))
-        return {"annotations": total}
+        if expected_copy is None or expected_copy.exists():
+            response: dict[str, Any] = {"annotations": total}
+            if expected_copy is not None:
+                response["annotated_copy"] = str(expected_copy)
+            return response
 
     findings = list(read_jsonl(findings_path))
     issue_rows = []
@@ -203,7 +245,33 @@ def annotate(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             + f"{item['note']} | block={location.get('block_index')} page={location.get('page')}"
         )
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return {"annotations": len(issue_rows)}
+
+    result = {"annotations": len(issue_rows)}
+    if source_path is None or not source_path.exists():
+        result["annotated_copy"] = None
+        result["annotation_warning"] = "Bid source file not found. Sidecar annotation files were generated."
+        return result
+
+    annotated_dir = out_dir / "annotated"
+    suffix = source_path.suffix.lower()
+    output_path = annotated_dir / f"{source_path.stem}.annotated{source_path.suffix}"
+    try:
+        if suffix == ".docx":
+            stats = annotate_docx_copy(source_path=source_path, output_path=output_path, issues=issue_rows)
+        elif suffix == ".pdf":
+            stats = annotate_pdf_copy(source_path=source_path, output_path=output_path, issues=issue_rows)
+        else:
+            result["annotated_copy"] = None
+            result["annotation_warning"] = f"Unsupported annotation source type: {source_path.suffix}"
+            return result
+    except Exception as exc:  # noqa: BLE001
+        result["annotated_copy"] = None
+        result["annotation_warning"] = str(exc)
+        return result
+
+    result["annotated_copy"] = str(output_path)
+    result.update(stats)
+    return result
 
 
 def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
@@ -333,7 +401,11 @@ def run_pipeline(
         ai_workers=ai_workers,
     )
     downstream_resume = resume and ai_provider is None
-    summary["annotate"] = annotate(out_dir=out_dir, resume=downstream_resume)
+    summary["annotate"] = annotate(
+        out_dir=out_dir,
+        resume=downstream_resume,
+        bid_source=bid_path,
+    )
     summary["checklist"] = checklist(out_dir=out_dir, resume=downstream_resume)
     summary["report"] = report(out_dir=out_dir)
     return summary

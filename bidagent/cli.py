@@ -61,7 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument("--tender", help="unused in this stage, kept for CLI consistency")
 
     subparsers.add_parser("review", parents=[common], help="review bid against requirements")
-    subparsers.add_parser("annotate", parents=[common], help="generate annotations sidecar")
+    annotate_parser = subparsers.add_parser("annotate", parents=[common], help="generate annotations sidecar")
+    annotate_parser.add_argument("--bid-source", default=None, help="optional original bid file for annotated copy")
     subparsers.add_parser("report", parents=[common], help="generate markdown report")
     subparsers.add_parser("checklist", parents=[common], help="generate manual review checklist")
 
@@ -107,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
                 ai_workers=args.ai_workers,
             )
         elif args.command == "annotate":
-            result = annotate(out_dir=out_dir, resume=args.resume)
+            bid_source = Path(args.bid_source) if getattr(args, "bid_source", None) else None
+            result = annotate(out_dir=out_dir, resume=args.resume, bid_source=bid_source)
         elif args.command == "report":
             result = report(out_dir=out_dir)
         elif args.command == "checklist":
