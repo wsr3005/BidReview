@@ -4,6 +4,7 @@ import json
 import os
 import re
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -274,17 +275,29 @@ def annotate(
     findings_path = out_dir / "findings.jsonl"
 
     source_path = _resolve_bid_source(out_dir=out_dir, bid_source=bid_source)
-    expected_copy: Path | None = None
-    if source_path is not None:
-        expected_copy = out_dir / "annotated" / f"{source_path.stem}.annotated{source_path.suffix}"
+    annotated_dir = out_dir / "annotated"
+    pointer_path = annotated_dir / "annotated-copy.json"
+
+    def _load_last_copy() -> Path | None:
+        if pointer_path.exists():
+            try:
+                data = json.loads(pointer_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                data = {}
+            candidate = data.get("annotated_copy")
+            if candidate:
+                path = Path(candidate)
+                if path.exists():
+                    return path
+        return None
 
     if path_ready(annotations_path, resume) and path_ready(markdown_path, resume):
         total = sum(1 for _ in read_jsonl(annotations_path))
-        if expected_copy is None or expected_copy.exists():
-            response: dict[str, Any] = {"annotations": total}
-            if expected_copy is not None:
-                response["annotated_copy"] = str(expected_copy)
-            return response
+        response: dict[str, Any] = {"annotations": total}
+        last_copy = _load_last_copy()
+        if last_copy is not None:
+            response["annotated_copy"] = str(last_copy)
+        return response
 
     findings = list(read_jsonl(findings_path))
     issue_rows = []
@@ -351,10 +364,17 @@ def annotate(
         result["annotation_warning"] = "Bid source file not found. Sidecar annotation files were generated."
         return result
 
-    annotated_dir = out_dir / "annotated"
     suffix = source_path.suffix.lower()
-    output_path = annotated_dir / f"{source_path.stem}.annotated{source_path.suffix}"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base_name = f"{source_path.stem}.annotated.{timestamp}{source_path.suffix}"
+    output_path = annotated_dir / base_name
+    # Avoid collisions if called multiple times within the same second.
+    counter = 2
+    while output_path.exists():
+        output_path = annotated_dir / f"{source_path.stem}.annotated.{timestamp}-{counter}{source_path.suffix}"
+        counter += 1
     try:
+        annotated_dir.mkdir(parents=True, exist_ok=True)
         if suffix == ".docx":
             stats = annotate_docx_copy(source_path=source_path, output_path=output_path, issues=issue_rows)
         elif suffix == ".pdf":
@@ -378,6 +398,18 @@ def annotate(
         return result
 
     result["annotated_copy"] = str(output_path)
+    pointer_path.write_text(
+        json.dumps(
+            {
+                "annotated_copy": str(output_path),
+                "generated_at": timestamp,
+                "source": str(source_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     result.update(stats)
     return result
 

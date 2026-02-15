@@ -92,6 +92,7 @@ class AnnotateOutputTests(unittest.TestCase):
 
             annotated_path = Path(result["annotated_copy"])
             self.assertTrue(annotated_path.exists())
+            self.assertIn(".annotated.", annotated_path.name)
             with zipfile.ZipFile(annotated_path, "r") as archive:
                 document_xml = archive.read("word/document.xml").decode("utf-8")
                 comments_xml = archive.read("word/comments.xml").decode("utf-8")
@@ -339,6 +340,7 @@ class AnnotateOutputTests(unittest.TestCase):
             result = annotate(out_dir=out_dir, resume=False)
             annotated_path = Path(result["annotated_copy"])
             self.assertTrue(annotated_path.exists())
+            self.assertIn(".annotated.", annotated_path.name)
 
             reader = PdfReader(str(annotated_path))
             annots = reader.pages[0].get("/Annots")
