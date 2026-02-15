@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bidagent"
+version = "0.1.0"
+description = "CLI pipeline for business-focused bid document review"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Codex" }]
+
+[project.scripts]
+bidagent = "bidagent.cli:main"
+
+[tool.setuptools]
+packages = ["bidagent"]

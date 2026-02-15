@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+@dataclass(slots=True)
+class Location:
+    block_index: int
+    page: int | None = None
+    section: str | None = None
+
+
+@dataclass(slots=True)
+class Block:
+    doc_id: str
+    text: str
+    location: Location
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "doc_id": self.doc_id,
+            "text": self.text,
+            "location": asdict(self.location),
+        }
+
+
+@dataclass(slots=True)
+class Requirement:
+    requirement_id: str
+    text: str
+    category: str
+    mandatory: bool
+    keywords: list[str] = field(default_factory=list)
+    source: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class Finding:
+    requirement_id: str
+    status: str
+    score: int
+    severity: str
+    reason: str
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    llm: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
