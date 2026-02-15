@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
+from bidagent.consistency import find_inconsistencies
 from bidagent.document import iter_document_blocks
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm import DeepSeekReviewer, apply_llm_review
@@ -419,6 +420,19 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     return {"manual_review": len(review_rows)}
 
 
+def consistency(out_dir: Path, resume: bool = False) -> dict[str, Any]:
+    out_path = out_dir / "consistency-findings.jsonl"
+    if path_ready(out_path, resume):
+        total = sum(1 for _ in read_jsonl(out_path))
+        return {"consistency_findings": total}
+
+    bid_path = out_dir / "ingest" / "bid_blocks.jsonl"
+    bid_blocks = _iter_blocks_from_jsonl(bid_path)
+    findings = find_inconsistencies(bid_blocks)
+    total = write_jsonl(out_path, (item.to_dict() for item in findings))
+    return {"consistency_findings": total}
+
+
 def _format_trace_location(location: Any) -> str:
     if not isinstance(location, dict):
         return "block=N/A page=N/A"
@@ -576,6 +590,10 @@ def _format_primary_evidence(finding: dict[str, Any], limit: int = 80) -> str:
 def report(out_dir: Path) -> dict[str, Any]:
     requirements = list(read_jsonl(out_dir / "requirements.jsonl"))
     findings = list(read_jsonl(out_dir / "findings.jsonl"))
+    consistency_path = out_dir / "consistency-findings.jsonl"
+    consistency_findings: list[dict[str, Any]] = []
+    if consistency_path.exists():
+        consistency_findings = list(read_jsonl(consistency_path))
     manual_review_path = out_dir / "manual-review.jsonl"
     manual_review_total = 0
     if manual_review_path.exists():
@@ -594,6 +612,7 @@ def report(out_dir: Path) -> dict[str, Any]:
         f"- risk: {counts.get('risk', 0)}",
         f"- needs_ocr: {counts.get('needs_ocr', 0)}",
         f"- insufficient_evidence: {counts.get('insufficient_evidence', 0)}",
+        f"- consistency_findings: {len(consistency_findings)}",
         f"- manual_review_items: {manual_review_total}",
         "",
         "## Findings",
@@ -610,6 +629,23 @@ def report(out_dir: Path) -> dict[str, Any]:
             + f"[{item['status']}/{item['severity']}] {item['requirement_id']} "
             + f"({requirement.get('category', 'N/A')}): {item['reason']} | {evidence_text} | trace: {trace_text}"
         )
+
+    if consistency_findings:
+        lines.extend(["", "## Consistency Findings", ""])
+        for item in consistency_findings:
+            values = item.get("values") or []
+            # Keep the report readable; include top 2 values only.
+            top_values = []
+            for value_row in values[:2]:
+                top_values.append(
+                    f"{value_row.get('value_raw_examples', [''])[0]}(count={value_row.get('count')})"
+                )
+            lines.append(
+                "- "
+                + f"[{item.get('status', 'risk')}/{item.get('severity', 'medium')}] "
+                + f"{item.get('type')}: {item.get('reason')} "
+                + f"| values: {', '.join(_sanitize_md_text(v, limit=60) for v in top_values if v)}"
+            )
 
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return {"report": str(report_path), "status_counts": dict(counts)}
@@ -656,5 +692,6 @@ def run_pipeline(
         bid_source=bid_path,
     )
     summary["checklist"] = checklist(out_dir=out_dir, resume=downstream_resume)
+    summary["consistency"] = consistency(out_dir=out_dir, resume=downstream_resume)
     summary["report"] = report(out_dir=out_dir)
     return summary
