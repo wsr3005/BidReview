@@ -9,7 +9,7 @@ from typing import Protocol
 
 from bidagent.models import Finding, Requirement
 
-ALLOWED_STATUS = {"pass", "risk", "fail", "insufficient_evidence"}
+ALLOWED_STATUS = {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"}
 ALLOWED_SEVERITY = {"none", "low", "medium", "high"}
 
 
@@ -78,7 +78,7 @@ class DeepSeekReviewer:
             "evidence": evidence_rows,
             "task": "仅审查商务合规，不审查技术方案。基于证据作结论，禁止臆测。",
             "output_schema": {
-                "status": "pass|risk|fail|insufficient_evidence",
+                "status": "pass|risk|fail|needs_ocr|insufficient_evidence",
                 "severity": "none|low|medium|high",
                 "reason": "string(<=80 chars)",
                 "confidence": "number 0.0-1.0",
@@ -169,6 +169,13 @@ def apply_llm_review(
     def _review_one(index: int, finding: Finding) -> tuple[int, Finding]:
         requirement = req_map.get(finding.requirement_id)
         if requirement is None:
+            return index, finding
+        if finding.status == "needs_ocr":
+            finding.llm = {
+                "provider": reviewer.provider,
+                "model": reviewer.model,
+                "skipped": "needs_ocr",
+            }
             return index, finding
         try:
             llm_result = reviewer.review(requirement, finding)

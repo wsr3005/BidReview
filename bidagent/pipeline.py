@@ -8,9 +8,10 @@ from typing import Any
 
 from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
 from bidagent.document import iter_document_blocks
-from bidagent.io_utils import ensure_dir, path_ready, read_jsonl, write_jsonl
+from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm import DeepSeekReviewer, apply_llm_review
 from bidagent.models import Block, Location, Requirement
+from bidagent.ocr import iter_document_ocr_blocks
 from bidagent.review import extract_requirements, review_requirements
 
 
@@ -61,6 +62,15 @@ def _load_api_key(provider: str | None, api_key_file: Path | None) -> str | None
     raise ValueError("DeepSeek API key not found. Set DEEPSEEK_API_KEY or provide --ai-api-key-file.")
 
 
+def _parse_manifest_page_range(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    start, end = value
+    if not isinstance(start, int) or not isinstance(end, int):
+        return None
+    return (start, end)
+
+
 def _llm_coverage_complete(rows: list[dict[str, Any]], provider: str) -> bool:
     if not rows:
         return False
@@ -73,6 +83,7 @@ def ingest(
     out_dir: Path,
     resume: bool = False,
     page_range: tuple[int, int] | None = None,
+    ocr_mode: str = "off",
 ) -> dict[str, Any]:
     ingest_dir = out_dir / "ingest"
     ensure_dir(ingest_dir)
@@ -80,9 +91,18 @@ def ingest(
     bid_out = ingest_dir / "bid_blocks.jsonl"
     manifest_path = ingest_dir / "manifest.json"
 
-    summary: dict[str, Any] = {"tender_blocks": 0, "bid_blocks": 0}
+    summary: dict[str, Any] = {"tender_blocks": 0, "bid_blocks": 0, "bid_ocr_blocks": 0}
+    previous_manifest: dict[str, Any] = {}
+    if manifest_path.exists():
+        try:
+            previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous_manifest = {}
+    page_range_matches = _parse_manifest_page_range(previous_manifest.get("page_range")) == page_range
+    ocr_mode_matches = str(previous_manifest.get("ocr_mode", "off")) == ocr_mode
 
-    if not path_ready(tender_out, resume):
+    tender_can_resume = path_ready(tender_out, resume) and page_range_matches
+    if not tender_can_resume:
         tender_rows = (
             block.to_dict()
             for block in iter_document_blocks(tender_path, doc_id="tender", page_range=page_range)
@@ -91,19 +111,37 @@ def ingest(
     else:
         summary["tender_blocks"] = sum(1 for _ in read_jsonl(tender_out))
 
-    if not path_ready(bid_out, resume):
+    bid_can_resume = path_ready(bid_out, resume) and page_range_matches and ocr_mode_matches
+    if not bid_can_resume:
         bid_rows = (
             block.to_dict()
             for block in iter_document_blocks(bid_path, doc_id="bid", page_range=page_range)
         )
-        summary["bid_blocks"] = write_jsonl(bid_out, bid_rows)
+        bid_text_count = write_jsonl(bid_out, bid_rows)
+        ocr_rows = (
+            block.to_dict()
+            for block in iter_document_ocr_blocks(
+                bid_path,
+                doc_id="bid",
+                start_index=bid_text_count,
+                page_range=page_range,
+                ocr_mode=ocr_mode,
+            )
+        )
+        bid_ocr_count = append_jsonl(bid_out, ocr_rows)
+        summary["bid_blocks"] = bid_text_count + bid_ocr_count
+        summary["bid_ocr_blocks"] = bid_ocr_count
     else:
         summary["bid_blocks"] = sum(1 for _ in read_jsonl(bid_out))
+        summary["bid_ocr_blocks"] = int(previous_manifest.get("bid_ocr_blocks", 0))
 
     manifest = {
         "tender_path": str(tender_path.resolve()),
         "bid_path": str(bid_path.resolve()),
         "ingest_cwd": str(Path.cwd().resolve()),
+        "page_range": list(page_range) if page_range else None,
+        "ocr_mode": ocr_mode,
+        "bid_ocr_blocks": summary["bid_ocr_blocks"],
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -325,7 +363,7 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     req_map = {item["requirement_id"]: item for item in read_jsonl(requirements_path)}
     review_rows: list[dict[str, Any]] = []
     for finding in read_jsonl(findings_path):
-        is_manual = finding["status"] == "fail" or finding.get("severity") == "high"
+        is_manual = finding["status"] in {"fail", "needs_ocr"} or finding.get("severity") == "high"
         if not is_manual:
             continue
         requirement = req_map.get(finding["requirement_id"], {})
@@ -386,6 +424,7 @@ def report(out_dir: Path) -> dict[str, Any]:
         f"- pass: {counts.get('pass', 0)}",
         f"- fail: {counts.get('fail', 0)}",
         f"- risk: {counts.get('risk', 0)}",
+        f"- needs_ocr: {counts.get('needs_ocr', 0)}",
         f"- insufficient_evidence: {counts.get('insufficient_evidence', 0)}",
         f"- manual_review_items: {manual_review_total}",
         "",
@@ -413,6 +452,7 @@ def run_pipeline(
     focus: str,
     resume: bool = False,
     page_range: tuple[int, int] | None = None,
+    ocr_mode: str = "off",
     ai_provider: str | None = None,
     ai_model: str = "deepseek-chat",
     ai_api_key_file: Path | None = None,
@@ -427,6 +467,7 @@ def run_pipeline(
         out_dir=out_dir,
         resume=resume,
         page_range=page_range,
+        ocr_mode=ocr_mode,
     )
     summary["extract_req"] = extract_req(out_dir=out_dir, focus=focus, resume=resume)
     summary["review"] = review(

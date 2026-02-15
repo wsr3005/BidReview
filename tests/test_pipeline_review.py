@@ -6,8 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bidagent.io_utils import read_jsonl, write_jsonl
-from bidagent.models import Finding
-from bidagent.pipeline import review
+from bidagent.models import Block, Finding, Location
+from bidagent.pipeline import ingest, review
 
 
 class _DummyReviewer:
@@ -111,6 +111,37 @@ class PipelineReviewTests(unittest.TestCase):
 
             self.assertEqual(result["findings"], 2)
             self.assertFalse(mocked_review.called)
+
+    def test_ingest_appends_ocr_blocks_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            tender = base / "tender.txt"
+            bid = base / "bid.txt"
+            out_dir = base / "out"
+            tender.write_text("商务要求：投标人必须提供营业执照。", encoding="utf-8")
+            bid.write_text("我司已提交相关商务文件。", encoding="utf-8")
+
+            fake_ocr_blocks = [
+                Block(
+                    doc_id="bid",
+                    text="营业执照统一社会信用代码：9134XXXXXXXXXX",
+                    location=Location(block_index=2, section="OCR_MEDIA"),
+                )
+            ]
+            with patch("bidagent.pipeline.iter_document_ocr_blocks", return_value=iter(fake_ocr_blocks)):
+                result = ingest(
+                    tender_path=tender,
+                    bid_path=bid,
+                    out_dir=out_dir,
+                    resume=False,
+                    ocr_mode="auto",
+                )
+
+            self.assertEqual(result["bid_ocr_blocks"], 1)
+            self.assertEqual(result["bid_blocks"], 2)
+            rows = list(read_jsonl(out_dir / "ingest" / "bid_blocks.jsonl"))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[-1]["location"]["section"], "OCR_MEDIA")
 
 
 if __name__ == "__main__":

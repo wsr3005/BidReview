@@ -84,6 +84,18 @@ EVIDENCE_ACTION_HINTS = [
     "执行",
 ]
 
+OCR_REFERENCE_HINTS = [
+    "扫描件",
+    "复印件",
+    "影印件",
+    "附件",
+    "附后",
+    "见附",
+    "图片",
+    "照片",
+    "原件照片",
+]
+
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", text).lower()
@@ -174,18 +186,43 @@ def is_substantive_bid_block(text: str, section: str | None) -> bool:
     if re.search(r"[\.·•…]{2,}\d{1,4}$", compact):
         return False
     has_action = any(token in compact for token in EVIDENCE_ACTION_HINTS)
+    has_ocr_ref = any(token in compact for token in OCR_REFERENCE_HINTS)
     if len(compact) <= 30 and not has_action:
-        return False
+        return has_ocr_ref
     # Word heading styles often mark TOC/section titles rather than evidential content.
     if section and re.search(r"(heading|标题)", section, flags=re.IGNORECASE):
-        if len(compact) <= 60 and not has_action:
+        if len(compact) <= 60 and not has_action and not has_ocr_ref:
             return False
-    if len(compact) <= 100 and re.search(r"(项目|工程|标段|有限公司|公司)", compact) and not has_action:
+    if len(compact) <= 100 and re.search(r"(项目|工程|标段|有限公司|公司)", compact) and not has_action and not has_ocr_ref:
         return False
     # Very short title-like fragments are weak evidence and usually directory entries.
     if len(compact) <= 20 and re.fullmatch(r"[0-9一二三四五六七八九十百零第章节条款\.（）()\-A-Za-z]+", compact):
         return False
     return True
+
+
+def has_evidence_action(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text.strip())
+    if not compact:
+        return False
+    action_tokens = [token for token in EVIDENCE_ACTION_HINTS if token != "附"]
+    return any(token in compact for token in action_tokens) or any(
+        phrase in compact for phrase in ("已附", "随附", "附有")
+    )
+
+
+def is_reference_only_evidence(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text.strip())
+    if not compact:
+        return False
+    has_ocr_ref = any(token in compact for token in OCR_REFERENCE_HINTS)
+    if not has_ocr_ref:
+        return False
+    if has_evidence_action(compact):
+        return False
+    if len(compact) <= 32:
+        return True
+    return bool(re.search(r"(见附件|详见附件|附后|附件[0-9一二三四五六七八九十])", compact))
 
 
 def is_requirement_sentence(text: str) -> bool:
@@ -303,6 +340,8 @@ def _push_top_match(
         "doc_id": block.doc_id,
         "location": asdict(block.location),
         "excerpt": block.text[:240],
+        "reference_only": is_reference_only_evidence(block.text),
+        "has_action": has_evidence_action(block.text),
     }
     if len(top_matches) < 3:
         top_matches.append(candidate)
@@ -364,6 +403,23 @@ def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterabl
 
         top_score = top_matches[0]["score"]
         threshold = max(2, min(len(requirement.keywords), 4))
+        has_reference_only = all(item.get("reference_only") for item in top_matches)
+        requirement_has_ocr_ref = any(token in requirement.text for token in OCR_REFERENCE_HINTS)
+        top_reference_only = bool(top_matches[0].get("reference_only"))
+        should_mark_needs_ocr = has_reference_only or (requirement_has_ocr_ref and top_reference_only)
+        if requirement.mandatory and should_mark_needs_ocr:
+            findings.append(
+                Finding(
+                    requirement_id=requirement.requirement_id,
+                    status="needs_ocr",
+                    score=top_score,
+                    severity="medium",
+                    reason="仅命中扫描件/附件引用，需OCR复核图片证据",
+                    evidence=top_matches,
+                )
+            )
+            continue
+
         if top_score >= threshold:
             status = "pass"
             severity = "none"

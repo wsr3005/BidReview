@@ -184,6 +184,81 @@ class ReviewTests(unittest.TestCase):
         findings = review_requirements(requirements, bid_blocks)
         self.assertEqual(findings[0].status, "fail")
 
+    def test_review_marks_needs_ocr_for_reference_only_scan_evidence(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="投标人必须提供营业执照。",
+                category="资质与证照",
+                mandatory=True,
+                keywords=["营业执照", "提供"],
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="营业执照扫描件见附件1。",
+                location=Location(block_index=1, section="Normal"),
+            )
+        ]
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertEqual(findings[0].status, "needs_ocr")
+
+    def test_review_does_not_force_needs_ocr_when_substantive_text_exists(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="投标人必须提供营业执照。",
+                category="资质与证照",
+                mandatory=True,
+                keywords=["营业执照", "提供"],
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="营业执照扫描件见附件1。",
+                location=Location(block_index=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="我司已提供营业执照复印件并提交至商务文件。",
+                location=Location(block_index=2, section="Normal"),
+            ),
+        ]
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertEqual(findings[0].status, "pass")
+
+    def test_review_marks_needs_ocr_when_scan_requirement_only_hits_list_items(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="投标人综合情况简介附营业执照扫描件等材料。",
+                category="资质与证照",
+                mandatory=True,
+                keywords=["营业执照扫描件", "单位名单", "证明材料"],
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="1、营业执照扫描件",
+                location=Location(block_index=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="3、单位名单",
+                location=Location(block_index=2, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="4、证明材料",
+                location=Location(block_index=3, section="Normal"),
+            ),
+        ]
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertEqual(findings[0].status, "needs_ocr")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -123,6 +123,39 @@ class LlmReviewTests(unittest.TestCase):
         self.assertEqual(result[0].status, "pass")
         self.assertEqual(result[1].status, "fail")
 
+    def test_apply_llm_review_skips_needs_ocr_findings(self) -> None:
+        class _ShouldNotCallReviewer:
+            provider = "deepseek"
+            model = "deepseek-chat"
+
+            def review(self, requirement: Requirement, finding: Finding) -> dict:  # pragma: no cover - defensive
+                raise AssertionError("needs_ocr finding should not call reviewer")
+
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="必须提供营业执照",
+                category="资质与证照",
+                mandatory=True,
+                keywords=["营业执照"],
+            )
+        ]
+        findings = [
+            Finding(
+                requirement_id="R0001",
+                status="needs_ocr",
+                score=1,
+                severity="medium",
+                reason="仅命中扫描件引用",
+                evidence=[{"excerpt": "营业执照扫描件见附件"}],
+            )
+        ]
+
+        result = apply_llm_review(requirements, findings, _ShouldNotCallReviewer())
+        self.assertEqual(result[0].status, "needs_ocr")
+        self.assertEqual(result[0].severity, "medium")
+        self.assertEqual((result[0].llm or {}).get("skipped"), "needs_ocr")
+
 
 if __name__ == "__main__":
     unittest.main()

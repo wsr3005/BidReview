@@ -24,6 +24,12 @@ def _common_parent() -> argparse.ArgumentParser:
         default=None,
         help="optional page range for PDF: START-END",
     )
+    parent.add_argument(
+        "--ocr-mode",
+        choices=["off", "auto", "tesseract"],
+        default="off",
+        help="OCR mode for image-only evidence in bid documents",
+    )
     parent.add_argument("--workers", type=int, default=2, help="reserved for parallel stage workers")
     parent.add_argument("--batch-size", type=int, default=500, help="reserved for future batch operations")
     parent.add_argument(
@@ -94,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
                 out_dir=out_dir,
                 resume=args.resume,
                 page_range=page_range,
+                ocr_mode=args.ocr_mode,
             )
         elif args.command == "extract-req":
             result = extract_req(out_dir=out_dir, focus=args.focus, resume=args.resume)
@@ -122,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
                 focus=args.focus,
                 resume=args.resume,
                 page_range=page_range,
+                ocr_mode=args.ocr_mode,
                 ai_provider=ai_provider,
                 ai_model=args.ai_model,
                 ai_api_key_file=ai_api_key_file,

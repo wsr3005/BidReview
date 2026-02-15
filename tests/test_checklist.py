@@ -30,6 +30,11 @@ class ChecklistTests(unittest.TestCase):
                         "text": "应响应付款条款",
                         "category": "付款与结算",
                     },
+                    {
+                        "requirement_id": "R0004",
+                        "text": "必须提供营业执照",
+                        "category": "资质与证照",
+                    },
                 ],
             )
             write_jsonl(
@@ -44,15 +49,16 @@ class ChecklistTests(unittest.TestCase):
                         "evidence": [{"location": {"block_index": 18, "page": 9}}],
                     },
                     {"requirement_id": "R0003", "status": "risk", "severity": "medium", "reason": "一般风险"},
+                    {"requirement_id": "R0004", "status": "needs_ocr", "severity": "medium", "reason": "需OCR复核"},
                 ],
             )
 
             result = checklist(out_dir)
             rows = list(read_jsonl(out_dir / "manual-review.jsonl"))
 
-            self.assertEqual(result["manual_review"], 2)
-            self.assertEqual(len(rows), 2)
-            self.assertEqual({row["requirement_id"] for row in rows}, {"R0001", "R0002"})
+            self.assertEqual(result["manual_review"], 3)
+            self.assertEqual(len(rows), 3)
+            self.assertEqual({row["requirement_id"] for row in rows}, {"R0001", "R0002", "R0004"})
             self.assertTrue((out_dir / "manual-review.md").exists())
 
 
