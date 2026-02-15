@@ -405,6 +405,37 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     return {"manual_review": len(review_rows)}
 
 
+def _format_trace_location(location: Any) -> str:
+    if not isinstance(location, dict):
+        return "block=N/A page=N/A"
+    return f"block={location.get('block_index')} page={location.get('page')}"
+
+
+def _format_finding_trace(finding: dict[str, Any]) -> str:
+    trace = finding.get("decision_trace")
+    clause_id = finding.get("clause_id") or finding.get("requirement_id", "N/A")
+    if not isinstance(trace, dict):
+        evidence = finding.get("evidence", [])
+        if evidence:
+            primary = evidence[0]
+            evidence_ref = f"{primary.get('evidence_id', 'N/A')}@{_format_trace_location(primary.get('location'))}"
+        else:
+            evidence_ref = "none"
+        return f"clause={clause_id}; evidence={evidence_ref}; rule=unknown"
+
+    clause_source = trace.get("clause_source", {})
+    clause_location = _format_trace_location(clause_source.get("location"))
+    evidence_refs = trace.get("evidence_refs", [])
+    if evidence_refs:
+        first_ref = evidence_refs[0]
+        evidence_ref = f"{first_ref.get('evidence_id', 'N/A')}@{_format_trace_location(first_ref.get('location'))}"
+    else:
+        evidence_ref = "none"
+    rule = trace.get("rule", {})
+    rule_ref = f"{rule.get('engine', 'N/A')}:{rule.get('version', 'N/A')}"
+    return f"clause={clause_id}@{clause_location}; evidence={evidence_ref}; rule={rule_ref}"
+
+
 def report(out_dir: Path) -> dict[str, Any]:
     requirements = list(read_jsonl(out_dir / "requirements.jsonl"))
     findings = list(read_jsonl(out_dir / "findings.jsonl"))
@@ -435,10 +466,11 @@ def report(out_dir: Path) -> dict[str, Any]:
     req_map = {item["requirement_id"]: item for item in requirements}
     for item in findings:
         requirement = req_map.get(item["requirement_id"], {})
+        trace_text = _format_finding_trace(item)
         lines.append(
             "- "
             + f"[{item['status']}/{item['severity']}] {item['requirement_id']} "
-            + f"({requirement.get('category', 'N/A')}): {item['reason']}"
+            + f"({requirement.get('category', 'N/A')}): {item['reason']} | trace: {trace_text}"
         )
 
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

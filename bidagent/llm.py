@@ -171,6 +171,13 @@ def apply_llm_review(
         if requirement is None:
             return index, finding
         if finding.status == "needs_ocr":
+            trace = finding.decision_trace if isinstance(finding.decision_trace, dict) else {}
+            trace.setdefault("decision", {})
+            trace["decision"]["status"] = finding.status
+            trace["decision"]["reason"] = finding.reason
+            trace["decision"]["source"] = "rule"
+            trace["llm_review"] = {"skipped": "needs_ocr"}
+            finding.decision_trace = trace
             finding.llm = {
                 "provider": reviewer.provider,
                 "model": reviewer.model,
@@ -180,6 +187,13 @@ def apply_llm_review(
         try:
             llm_result = reviewer.review(requirement, finding)
         except Exception as exc:  # noqa: BLE001
+            trace = finding.decision_trace if isinstance(finding.decision_trace, dict) else {}
+            trace["llm_review"] = {
+                "provider": reviewer.provider,
+                "model": reviewer.model,
+                "error": str(exc),
+            }
+            finding.decision_trace = trace
             finding.llm = {
                 "provider": reviewer.provider,
                 "model": reviewer.model,
@@ -190,6 +204,19 @@ def apply_llm_review(
         finding.status = llm_result["status"]
         finding.severity = llm_result["severity"]
         finding.reason = llm_result["reason"] or finding.reason
+        trace = finding.decision_trace if isinstance(finding.decision_trace, dict) else {}
+        trace.setdefault("decision", {})
+        trace["decision"]["status"] = finding.status
+        trace["decision"]["reason"] = finding.reason
+        trace["decision"]["source"] = "llm"
+        trace["llm_review"] = {
+            "provider": reviewer.provider,
+            "model": reviewer.model,
+            "status": llm_result["status"],
+            "severity": llm_result["severity"],
+            "confidence": llm_result["confidence"],
+        }
+        finding.decision_trace = trace
         finding.llm = {
             "provider": reviewer.provider,
             "model": reviewer.model,

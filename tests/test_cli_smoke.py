@@ -61,6 +61,9 @@ class CliSmokeTests(unittest.TestCase):
             self.assertTrue((out / "annotations.jsonl").exists())
             self.assertTrue((out / "manual-review.jsonl").exists())
             self.assertTrue((out / "review-report.md").exists())
+            report_text = (out / "review-report.md").read_text(encoding="utf-8")
+            self.assertIn("| trace: clause=", report_text)
+            self.assertIn("rule=keyword_match:r1-trace-v1", report_text)
 
 
 if __name__ == "__main__":

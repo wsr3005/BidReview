@@ -259,6 +259,55 @@ class ReviewTests(unittest.TestCase):
         findings = review_requirements(requirements, bid_blocks)
         self.assertEqual(findings[0].status, "needs_ocr")
 
+    def test_review_outputs_traceable_clause_and_evidence(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="投标人必须提供有效营业执照。",
+                category="资质与证照",
+                mandatory=True,
+                keywords=["营业执照", "提供"],
+                source={"doc_id": "tender", "location": {"block_index": 7, "page": 2, "section": "Normal"}},
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="我司已提供有效营业执照复印件。",
+                location=Location(block_index=11, page=9, section="Normal"),
+            )
+        ]
+        findings = review_requirements(requirements, bid_blocks)
+        finding = findings[0]
+        self.assertEqual(finding.clause_id, finding.requirement_id)
+        self.assertIsNotNone(finding.decision_trace)
+        self.assertEqual(finding.decision_trace["clause_id"], finding.requirement_id)
+        self.assertEqual(finding.decision_trace["clause_source"]["location"]["block_index"], 7)
+        self.assertTrue(finding.evidence[0]["evidence_id"].startswith("E-bid-"))
+        self.assertEqual(
+            finding.decision_trace["evidence_refs"][0]["evidence_id"],
+            finding.evidence[0]["evidence_id"],
+        )
+        self.assertEqual(finding.decision_trace["rule"]["version"], "r1-trace-v1")
+
+    def test_review_keeps_trace_when_no_evidence(self) -> None:
+        requirements = extract_requirements(
+            [
+                Block(
+                    doc_id="tender",
+                    text="商务要求：投标人必须提供投标保证金缴纳凭证。",
+                    location=Location(block_index=3, page=1),
+                )
+            ],
+            focus="business",
+        )
+        findings = review_requirements(requirements, bid_blocks=[])
+        finding = findings[0]
+        self.assertEqual(finding.status, "fail")
+        self.assertIsNotNone(finding.decision_trace)
+        self.assertEqual(finding.decision_trace["decision"]["top_score"], 0)
+        self.assertEqual(finding.decision_trace["evidence_refs"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

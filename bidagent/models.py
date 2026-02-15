@@ -45,7 +45,9 @@ class Finding:
     score: int
     severity: str
     reason: str
+    clause_id: str | None = None
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    decision_trace: dict[str, Any] | None = None
     llm: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:

@@ -7,6 +7,9 @@ from typing import Iterable
 
 from bidagent.models import Block, Finding, Requirement
 
+REVIEW_RULE_ENGINE = "keyword_match"
+REVIEW_RULE_VERSION = "r1-trace-v1"
+
 BUSINESS_KEYWORDS = [
     "商务",
     "报价",
@@ -241,6 +244,13 @@ def _new_source(block: Block, text: str) -> dict:
     }
 
 
+def _build_evidence_id(block: Block) -> str:
+    page = block.location.page if isinstance(block.location.page, int) else 0
+    section = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", block.location.section or "NA")[:16]
+    section = section or "NA"
+    return f"E-{block.doc_id}-p{page}-b{block.location.block_index}-s{section}"
+
+
 def _merge_keywords(base: list[str], extra: list[str], limit: int = 10) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
@@ -336,6 +346,7 @@ def _push_top_match(
     block: Block,
 ) -> None:
     candidate = {
+        "evidence_id": _build_evidence_id(block),
         "score": score,
         "doc_id": block.doc_id,
         "location": asdict(block.location),
@@ -350,6 +361,46 @@ def _push_top_match(
     if score > top_matches[-1]["score"]:
         top_matches[-1] = candidate
         top_matches.sort(key=lambda item: item["score"], reverse=True)
+
+
+def _build_decision_trace(
+    requirement: Requirement,
+    *,
+    status: str,
+    reason: str,
+    top_score: int,
+    threshold: int,
+    evidence: list[dict],
+) -> dict:
+    source_doc_id = requirement.source.get("doc_id") if isinstance(requirement.source, dict) else None
+    source_location = requirement.source.get("location") if isinstance(requirement.source, dict) else None
+    evidence_refs = [
+        {
+            "evidence_id": item.get("evidence_id"),
+            "doc_id": item.get("doc_id"),
+            "location": item.get("location"),
+            "score": item.get("score"),
+        }
+        for item in evidence
+    ]
+    return {
+        "clause_id": requirement.requirement_id,
+        "clause_source": {
+            "doc_id": source_doc_id,
+            "location": source_location,
+        },
+        "rule": {
+            "engine": REVIEW_RULE_ENGINE,
+            "version": REVIEW_RULE_VERSION,
+        },
+        "decision": {
+            "status": status,
+            "reason": reason,
+            "top_score": top_score,
+            "threshold": threshold,
+        },
+        "evidence_refs": evidence_refs,
+    }
 
 
 def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterable[Block]) -> list[Finding]:
@@ -384,37 +435,59 @@ def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterabl
     findings: list[Finding] = []
     for index, requirement in enumerate(requirement_list):
         top_matches = req_scores[index]
+        threshold = max(2, min(len(requirement.keywords), 4))
 
         if not top_matches:
             status = "fail" if requirement.mandatory else "insufficient_evidence"
             reason = "未检索到相关证据"
             severity = "high" if requirement.mandatory else "medium"
+            trace = _build_decision_trace(
+                requirement,
+                status=status,
+                reason=reason,
+                top_score=0,
+                threshold=threshold,
+                evidence=[],
+            )
             findings.append(
                 Finding(
                     requirement_id=requirement.requirement_id,
+                    clause_id=requirement.requirement_id,
                     status=status,
                     score=0,
                     severity=severity,
                     reason=reason,
+                    decision_trace=trace,
                     evidence=[],
                 )
             )
             continue
 
         top_score = top_matches[0]["score"]
-        threshold = max(2, min(len(requirement.keywords), 4))
         has_reference_only = all(item.get("reference_only") for item in top_matches)
         requirement_has_ocr_ref = any(token in requirement.text for token in OCR_REFERENCE_HINTS)
         top_reference_only = bool(top_matches[0].get("reference_only"))
         should_mark_needs_ocr = has_reference_only or (requirement_has_ocr_ref and top_reference_only)
         if requirement.mandatory and should_mark_needs_ocr:
+            status = "needs_ocr"
+            reason = "仅命中扫描件/附件引用，需OCR复核图片证据"
+            trace = _build_decision_trace(
+                requirement,
+                status=status,
+                reason=reason,
+                top_score=top_score,
+                threshold=threshold,
+                evidence=top_matches,
+            )
             findings.append(
                 Finding(
                     requirement_id=requirement.requirement_id,
-                    status="needs_ocr",
+                    clause_id=requirement.requirement_id,
+                    status=status,
                     score=top_score,
                     severity="medium",
-                    reason="仅命中扫描件/附件引用，需OCR复核图片证据",
+                    reason=reason,
+                    decision_trace=trace,
                     evidence=top_matches,
                 )
             )
@@ -438,13 +511,23 @@ def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterabl
             severity = "medium"
             reason = "证据强度不足"
 
+        trace = _build_decision_trace(
+            requirement,
+            status=status,
+            reason=reason,
+            top_score=top_score,
+            threshold=threshold,
+            evidence=top_matches,
+        )
         findings.append(
             Finding(
                 requirement_id=requirement.requirement_id,
+                clause_id=requirement.requirement_id,
                 status=status,
                 score=top_score,
                 severity=severity,
                 reason=reason,
+                decision_trace=trace,
                 evidence=top_matches,
             )
         )

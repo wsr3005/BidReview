@@ -37,6 +37,7 @@ uv run bidagent run \
 ## Notes
 
 - Large files are handled in a staged, resumable pipeline.
+- Findings include a trace chain (`clause_id`, `evidence_id`, `decision_trace`) for auditability.
 - For image evidence (e.g. scanned licenses), use `--ocr-mode auto|tesseract`.
 - If only "scan attachment reference" is detected but OCR text is missing, status becomes `needs_ocr`.
 - PDF parsing depends on `pypdf` (optional). If unavailable, use TXT/DOCX or install `pypdf`.
