@@ -302,6 +302,35 @@ class AnnotateOutputTests(unittest.TestCase):
             self.assertTrue(result.get("annotated_copy"))
             self.assertTrue(Path(result["annotated_copy"]).exists())
 
+    def test_annotate_resume_returns_existing_legacy_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "annotated").mkdir(parents=True, exist_ok=True)
+
+            bid_docx = base / "bid.docx"
+            tender_txt = base / "tender.txt"
+            _create_minimal_docx(bid_docx, ["投标人必须提供营业执照"])
+            tender_txt.write_text("商务要求：投标人必须提供营业执照。", encoding="utf-8")
+
+            ingest(
+                tender_path=tender_txt,
+                bid_path=bid_docx,
+                out_dir=out_dir,
+                resume=False,
+            )
+
+            # Simulate an old run that created legacy annotated copy without writing the pointer file.
+            legacy_copy = out_dir / "annotated" / f"{bid_docx.stem}.annotated{bid_docx.suffix}"
+            legacy_copy.write_bytes(bid_docx.read_bytes())
+
+            write_jsonl(out_dir / "annotations.jsonl", [{"note": "existing"}])
+            (out_dir / "annotations.md").write_text("# Review Annotations\n- existing\n", encoding="utf-8")
+
+            result = annotate(out_dir=out_dir, resume=True)
+            self.assertEqual(Path(result["annotated_copy"]), legacy_copy)
+
     @unittest.skipUnless(importlib.util.find_spec("pypdf") is not None, "pypdf is required")
     def test_annotate_generates_pdf_copy_with_annotations(self) -> None:
         from pypdf import PdfReader, PdfWriter

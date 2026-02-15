@@ -289,6 +289,17 @@ def annotate(
                 path = Path(candidate)
                 if path.exists():
                     return path
+        # Backward-compatible fallback: older runs used a fixed name without timestamp,
+        # and some resume flows may not have written the pointer yet.
+        if source_path is not None:
+            legacy = annotated_dir / f"{source_path.stem}.annotated{source_path.suffix}"
+            if legacy.exists():
+                return legacy
+            pattern = f"{source_path.stem}.annotated.*{source_path.suffix}"
+            matches = list(annotated_dir.glob(pattern))
+            if matches:
+                matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                return matches[0]
         return None
 
     if path_ready(annotations_path, resume) and path_ready(markdown_path, resume):
@@ -771,7 +782,9 @@ def run_pipeline(
         ai_workers=ai_workers,
         ai_min_confidence=ai_min_confidence,
     )
-    downstream_resume = resume and ai_provider is None
+    # Even when resuming expensive upstream stages, keep downstream deliverables fresh.
+    # This also guarantees a new timestamped annotated copy after each `run`.
+    downstream_resume = False
     summary["annotate"] = annotate(
         out_dir=out_dir,
         resume=downstream_resume,
