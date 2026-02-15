@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import random
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,11 +52,41 @@ class DeepSeekReviewer:
         model: str = "deepseek-chat",
         base_url: str = "https://api.deepseek.com/v1",
         timeout_seconds: int = 90,
+        max_retries: int = 4,
     ) -> None:
         self.api_key = api_key.strip()
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.max_retries = max(0, int(max_retries))
+        # Shared cooldown to reduce thundering herd on 429 across worker threads.
+        self._cooldown_lock = threading.Lock()
+        self._cooldown_until = 0.0
+
+    def _maybe_sleep_for_cooldown(self) -> None:
+        with self._cooldown_lock:
+            until = float(self._cooldown_until)
+        now = time.time()
+        if until > now:
+            time.sleep(min(60.0, until - now))
+
+    def _set_cooldown(self, seconds: float) -> None:
+        delay = max(0.0, float(seconds))
+        now = time.time()
+        with self._cooldown_lock:
+            self._cooldown_until = max(float(self._cooldown_until), now + delay)
+
+    @staticmethod
+    def _parse_retry_after(value: str | None) -> float | None:
+        if not value:
+            return None
+        try:
+            seconds = float(str(value).strip())
+        except ValueError:
+            return None
+        if seconds < 0:
+            return None
+        return seconds
 
     def _build_messages(self, requirement: Requirement, finding: Finding) -> list[dict]:
         evidence_rows = []
@@ -117,14 +150,47 @@ class DeepSeekReviewer:
             method="POST",
         )
 
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"DeepSeek HTTP {exc.code}: {detail[:200]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"DeepSeek request failed: {exc.reason}") from exc
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            self._maybe_sleep_for_cooldown()
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    body = response.read().decode("utf-8")
+                last_error = None
+                break
+            except urllib.error.HTTPError as exc:
+                retry_after = self._parse_retry_after(exc.headers.get("Retry-After"))
+                code = int(getattr(exc, "code", 0) or 0)
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    detail = ""
+
+                # Retry policy:
+                # - 429: respect Retry-After when present; otherwise backoff. Also set a shared cooldown.
+                # - 5xx/408: retry with backoff.
+                # - others: fail fast.
+                if attempt < self.max_retries and (code == 429 or code == 408 or 500 <= code <= 599):
+                    base = retry_after if retry_after is not None else (1.0 * (2**attempt))
+                    delay = min(60.0, base + random.uniform(0.0, 0.5))
+                    if code == 429:
+                        self._set_cooldown(delay)
+                    time.sleep(delay)
+                    last_error = RuntimeError(f"DeepSeek HTTP {code}: {detail[:200]}")
+                    continue
+                raise RuntimeError(f"DeepSeek HTTP {code}: {detail[:200]}") from exc
+            except urllib.error.URLError as exc:
+                # Transient network errors: retry with backoff.
+                if attempt < self.max_retries:
+                    delay = min(60.0, (1.0 * (2**attempt)) + random.uniform(0.0, 0.5))
+                    time.sleep(delay)
+                    last_error = RuntimeError(f"DeepSeek request failed: {exc.reason}")
+                    continue
+                raise RuntimeError(f"DeepSeek request failed: {exc.reason}") from exc
+
+        if last_error is not None:
+            raise last_error
 
         data_obj = json.loads(body)
         choices = data_obj.get("choices", [])
@@ -249,10 +315,32 @@ def apply_llm_review(
         }
         return index, finding
 
+    # Bounded scheduling: avoid creating thousands of Future objects at once on huge runs.
     results: list[Finding] = [*findings]
+    if not findings:
+        return results
+
+    max_in_flight = max(2, worker_count * 2)
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(_review_one, idx, finding) for idx, finding in enumerate(findings)]
-        for future in as_completed(futures):
-            idx, updated_finding = future.result()
+        it = iter(enumerate(findings))
+        in_flight = set()
+
+        def _submit_next() -> bool:
+            try:
+                idx, finding = next(it)
+            except StopIteration:
+                return False
+            in_flight.add(executor.submit(_review_one, idx, finding))
+            return True
+
+        while len(in_flight) < max_in_flight and _submit_next():
+            pass
+
+        while in_flight:
+            done = next(as_completed(in_flight))
+            in_flight.remove(done)
+            idx, updated_finding = done.result()
             results[idx] = updated_finding
+            _submit_next()
+
     return results
