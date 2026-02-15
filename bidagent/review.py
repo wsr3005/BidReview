@@ -43,6 +43,33 @@ TECHNICAL_HINTS = [
 
 MANDATORY_HINTS = ["必须", "应", "须", "不得", "严禁", "需", "要求"]
 MANDATORY_STRONG_HINTS = ["必须", "应", "须", "不得", "严禁", "需"]
+SCORE_HINTS = ["评分", "得分", "加分", "扣分", "分值", "评分标准"]
+
+TIER_ORDER = {"general": 0, "scored": 1, "hard_fail": 2}
+
+HARD_FAIL_HINTS = [
+    "否决",
+    "废标",
+    "无效投标",
+    "不响应",
+    "将被否决",
+    "将被废标",
+    "视为无效",
+    "否则",
+]
+
+
+def infer_rule_tier(text: str, *, mandatory: bool) -> str:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return "general"
+    if any(token in compact for token in SCORE_HINTS):
+        return "scored"
+    if any(token in compact for token in HARD_FAIL_HINTS):
+        return "hard_fail"
+    if mandatory and re.search(r"(不满足|未提供|未提交|未响应).{0,12}(将被|视为|否则)", compact):
+        return "hard_fail"
+    return "general"
 
 STOP_WORDS = {
     "投标",
@@ -235,6 +262,8 @@ def is_requirement_sentence(text: str) -> bool:
         return False
     if any(token in text for token in MANDATORY_STRONG_HINTS):
         return True
+    if any(token in text for token in SCORE_HINTS):
+        return True
     return bool(re.search(r"(符合|满足|达到).{0,12}要求", text))
 
 
@@ -301,6 +330,11 @@ def _merge_requirement(existing: Requirement, candidate: Requirement) -> None:
         existing.constraints = list(existing.constraints) + [
             item for item in candidate.constraints if item not in existing.constraints
         ]
+    # Elevate tier if the merged candidate is stricter (hard_fail > scored > general).
+    existing_tier = getattr(existing, "rule_tier", "general")
+    candidate_tier = getattr(candidate, "rule_tier", "general")
+    if TIER_ORDER.get(candidate_tier, 0) > TIER_ORDER.get(existing_tier, 0):
+        existing.rule_tier = candidate_tier
 
     merged_sources = existing.source.setdefault("merged_sources", [])
     incoming_sources = candidate.source.get("merged_sources", [])
@@ -328,14 +362,16 @@ def extract_requirements(
             if not is_requirement_sentence(text):
                 continue
             source = _new_source(block, text)
+            mandatory = any(token in text for token in MANDATORY_STRONG_HINTS)
             candidate = Requirement(
                 requirement_id="",
                 text=text,
                 category=classify_category(text),
                 # "要求" is too generic; use strong obligation hints to reduce false mandatory flags.
-                mandatory=any(token in text for token in MANDATORY_STRONG_HINTS),
+                mandatory=mandatory,
                 keywords=extract_keywords(text),
                 constraints=extract_constraints(text),
+                rule_tier=infer_rule_tier(text, mandatory=mandatory),
                 source={
                     "doc_id": source["doc_id"],
                     "location": source["location"],

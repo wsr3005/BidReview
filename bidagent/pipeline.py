@@ -43,6 +43,7 @@ def _row_to_requirement(row: dict[str, Any]) -> Requirement:
         mandatory=bool(row.get("mandatory", False)),
         keywords=list(row.get("keywords", [])),
         constraints=list(row.get("constraints", [])),
+        rule_tier=str(row.get("rule_tier") or "general"),
         source=row.get("source", {}),
     )
 
@@ -394,10 +395,15 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     req_map = {item["requirement_id"]: item for item in read_jsonl(requirements_path)}
     review_rows: list[dict[str, Any]] = []
     for finding in read_jsonl(findings_path):
-        is_manual = finding["status"] in {"fail", "needs_ocr"} or finding.get("severity") == "high"
+        requirement = req_map.get(finding["requirement_id"], {})
+        tier = str(requirement.get("rule_tier") or "general")
+        is_manual = (
+            finding["status"] in {"fail", "needs_ocr"}
+            or finding.get("severity") == "high"
+            or (tier == "hard_fail" and finding.get("status") != "pass")
+        )
         if not is_manual:
             continue
-        requirement = req_map.get(finding["requirement_id"], {})
         evidence = finding.get("evidence", [])
         primary = _choose_primary_evidence(evidence, status=str(finding.get("status") or ""))
         if not primary:
@@ -405,6 +411,7 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         review_rows.append(
             {
                 "requirement_id": finding["requirement_id"],
+                "tier": tier,
                 "status": finding["status"],
                 "severity": finding.get("severity", "medium"),
                 "reason": finding.get("reason", ""),
@@ -418,6 +425,17 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             }
         )
 
+    tier_rank = {"hard_fail": 0, "scored": 1, "general": 2}
+    severity_rank = {"high": 0, "medium": 1, "low": 2, "none": 3}
+    review_rows.sort(
+        key=lambda row: (
+            tier_rank.get(str(row.get("tier") or "general"), 9),
+            0 if str(row.get("status")) in {"fail"} else 1,
+            severity_rank.get(str(row.get("severity") or "medium"), 9),
+            str(row.get("requirement_id") or ""),
+        )
+    )
+
     write_jsonl(review_jsonl, review_rows)
 
     lines = [
@@ -430,7 +448,7 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         location = row["target"].get("location") or {}
         lines.append(
             "- "
-            + f"[{row['status']}/{row['severity']}] {row['requirement_id']} "
+            + f"[{row.get('tier','general')}/{row['status']}/{row['severity']}] {row['requirement_id']} "
             + f"({row['category']}) block={location.get('block_index')} page={location.get('page')} "
             + f"| {row['reason']}"
         )
@@ -617,6 +635,13 @@ def report(out_dir: Path) -> dict[str, Any]:
     if manual_review_path.exists():
         manual_review_total = sum(1 for _ in read_jsonl(manual_review_path))
     counts = Counter(item["status"] for item in findings)
+    tier_counts = Counter(str(item.get("rule_tier") or "general") for item in requirements)
+    req_tier_map = {item.get("requirement_id"): str(item.get("rule_tier") or "general") for item in requirements}
+    hard_fail_status = Counter(
+        item["status"]
+        for item in findings
+        if req_tier_map.get(item.get("requirement_id")) == "hard_fail"
+    )
     report_path = out_dir / "review-report.md"
 
     lines = [
@@ -625,11 +650,19 @@ def report(out_dir: Path) -> dict[str, Any]:
         "## Summary",
         "",
         f"- Total requirements: {len(requirements)}",
+        f"- hard_fail_requirements: {tier_counts.get('hard_fail', 0)}",
+        f"- scored_requirements: {tier_counts.get('scored', 0)}",
+        f"- general_requirements: {tier_counts.get('general', 0)}",
         f"- pass: {counts.get('pass', 0)}",
         f"- fail: {counts.get('fail', 0)}",
         f"- risk: {counts.get('risk', 0)}",
         f"- needs_ocr: {counts.get('needs_ocr', 0)}",
         f"- insufficient_evidence: {counts.get('insufficient_evidence', 0)}",
+        f"- hard_fail_pass: {hard_fail_status.get('pass', 0)}",
+        f"- hard_fail_fail: {hard_fail_status.get('fail', 0)}",
+        f"- hard_fail_risk: {hard_fail_status.get('risk', 0)}",
+        f"- hard_fail_needs_ocr: {hard_fail_status.get('needs_ocr', 0)}",
+        f"- hard_fail_insufficient_evidence: {hard_fail_status.get('insufficient_evidence', 0)}",
         f"- consistency_findings: {len(consistency_findings)}",
         f"- manual_review_items: {manual_review_total}",
         "",
@@ -642,10 +675,11 @@ def report(out_dir: Path) -> dict[str, Any]:
         requirement = req_map.get(item["requirement_id"], {})
         trace_text = _format_finding_trace(item)
         evidence_text = _format_primary_evidence(item)
+        tier = str(requirement.get("rule_tier") or "general")
         lines.append(
             "- "
             + f"[{item['status']}/{item['severity']}] {item['requirement_id']} "
-            + f"({requirement.get('category', 'N/A')}): {item['reason']} | {evidence_text} | trace: {trace_text}"
+            + f"({tier}/{requirement.get('category', 'N/A')}): {item['reason']} | {evidence_text} | trace: {trace_text}"
         )
 
     if consistency_findings:

@@ -36,6 +36,9 @@ class Requirement:
     # Each item is a dict like: {"type": "amount|term|quantity", "op": ">="|"<="|"="|None, "value": int|float|str,
     # "unit": "元|万元|天|月|年|份|套|台|项|个|..." , "raw": "..."}
     constraints: list[dict[str, Any]] = field(default_factory=list)
+    # Requirement tier for prioritization and gating.
+    # hard_fail: mandatory knockout clause; scored: evaluation/scoring item; general: other checkable requirement.
+    rule_tier: str = "general"
     source: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
