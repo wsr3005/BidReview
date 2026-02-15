@@ -436,6 +436,24 @@ def _format_finding_trace(finding: dict[str, Any]) -> str:
     return f"clause={clause_id}@{clause_location}; evidence={evidence_ref}; rule={rule_ref}"
 
 
+def _format_primary_evidence(finding: dict[str, Any], limit: int = 80) -> str:
+    evidence = finding.get("evidence", [])
+    if not isinstance(evidence, list) or not evidence:
+        return "evidence: none"
+    primary = evidence[0] if isinstance(evidence[0], dict) else {}
+    location = primary.get("location")
+    excerpt = str(primary.get("excerpt") or "").strip().replace("\n", " ")
+    if len(excerpt) > limit:
+        excerpt = excerpt[:limit] + "..."
+    return (
+        "evidence: "
+        + f"{primary.get('evidence_id', 'N/A')} "
+        + f"{_format_trace_location(location)} "
+        + f"score={primary.get('score', 'N/A')} "
+        + f"\"{excerpt}\""
+    )
+
+
 def report(out_dir: Path) -> dict[str, Any]:
     requirements = list(read_jsonl(out_dir / "requirements.jsonl"))
     findings = list(read_jsonl(out_dir / "findings.jsonl"))
@@ -467,10 +485,11 @@ def report(out_dir: Path) -> dict[str, Any]:
     for item in findings:
         requirement = req_map.get(item["requirement_id"], {})
         trace_text = _format_finding_trace(item)
+        evidence_text = _format_primary_evidence(item)
         lines.append(
             "- "
             + f"[{item['status']}/{item['severity']}] {item['requirement_id']} "
-            + f"({requirement.get('category', 'N/A')}): {item['reason']} | trace: {trace_text}"
+            + f"({requirement.get('category', 'N/A')}): {item['reason']} | {evidence_text} | trace: {trace_text}"
         )
 
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -18,8 +18,9 @@ class CliSmokeTests(unittest.TestCase):
             tender.write_text(
                 "\n".join(
                     [
-                        "商务要求：投标人必须提供有效营业执照。",
-                        "商务要求：投标人应提供近三年类似项目业绩。",
+                        # Use punctuation to help keyword extraction keep "营业执照" as a standalone keyword.
+                        "商务要求：投标人必须提供：营业执照。",
+                        "商务要求：投标人应提供：类似项目业绩。",
                         "技术参数必须满足性能指标。",
                     ]
                 ),
@@ -64,6 +65,8 @@ class CliSmokeTests(unittest.TestCase):
             report_text = (out / "review-report.md").read_text(encoding="utf-8")
             self.assertIn("| trace: clause=", report_text)
             self.assertIn("rule=keyword_match:r1-trace-v1", report_text)
+            self.assertIn("| evidence:", report_text)
+            self.assertIn("我司已提供有效营业执照复印件", report_text)
 
 
 if __name__ == "__main__":
