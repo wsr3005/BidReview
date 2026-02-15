@@ -267,9 +267,16 @@ def annotate(
         if row["status"] == "pass":
             continue
         evidence = row.get("evidence", [])
-        primary = evidence[0] if evidence else {}
+        primary = _choose_primary_evidence(evidence, status=str(row.get("status") or ""))
+        if not primary:
+            primary = {}
         alternates = []
-        for item in evidence[1:3]:
+        for item in _choose_alternate_evidence(
+            evidence,
+            primary,
+            status=str(row.get("status") or ""),
+            limit=2,
+        ):
             alternates.append(
                 {
                     "doc_id": item.get("doc_id", "bid"),
@@ -368,7 +375,9 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             continue
         requirement = req_map.get(finding["requirement_id"], {})
         evidence = finding.get("evidence", [])
-        primary = evidence[0] if evidence else {}
+        primary = _choose_primary_evidence(evidence, status=str(finding.get("status") or ""))
+        if not primary:
+            primary = {}
         review_rows.append(
             {
                 "requirement_id": finding["requirement_id"],
@@ -411,6 +420,91 @@ def _format_trace_location(location: Any) -> str:
     return f"block={location.get('block_index')} page={location.get('page')}"
 
 
+def _is_mappable_location(location: Any) -> bool:
+    if not isinstance(location, dict):
+        return False
+    block_index = location.get("block_index")
+    page = location.get("page")
+    return (isinstance(block_index, int) and block_index > 0) or (isinstance(page, int) and page > 0)
+
+
+def _choose_primary_evidence(evidence: Any, *, status: str | None = None) -> dict[str, Any]:
+    if not isinstance(evidence, list) or not evidence:
+        return {}
+
+    candidates = [item for item in evidence if isinstance(item, dict)]
+    if status == "needs_ocr":
+        reference_candidates = [item for item in candidates if item.get("reference_only")]
+        if reference_candidates:
+            candidates = reference_candidates
+    else:
+        non_reference_candidates = [item for item in candidates if not item.get("reference_only")]
+        if non_reference_candidates:
+            candidates = non_reference_candidates
+
+    def _ocr_hint_score(excerpt: str) -> int:
+        score = 0
+        for token in ("营业执照", "扫描件", "复印件", "影印件", "附件"):
+            if token in excerpt:
+                score += 1
+        return score
+
+    best: dict[str, Any] = {}
+    best_key: tuple[int, int, int, int, int] = (-1, -1, -1, -1, -1)
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        location = item.get("location")
+        mappable = 1 if _is_mappable_location(location) else 0
+        has_action = 1 if item.get("has_action") else 0
+        excerpt = str(item.get("excerpt") or "").strip()
+        excerpt_len = len(excerpt)
+        try:
+            score = int(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        if status == "needs_ocr":
+            key = (mappable, _ocr_hint_score(excerpt), excerpt_len, score, has_action)
+        else:
+            key = (mappable, score, has_action, excerpt_len, 0)
+        if key > best_key:
+            best_key = key
+            best = item
+    return best
+
+
+def _choose_alternate_evidence(
+    evidence: Any,
+    primary: dict[str, Any],
+    *,
+    status: str | None = None,
+    limit: int = 2,
+) -> list[dict[str, Any]]:
+    if not isinstance(evidence, list) or not evidence:
+        return []
+    primary_id = primary.get("evidence_id")
+    alternates: list[dict[str, Any]] = []
+    for item in sorted(
+        (item for item in evidence if isinstance(item, dict)),
+        key=lambda item: (
+            1 if _is_mappable_location(item.get("location")) else 0,
+            0 if status == "needs_ocr" and item.get("reference_only") else 1,
+            0 if status != "needs_ocr" and item.get("reference_only") else 1,
+            int(item.get("score") or 0),
+            len(str(item.get("excerpt") or "")),
+        ),
+        reverse=True,
+    ):
+        if not isinstance(item, dict):
+            continue
+        if primary_id and item.get("evidence_id") == primary_id:
+            continue
+        alternates.append(item)
+        if len(alternates) >= limit:
+            break
+    return alternates
+
+
 def _format_finding_trace(finding: dict[str, Any]) -> str:
     trace = finding.get("decision_trace")
     clause_id = finding.get("clause_id") or finding.get("requirement_id", "N/A")
@@ -440,7 +534,9 @@ def _format_primary_evidence(finding: dict[str, Any], limit: int = 80) -> str:
     evidence = finding.get("evidence", [])
     if not isinstance(evidence, list) or not evidence:
         return "evidence: none"
-    primary = evidence[0] if isinstance(evidence[0], dict) else {}
+    primary = _choose_primary_evidence(evidence, status=str(finding.get("status") or ""))
+    if not primary:
+        return "evidence: none"
     location = primary.get("location")
     excerpt = str(primary.get("excerpt") or "").strip().replace("\n", " ")
     if len(excerpt) > limit:

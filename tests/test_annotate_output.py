@@ -7,7 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from bidagent.io_utils import write_jsonl
+from bidagent.io_utils import read_jsonl, write_jsonl
 from bidagent.pipeline import annotate, ingest
 
 
@@ -148,6 +148,110 @@ class AnnotateOutputTests(unittest.TestCase):
             self.assertEqual(result["annotations"], 1)
             self.assertIsNone(result.get("annotated_copy"))
             self.assertTrue(result.get("annotation_warning"))
+
+    def test_annotate_prefers_non_reference_evidence_as_primary_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            bid_docx = base / "bid.docx"
+            tender_txt = base / "tender.txt"
+            _create_minimal_docx(bid_docx, ["营业执照扫描件", "我司已提供有效营业执照复印件"])
+            tender_txt.write_text("商务要求：投标人必须提供：营业执照。", encoding="utf-8")
+
+            ingest(
+                tender_path=tender_txt,
+                bid_path=bid_docx,
+                out_dir=out_dir,
+                resume=False,
+            )
+
+            # evidence[0] is a scan-title reference-only; evidence[1] is substantive.
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "risk",
+                        "severity": "high",
+                        "reason": "证据不足",
+                        "evidence": [
+                            {
+                                "doc_id": "bid",
+                                "location": {"block_index": 1},
+                                "excerpt": "营业执照扫描件",
+                                "score": 1,
+                                "reference_only": True,
+                            },
+                            {
+                                "doc_id": "bid",
+                                "location": {"block_index": 2},
+                                "excerpt": "我司已提供有效营业执照复印件",
+                                "score": 1,
+                                "reference_only": False,
+                                "has_action": True,
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            result = annotate(out_dir=out_dir, resume=False)
+            self.assertEqual(result["annotations"], 1)
+            row = next(read_jsonl(out_dir / "annotations.jsonl"))
+            self.assertEqual((row.get("target") or {}).get("location", {}).get("block_index"), 2)
+
+    def test_annotate_prefers_reference_evidence_for_needs_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            bid_docx = base / "bid.docx"
+            tender_txt = base / "tender.txt"
+            _create_minimal_docx(bid_docx, ["营业执照扫描件", "其他清单项", "我司已提供有效营业执照复印件"])
+            tender_txt.write_text("商务要求：投标人必须提供：营业执照扫描件。", encoding="utf-8")
+
+            ingest(
+                tender_path=tender_txt,
+                bid_path=bid_docx,
+                out_dir=out_dir,
+                resume=False,
+            )
+
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "needs_ocr",
+                        "severity": "medium",
+                        "reason": "需OCR复核",
+                        "evidence": [
+                            {
+                                "doc_id": "bid",
+                                "location": {"block_index": 1},
+                                "excerpt": "营业执照扫描件",
+                                "score": 1,
+                                "reference_only": True,
+                            },
+                            {
+                                "doc_id": "bid",
+                                "location": {"block_index": 3},
+                                "excerpt": "我司已提供有效营业执照复印件",
+                                "score": 1,
+                                "reference_only": False,
+                                "has_action": True,
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            annotate(out_dir=out_dir, resume=False)
+            row = next(read_jsonl(out_dir / "annotations.jsonl"))
+            self.assertEqual((row.get("target") or {}).get("location", {}).get("block_index"), 1)
 
     def test_resolve_manifest_relative_path_after_cwd_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
