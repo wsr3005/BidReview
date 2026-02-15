@@ -230,6 +230,16 @@ def annotate(
             continue
         evidence = row.get("evidence", [])
         primary = evidence[0] if evidence else {}
+        alternates = []
+        for item in evidence[1:3]:
+            alternates.append(
+                {
+                    "doc_id": item.get("doc_id", "bid"),
+                    "location": item.get("location"),
+                    "excerpt": item.get("excerpt"),
+                    "score": item.get("score"),
+                }
+            )
         issue_rows.append(
             {
                 "requirement_id": row["requirement_id"],
@@ -240,7 +250,9 @@ def annotate(
                     "doc_id": primary.get("doc_id", "bid"),
                     "location": primary.get("location"),
                     "excerpt": primary.get("excerpt"),
+                    "score": primary.get("score"),
                 },
+                "alternate_targets": alternates,
                 "note": (
                     f"[{row['severity']}] {row['requirement_id']} {row['status']}: "
                     f"{row['reason']}"
@@ -253,9 +265,13 @@ def annotate(
     lines = ["# Review Annotations", ""]
     for item in issue_rows:
         location = item["target"].get("location") or {}
+        alt_count = len(item.get("alternate_targets", []))
         lines.append(
             "- "
-            + f"{item['note']} | block={location.get('block_index')} page={location.get('page')}"
+            + (
+                f"{item['note']} | block={location.get('block_index')} page={location.get('page')} "
+                f"score={item['target'].get('score')} alt={alt_count}"
+            )
         )
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

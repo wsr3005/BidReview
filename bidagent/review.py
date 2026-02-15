@@ -69,6 +69,21 @@ NON_CHECKABLE_HINTS = [
     "附表",
 ]
 
+EVIDENCE_ACTION_HINTS = [
+    "提供",
+    "提交",
+    "附",
+    "响应",
+    "满足",
+    "承诺",
+    "声明",
+    "保证",
+    "签署",
+    "盖章",
+    "同意",
+    "执行",
+]
+
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", text).lower()
@@ -152,14 +167,21 @@ def is_substantive_bid_block(text: str, section: str | None) -> bool:
     compact = re.sub(r"\s+", "", text.strip())
     if not compact:
         return False
+    if section and re.search(r"(toc|目录)", section, flags=re.IGNORECASE):
+        return False
     if is_catalog_or_heading(compact):
         return False
     if re.search(r"[\.·•…]{2,}\d{1,4}$", compact):
         return False
+    has_action = any(token in compact for token in EVIDENCE_ACTION_HINTS)
+    if len(compact) <= 30 and not has_action:
+        return False
     # Word heading styles often mark TOC/section titles rather than evidential content.
     if section and re.search(r"(heading|标题)", section, flags=re.IGNORECASE):
-        if len(compact) <= 60 and not re.search(r"(提供|提交|附|响应|满足|承诺)", compact):
+        if len(compact) <= 60 and not has_action:
             return False
+    if len(compact) <= 100 and re.search(r"(项目|工程|标段|有限公司|公司)", compact) and not has_action:
+        return False
     # Very short title-like fragments are weak evidence and usually directory entries.
     if len(compact) <= 20 and re.fullmatch(r"[0-9一二三四五六七八九十百零第章节条款\.（）()\-A-Za-z]+", compact):
         return False

@@ -164,6 +164,26 @@ class ReviewTests(unittest.TestCase):
         findings = review_requirements(requirements, bid_blocks)
         self.assertEqual(findings[0].status, "pass")
 
+    def test_review_ignores_project_title_like_block(self) -> None:
+        requirements = [
+            Requirement(
+                requirement_id="R0001",
+                text="投标人必须提供保密承诺函。",
+                category="有效期与响应",
+                mandatory=True,
+                keywords=["保密", "承诺函"],
+            )
+        ]
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="某某有限公司某项目投标文件",
+                location=Location(block_index=1, section="Normal"),
+            )
+        ]
+        findings = review_requirements(requirements, bid_blocks)
+        self.assertEqual(findings[0].status, "fail")
+
 
 if __name__ == "__main__":
     unittest.main()
