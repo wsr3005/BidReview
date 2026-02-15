@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from bidagent.document import parse_page_range
+from bidagent.eval import evaluate_and_write
 from bidagent.pipeline import annotate, checklist, extract_req, ingest, report, review, run_pipeline
 
 
@@ -77,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_parser.add_argument("--bid-source", default=None, help="optional original bid file for annotated copy")
     subparsers.add_parser("report", parents=[common], help="generate markdown report")
     subparsers.add_parser("checklist", parents=[common], help="generate manual review checklist")
+    subparsers.add_parser("eval", parents=[common], help="evaluate run outputs with a gold set (runs/<x>/eval/gold.jsonl)")
 
     run_parser = subparsers.add_parser("run", parents=[common], help="run full pipeline")
     run_parser.add_argument("--tender", required=True, help="tender file path")
@@ -128,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
             result = report(out_dir=out_dir)
         elif args.command == "checklist":
             result = checklist(out_dir=out_dir, resume=args.resume)
+        elif args.command == "eval":
+            result = evaluate_and_write(out_dir)
         elif args.command == "run":
             result = run_pipeline(
                 tender_path=Path(args.tender),

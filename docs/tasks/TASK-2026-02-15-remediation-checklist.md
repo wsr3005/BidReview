@@ -47,7 +47,7 @@
 | R5 | 结论与证据绑定弱，定位缺失 | Partial | 强制证据定位质量门槛（页码/块号/摘录长度） | 非 `fail(no_evidence)` 场景下 evidence 至少含一条可定位证据；标注副本落点命中率达标 |
 | R6 | 跨文档一致性校验不足 | Done | 新增 consistency checker（公司名、金额、日期、证照编号） | 输出 `consistency-findings.jsonl`；可检出样例冲突并进入报告 |
 | R7 | 低置信度场景缺少可靠兜底 | Done | 增加低置信策略（降级到人工复核、禁止自动 pass） | LLM 低置信或证据弱时状态进入 `manual_required`/`risk`；无“低置信 pass” |
-| R8 | 缺少稳定评测基准，质量不可量化 | Open | 建立固定评测集与指标板（漏检率/误报率/hard_fail召回） | 新增评测命令可重复执行；PR 必须附核心指标变化 |
+| R8 | 缺少稳定评测基准，质量不可量化 | Partial | 建立固定评测集与指标板（漏检率/误报率/hard_fail召回） | 新增评测命令可重复执行；PR 必须附核心指标变化 |
 | R9 | 任务卡与提交不同步，影响追踪 | Done | 形成“任务卡先落盘、实现后即提交”的纪律门禁 | 每次功能提交对应一个 task card；`git log` 可按 task id 回溯变更 |
 
 ## Execution Order
