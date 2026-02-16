@@ -13,7 +13,7 @@ uv sync
 ```bash
 uv run bidagent run \
   --tender "电子招标文件.pdf" \
-  --bid "北京为是科技有限公司-安徽芜湖投标文件(1).docx" \
+  --bid "bid.docx" \
   --out "runs/demo" \
   --focus business \
   --ocr-mode auto \
