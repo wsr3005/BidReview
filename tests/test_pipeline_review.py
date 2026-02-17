@@ -9,7 +9,7 @@ import json
 
 from bidagent.io_utils import read_jsonl, write_jsonl
 from bidagent.models import Block, Finding, Location
-from bidagent.pipeline import ingest, review
+from bidagent.pipeline import gate, ingest, plan_tasks, review, run_pipeline, verdict
 
 
 class _DummyReviewer:
@@ -156,6 +156,135 @@ class PipelineReviewTests(unittest.TestCase):
             rows = list(read_jsonl(out_dir / "ingest" / "bid_blocks.jsonl"))
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[-1]["location"]["section"], "OCR_MEDIA")
+
+    def test_gate_allows_auto_final_when_all_metrics_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            (out_dir / "eval").mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [
+                    {"requirement_id": "R0001", "text": "必须提供营业执照", "rule_tier": "hard_fail", "mandatory": True},
+                    {"requirement_id": "R0002", "text": "必须提供保证金", "rule_tier": "general", "mandatory": True},
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "fail",
+                        "score": 0,
+                        "severity": "high",
+                        "reason": "缺失",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.95},
+                        "evidence": [{"evidence_id": "E-1", "location": {"block_index": 10, "page": 2}}],
+                    },
+                    {
+                        "requirement_id": "R0002",
+                        "status": "pass",
+                        "score": 3,
+                        "severity": "none",
+                        "reason": "满足",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.92},
+                        "evidence": [{"evidence_id": "E-2", "location": {"block_index": 18, "page": 4}}],
+                    },
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+            verdict(out_dir=out_dir, resume=False)
+            (out_dir / "eval" / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "hard_fail_recall": 1.0,
+                            "false_positive_fail_rate": 0.0,
+                            "false_positive_fail": 0,
+                            "non_fail_total": 1,
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = gate(out_dir=out_dir, requested_release_mode="auto_final")
+            self.assertEqual(result["release_mode"], "auto_final")
+            self.assertTrue((out_dir / "gate-result.json").exists())
+
+    def test_gate_forces_assist_only_when_metrics_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            (out_dir / "eval").mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [{"requirement_id": "R0001", "text": "必须提供营业执照", "rule_tier": "hard_fail", "mandatory": True}],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "fail",
+                        "score": 0,
+                        "severity": "high",
+                        "reason": "缺失",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.95},
+                        "evidence": [{"evidence_id": "E-1", "location": {"block_index": 10, "page": 2}}],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+            verdict(out_dir=out_dir, resume=False)
+            (out_dir / "eval" / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "hard_fail_recall": 0.2,
+                            "false_positive_fail_rate": 0.0,
+                            "false_positive_fail": 0,
+                            "non_fail_total": 1,
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = gate(out_dir=out_dir, requested_release_mode="auto_final")
+            self.assertEqual(result["release_mode"], "assist_only")
+            failed = [item for item in result.get("checks", []) if not item.get("ok")]
+            self.assertTrue(any(item.get("name") == "hard_fail_recall" for item in failed))
+
+    def test_run_pipeline_writes_gate_result_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            tender = base / "tender.txt"
+            bid = base / "bid.txt"
+            out_dir = base / "out"
+            tender.write_text("商务要求：投标人必须提供营业执照。", encoding="utf-8")
+            bid.write_text("我司已提供营业执照复印件。", encoding="utf-8")
+
+            with patch.dict("os.environ", {"BIDAGENT_ALLOW_NO_AI": "1"}, clear=False):
+                result = run_pipeline(
+                    tender_path=tender,
+                    bid_path=bid,
+                    out_dir=out_dir,
+                    focus="business",
+                    resume=False,
+                    ocr_mode="auto",
+                    ai_provider=None,
+                    release_mode="auto_final",
+                )
+
+            self.assertIn(result["gate"]["release_mode"], {"assist_only", "auto_final"})
+            self.assertTrue((out_dir / "review-tasks.jsonl").exists())
+            self.assertTrue((out_dir / "verdicts.jsonl").exists())
+            self.assertTrue((out_dir / "gate-result.json").exists())
 
 
 if __name__ == "__main__":

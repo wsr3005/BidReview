@@ -7,7 +7,7 @@ from pathlib import Path
 
 from bidagent.document import parse_page_range
 from bidagent.eval import evaluate_and_write
-from bidagent.pipeline import annotate, checklist, extract_req, ingest, report, review, run_pipeline
+from bidagent.pipeline import annotate, checklist, extract_req, gate, ingest, plan_tasks, report, review, run_pipeline, verdict
 
 
 def _common_parent() -> argparse.ArgumentParser:
@@ -53,6 +53,12 @@ def _common_parent() -> argparse.ArgumentParser:
         default="https://api.deepseek.com/v1",
         help="LLM API base url",
     )
+    parent.add_argument(
+        "--release-mode",
+        default="assist_only",
+        choices=["assist_only", "auto_final"],
+        help="requested release mode used by gate/run",
+    )
     return parent
 
 
@@ -73,7 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     extract_parser.add_argument("--tender", help="unused in this stage, kept for CLI consistency")
 
+    subparsers.add_parser("plan-tasks", parents=[common], help="split requirements into review tasks")
     subparsers.add_parser("review", parents=[common], help="review bid against requirements")
+    subparsers.add_parser("verdict", parents=[common], help="materialize normalized verdict protocol")
+    subparsers.add_parser("gate", parents=[common], help="apply L3 release gate and write gate-result.json")
     annotate_parser = subparsers.add_parser("annotate", parents=[common], help="generate annotations sidecar")
     annotate_parser.add_argument("--bid-source", default=None, help="optional original bid file for annotated copy")
     subparsers.add_parser("report", parents=[common], help="generate markdown report")
@@ -112,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "extract-req":
             result = extract_req(out_dir=out_dir, focus=args.focus, resume=args.resume)
+        elif args.command == "plan-tasks":
+            result = plan_tasks(out_dir=out_dir, resume=args.resume)
         elif args.command == "review":
             result = review(
                 out_dir=out_dir,
@@ -123,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
                 ai_workers=args.ai_workers,
                 ai_min_confidence=args.ai_min_confidence,
             )
+        elif args.command == "verdict":
+            result = verdict(out_dir=out_dir, resume=args.resume)
+        elif args.command == "gate":
+            result = gate(out_dir=out_dir, requested_release_mode=args.release_mode)
         elif args.command == "annotate":
             bid_source = Path(args.bid_source) if getattr(args, "bid_source", None) else None
             result = annotate(out_dir=out_dir, resume=args.resume, bid_source=bid_source)
@@ -147,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
                 ai_base_url=args.ai_base_url,
                 ai_workers=args.ai_workers,
                 ai_min_confidence=args.ai_min_confidence,
+                release_mode=args.release_mode,
             )
         else:
             parser.error(f"unsupported command: {args.command}")

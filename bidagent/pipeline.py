@@ -4,18 +4,28 @@ import json
 import os
 import re
 from collections import Counter
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
 from bidagent.consistency import find_inconsistencies
 from bidagent.document import iter_document_blocks
+from bidagent.eval import evaluate_run
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm import DeepSeekReviewer, apply_llm_review
 from bidagent.models import Block, Location, Requirement
 from bidagent.ocr import iter_document_ocr_blocks, ocr_selfcheck
 from bidagent.review import enforce_evidence_quality_gate, extract_requirements, review_requirements
+
+VALID_RELEASE_MODES = {"assist_only", "auto_final"}
+GATE_THRESHOLDS = {
+    "auto_review_coverage": 0.95,
+    "hard_fail_recall": 0.98,
+    "false_positive_fail_rate": 0.01,
+    "evidence_traceability": 0.99,
+    "llm_coverage": 1.0,
+}
 
 
 def _row_to_block(row: dict[str, Any]) -> Block:
@@ -185,6 +195,14 @@ def _llm_coverage_complete(rows: list[dict[str, Any]], provider: str) -> bool:
     if not rows:
         return False
     return all((row.get("llm") or {}).get("provider") == provider for row in rows)
+
+
+def _validate_release_mode(release_mode: str) -> str:
+    value = str(release_mode or "").strip()
+    if value in VALID_RELEASE_MODES:
+        return value
+    allowed = ", ".join(sorted(VALID_RELEASE_MODES))
+    raise ValueError(f"release_mode must be one of: {allowed}")
 
 
 def ingest(
@@ -785,6 +803,266 @@ def _format_primary_evidence(finding: dict[str, Any], limit: int = 80) -> str:
     )
 
 
+def _safe_ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return float(numerator) / float(denominator)
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _status_confidence_hint(status: str) -> float:
+    if status == "pass":
+        return 0.70
+    if status == "fail":
+        return 0.80
+    if status == "risk":
+        return 0.50
+    if status == "needs_ocr":
+        return 0.35
+    return 0.30
+
+
+def _requirement_task_id(requirement_id: str, index: int) -> str:
+    token = "".join(ch for ch in requirement_id if ch.isalnum())
+    if not token:
+        token = f"R{index:04d}"
+    return f"T-{token}-01"
+
+
+def plan_tasks(out_dir: Path, resume: bool = False) -> dict[str, Any]:
+    requirements_path = out_dir / "requirements.jsonl"
+    tasks_path = out_dir / "review-tasks.jsonl"
+    if path_ready(tasks_path, resume):
+        total = sum(1 for _ in read_jsonl(tasks_path))
+        return {"review_tasks": total}
+
+    requirements = list(read_jsonl(requirements_path))
+    task_rows: list[dict[str, Any]] = []
+    for index, requirement in enumerate(requirements, start=1):
+        requirement_id = str(requirement.get("requirement_id") or f"R{index:04d}")
+        tier = str(requirement.get("rule_tier") or "general")
+        task_rows.append(
+            {
+                "task_id": _requirement_task_id(requirement_id, index),
+                "requirement_id": requirement_id,
+                "task_type": "requirement_check",
+                "query": str(requirement.get("text") or ""),
+                "expected_logic": {
+                    "constraints": list(requirement.get("constraints") or []),
+                    "mandatory": bool(requirement.get("mandatory", False)),
+                },
+                "priority": tier,
+            }
+        )
+
+    write_jsonl(tasks_path, task_rows)
+    return {"review_tasks": len(task_rows)}
+
+
+def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
+    findings_path = out_dir / "findings.jsonl"
+    tasks_path = out_dir / "review-tasks.jsonl"
+    verdicts_path = out_dir / "verdicts.jsonl"
+    if path_ready(verdicts_path, resume):
+        rows = list(read_jsonl(verdicts_path))
+        counts = Counter(str(row.get("status") or "") for row in rows)
+        llm_coverage = _safe_ratio(
+            sum(1 for row in rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
+            len(rows),
+        )
+        return {"verdicts": len(rows), "status_counts": dict(counts), "llm_coverage": llm_coverage}
+
+    task_by_requirement: dict[str, str] = {}
+    if tasks_path.exists():
+        for row in read_jsonl(tasks_path):
+            requirement_id = str(row.get("requirement_id") or "").strip()
+            task_id = str(row.get("task_id") or "").strip()
+            if requirement_id and task_id and requirement_id not in task_by_requirement:
+                task_by_requirement[requirement_id] = task_id
+
+    finding_rows = list(read_jsonl(findings_path))
+    verdict_rows: list[dict[str, Any]] = []
+    for index, finding in enumerate(finding_rows, start=1):
+        requirement_id = str(finding.get("requirement_id") or f"R{index:04d}")
+        status = str(finding.get("status") or "risk")
+        llm = finding.get("llm") if isinstance(finding.get("llm"), dict) else {}
+        confidence = _safe_float((llm or {}).get("confidence"))
+        if confidence is None:
+            confidence = _status_confidence_hint(status)
+        confidence = max(0.0, min(1.0, confidence))
+        evidence_refs = [
+            str(item.get("evidence_id"))
+            for item in (finding.get("evidence") or [])
+            if isinstance(item, dict) and item.get("evidence_id")
+        ]
+        model = {}
+        provider = str((llm or {}).get("provider") or "")
+        model_name = str((llm or {}).get("model") or "")
+        if provider or model_name:
+            model = {"provider": provider, "name": model_name}
+
+        decision_trace = finding.get("decision_trace")
+        if not isinstance(decision_trace, dict):
+            decision_trace = {"source": "pipeline_findings_bridge", "fallbacks": []}
+
+        verdict_rows.append(
+            {
+                "task_id": task_by_requirement.get(requirement_id, _requirement_task_id(requirement_id, index)),
+                "requirement_id": requirement_id,
+                "status": status,
+                "confidence": confidence,
+                "reason": str(finding.get("reason") or ""),
+                "evidence_refs": evidence_refs,
+                "counter_evidence_refs": [],
+                "model": model,
+                "decision_trace": decision_trace,
+            }
+        )
+
+    write_jsonl(verdicts_path, verdict_rows)
+    counts = Counter(str(row.get("status") or "") for row in verdict_rows)
+    llm_coverage = _safe_ratio(
+        sum(1 for row in verdict_rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
+        len(verdict_rows),
+    )
+    return {"verdicts": len(verdict_rows), "status_counts": dict(counts), "llm_coverage": llm_coverage}
+
+
+def _load_eval_metrics(out_dir: Path) -> dict[str, Any] | None:
+    metrics_path = out_dir / "eval" / "metrics.json"
+    if metrics_path.exists():
+        try:
+            payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+            metrics = payload.get("metrics")
+            if isinstance(metrics, dict):
+                return metrics
+        except json.JSONDecodeError:
+            pass
+
+    gold_path = out_dir / "eval" / "gold.jsonl"
+    findings_path = out_dir / "findings.jsonl"
+    if not gold_path.exists() or not findings_path.exists():
+        return None
+
+    try:
+        result = evaluate_run(out_dir, out_path=metrics_path)
+    except FileNotFoundError:
+        return None
+    metrics = result.get("metrics")
+    return metrics if isinstance(metrics, dict) else None
+
+
+def _finding_has_traceable_evidence(finding: dict[str, Any]) -> bool:
+    for evidence in finding.get("evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        if _is_mappable_location(evidence.get("location")):
+            return True
+    return False
+
+
+def gate(out_dir: Path, *, requested_release_mode: str = "assist_only") -> dict[str, Any]:
+    requested_mode = _validate_release_mode(requested_release_mode)
+
+    requirements_path = out_dir / "requirements.jsonl"
+    findings_path = out_dir / "findings.jsonl"
+    verdicts_path = out_dir / "verdicts.jsonl"
+    gate_out = out_dir / "gate-result.json"
+
+    requirements_total = 0
+    if requirements_path.exists():
+        requirements_total = sum(1 for _ in read_jsonl(requirements_path))
+
+    finding_rows = list(read_jsonl(findings_path)) if findings_path.exists() else []
+    verdict_rows = list(read_jsonl(verdicts_path)) if verdicts_path.exists() else []
+    if requirements_total <= 0:
+        requirements_total = max(len(finding_rows), len(verdict_rows))
+
+    auto_review_coverage = _safe_ratio(len(verdict_rows), requirements_total)
+    evidence_traceability = _safe_ratio(
+        sum(1 for row in finding_rows if _finding_has_traceable_evidence(row)),
+        len(finding_rows),
+    )
+    llm_coverage = _safe_ratio(
+        sum(1 for row in verdict_rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
+        len(verdict_rows),
+    )
+
+    eval_metrics = _load_eval_metrics(out_dir)
+    hard_fail_recall = _safe_float((eval_metrics or {}).get("hard_fail_recall"))
+    false_positive_fail_rate = _safe_float((eval_metrics or {}).get("false_positive_fail_rate"))
+    if false_positive_fail_rate is None and eval_metrics:
+        false_positive_fail = _safe_float(eval_metrics.get("false_positive_fail")) or 0.0
+        non_fail_total = _safe_float(eval_metrics.get("non_fail_total")) or 0.0
+        false_positive_fail_rate = (false_positive_fail / non_fail_total) if non_fail_total > 0 else 0.0
+
+    checks = [
+        {
+            "name": "auto_review_coverage",
+            "value": auto_review_coverage,
+            "threshold": GATE_THRESHOLDS["auto_review_coverage"],
+            "ok": auto_review_coverage >= GATE_THRESHOLDS["auto_review_coverage"],
+        },
+        {
+            "name": "hard_fail_recall",
+            "value": hard_fail_recall,
+            "threshold": GATE_THRESHOLDS["hard_fail_recall"],
+            "ok": hard_fail_recall is not None and hard_fail_recall >= GATE_THRESHOLDS["hard_fail_recall"],
+        },
+        {
+            "name": "false_positive_fail_rate",
+            "value": false_positive_fail_rate,
+            "threshold": GATE_THRESHOLDS["false_positive_fail_rate"],
+            "ok": false_positive_fail_rate is not None
+            and false_positive_fail_rate <= GATE_THRESHOLDS["false_positive_fail_rate"],
+        },
+        {
+            "name": "evidence_traceability",
+            "value": evidence_traceability,
+            "threshold": GATE_THRESHOLDS["evidence_traceability"],
+            "ok": evidence_traceability >= GATE_THRESHOLDS["evidence_traceability"],
+        },
+        {
+            "name": "llm_coverage",
+            "value": llm_coverage,
+            "threshold": GATE_THRESHOLDS["llm_coverage"],
+            "ok": llm_coverage >= GATE_THRESHOLDS["llm_coverage"],
+        },
+    ]
+    all_checks_pass = all(bool(item.get("ok")) for item in checks)
+    release_mode = "auto_final" if requested_mode == "auto_final" and all_checks_pass else "assist_only"
+
+    result = {
+        "requested_release_mode": requested_mode,
+        "release_mode": release_mode,
+        "eligible_for_auto_final": all_checks_pass,
+        "thresholds": GATE_THRESHOLDS,
+        "metrics": {
+            "requirements_total": requirements_total,
+            "verdict_total": len(verdict_rows),
+            "findings_total": len(finding_rows),
+            "auto_review_coverage": auto_review_coverage,
+            "hard_fail_recall": hard_fail_recall,
+            "false_positive_fail_rate": false_positive_fail_rate,
+            "evidence_traceability": evidence_traceability,
+            "llm_coverage": llm_coverage,
+            "eval_metrics": eval_metrics or {},
+        },
+        "checks": checks,
+        "generated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    gate_out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
 def report(out_dir: Path) -> dict[str, Any]:
     requirements = list(read_jsonl(out_dir / "requirements.jsonl"))
     findings = list(read_jsonl(out_dir / "findings.jsonl"))
@@ -886,9 +1164,11 @@ def run_pipeline(
     ai_base_url: str = "https://api.deepseek.com/v1",
     ai_workers: int = 4,
     ai_min_confidence: float = 0.65,
+    release_mode: str = "assist_only",
 ) -> dict[str, Any]:
     ensure_dir(out_dir)
     summary: dict[str, Any] = {}
+    requested_release_mode = _validate_release_mode(release_mode)
     summary["ingest"] = ingest(
         tender_path=tender_path,
         bid_path=bid_path,
@@ -898,6 +1178,7 @@ def run_pipeline(
         ocr_mode=ocr_mode,
     )
     summary["extract_req"] = extract_req(out_dir=out_dir, focus=focus, resume=resume)
+    summary["plan_tasks"] = plan_tasks(out_dir=out_dir, resume=resume)
     summary["review"] = review(
         out_dir=out_dir,
         resume=resume,
@@ -908,6 +1189,7 @@ def run_pipeline(
         ai_workers=ai_workers,
         ai_min_confidence=ai_min_confidence,
     )
+    summary["verdict"] = verdict(out_dir=out_dir, resume=False)
     # Even when resuming expensive upstream stages, keep downstream deliverables fresh.
     # This also guarantees a new timestamped annotated copy after each `run`.
     downstream_resume = False
@@ -919,4 +1201,5 @@ def run_pipeline(
     summary["checklist"] = checklist(out_dir=out_dir, resume=downstream_resume)
     summary["consistency"] = consistency(out_dir=out_dir, resume=downstream_resume)
     summary["report"] = report(out_dir=out_dir)
+    summary["gate"] = gate(out_dir=out_dir, requested_release_mode=requested_release_mode)
     return summary

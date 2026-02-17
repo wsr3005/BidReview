@@ -15,7 +15,9 @@ class EvalMetrics:
     hard_fail_fail: int
     hard_fail_missed: int  # expected hard_fail but got not-fail
     hard_fail_recall: float
+    non_fail_total: int
     false_positive_fail: int
+    false_positive_fail_rate: float
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -51,6 +53,7 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
     hard_fail_total = 0
     hard_fail_fail = 0
     hard_fail_missed = 0
+    non_fail_total = 0
     false_positive_fail = 0
 
     per_item: list[dict[str, Any]] = []
@@ -69,7 +72,10 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
                 hard_fail_missed += 1
 
         if expected != "fail" and got == "fail":
+            non_fail_total += 1
             false_positive_fail += 1
+        elif expected != "fail":
+            non_fail_total += 1
 
         per_item.append(
             {
@@ -82,13 +88,16 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
         )
 
     recall = (hard_fail_fail / hard_fail_total) if hard_fail_total else 0.0
+    false_positive_fail_rate = (false_positive_fail / non_fail_total) if non_fail_total else 0.0
     metrics = EvalMetrics(
         total=total,
         hard_fail_total=hard_fail_total,
         hard_fail_fail=hard_fail_fail,
         hard_fail_missed=hard_fail_missed,
         hard_fail_recall=recall,
+        non_fail_total=non_fail_total,
         false_positive_fail=false_positive_fail,
+        false_positive_fail_rate=false_positive_fail_rate,
     ).to_dict()
 
     result = {"metrics": metrics, "items": per_item}
