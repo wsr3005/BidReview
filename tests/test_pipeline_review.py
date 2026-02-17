@@ -260,6 +260,109 @@ class PipelineReviewTests(unittest.TestCase):
             failed = [item for item in result.get("checks", []) if not item.get("ok")]
             self.assertTrue(any(item.get("name") == "hard_fail_recall" for item in failed))
 
+    def test_gate_threshold_overrides_allow_auto_final(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            (out_dir / "eval").mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [{"requirement_id": "R0001", "text": "必须提供营业执照", "rule_tier": "hard_fail", "mandatory": True}],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "fail",
+                        "score": 0,
+                        "severity": "high",
+                        "reason": "缺失",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.95},
+                        "evidence": [{"evidence_id": "E-1", "location": {"block_index": 10, "page": 2}}],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+            verdict(out_dir=out_dir, resume=False)
+            (out_dir / "eval" / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "hard_fail_recall": 0.95,
+                            "false_positive_fail_rate": 0.0,
+                            "false_positive_fail": 0,
+                            "non_fail_total": 1,
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = gate(
+                out_dir=out_dir,
+                requested_release_mode="auto_final",
+                threshold_overrides={"hard_fail_recall": 0.9},
+                fail_fast="critical",
+            )
+            self.assertEqual(result["release_mode"], "auto_final")
+            self.assertEqual(result["thresholds"]["hard_fail_recall"], 0.9)
+            self.assertFalse((result.get("fail_fast") or {}).get("triggered"))
+
+    def test_gate_fail_fast_critical_short_circuits_remaining_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            (out_dir / "eval").mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [{"requirement_id": "R0001", "text": "必须提供营业执照", "rule_tier": "hard_fail", "mandatory": True}],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "fail",
+                        "score": 0,
+                        "severity": "high",
+                        "reason": "缺失",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.95},
+                        "evidence": [{"evidence_id": "E-1", "location": {"block_index": 10, "page": 2}}],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+            verdict(out_dir=out_dir, resume=False)
+            (out_dir / "eval" / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "hard_fail_recall": 0.2,
+                            "false_positive_fail_rate": 0.0,
+                            "false_positive_fail": 0,
+                            "non_fail_total": 1,
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = gate(out_dir=out_dir, requested_release_mode="auto_final", fail_fast="critical")
+
+            self.assertEqual(result["release_mode"], "assist_only")
+            fail_fast = result.get("fail_fast") or {}
+            self.assertTrue(fail_fast.get("triggered"))
+            self.assertEqual(fail_fast.get("triggered_by"), "hard_fail_recall")
+            checks = result.get("checks") or []
+            skipped = [item for item in checks if item.get("skipped")]
+            self.assertTrue(skipped)
+            self.assertTrue(any(item.get("name") == "false_positive_fail_rate" for item in skipped))
+
     def test_verdict_harvests_evidence_refs_from_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)

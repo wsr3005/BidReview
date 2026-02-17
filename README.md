@@ -45,3 +45,4 @@ uv run bidagent run \
 - DOCX parser uses built-in XML streaming and does not validate stamp/seal by design.
 - If `--ai-provider deepseek` is enabled, the tool reads API key from:
   1) `DEEPSEEK_API_KEY`, 2) `--ai-api-key-file`, 3) `deepseek api key.txt`.
+- `gate` / `run` support threshold tuning via `--gate-threshold-*` and short-circuit strategy via `--gate-fail-fast off|critical|all`.
