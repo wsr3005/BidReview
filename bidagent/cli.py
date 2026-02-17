@@ -200,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
                 ai_model=args.ai_model,
                 ai_api_key_file=ai_api_key_file,
                 ai_base_url=args.ai_base_url,
+                ai_workers=args.ai_workers,
                 ai_min_confidence=args.ai_min_confidence,
             )
         elif args.command == "gate":

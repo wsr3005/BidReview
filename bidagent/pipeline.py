@@ -1741,6 +1741,7 @@ def verdict(
     ai_model: str = "deepseek-chat",
     ai_api_key_file: Path | None = None,
     ai_base_url: str = "https://api.deepseek.com/v1",
+    ai_workers: int = 4,
     ai_min_confidence: float = 0.65,
 ) -> dict[str, Any]:
     requirements_path = out_dir / "requirements.jsonl"
@@ -1805,7 +1806,23 @@ def verdict(
             requirement_order.append(requirement_id)
 
     shared_task_llm_reviewer: _PipelineDeepSeekTaskReviewer | None = None
+    task_llm_workers = 1
+    task_llm_rate_limit: dict[str, Any] = {
+        "enabled": False,
+        "requested_workers": 0,
+        "max_workers": 1,
+        "strategy": "single_thread",
+    }
     if ai_provider == "deepseek":
+        requested_workers = max(1, int(ai_workers))
+        safe_cap = 4
+        task_llm_workers = min(requested_workers, safe_cap)
+        task_llm_rate_limit = {
+            "enabled": True,
+            "requested_workers": requested_workers,
+            "max_workers": task_llm_workers,
+            "strategy": "deepseek_concurrency_cap_4",
+        }
         api_key = _load_api_key(ai_provider, ai_api_key_file)
         if api_key:
             shared_task_llm_reviewer = _PipelineDeepSeekTaskReviewer(
@@ -1813,6 +1830,9 @@ def verdict(
                 model=ai_model,
                 base_url=ai_base_url,
             )
+        else:
+            task_llm_rate_limit["enabled"] = False
+            task_llm_rate_limit["strategy"] = "no_api_key_fallback_rule_only"
 
     verdict_rows: list[dict[str, Any]] = []
     evidence_pack_rows: list[dict[str, Any]] = []
@@ -1900,7 +1920,12 @@ def verdict(
             trace["task_rule"] = task_rule.get("trace")
             task_row["decision_trace"] = trace
             task_inputs.append(task_row)
-        task_verdict_rows = judge_tasks_with_llm(task_inputs, task_reviewer, min_confidence=ai_min_confidence)
+        task_verdict_rows = judge_tasks_with_llm(
+            task_inputs,
+            task_reviewer,
+            min_confidence=ai_min_confidence,
+            max_workers=task_llm_workers,
+        )
         aggregated = _aggregate_task_verdicts(task_verdict_rows)
         status = str(aggregated.get("status") or "insufficient_evidence")
         confidence = max(0.0, min(1.0, _safe_float(aggregated.get("confidence")) or _status_confidence_hint(status)))
@@ -1959,6 +1984,7 @@ def verdict(
         decision_trace["task_verdicts"] = {
             "total": len(task_verdict_rows),
             "status_counts": aggregated.get("status_counts", {}),
+            "llm_rate_limit": dict(task_llm_rate_limit),
             "sample": [
                 {
                     "task_id": row.get("task_id"),
@@ -2338,6 +2364,7 @@ def run_pipeline(
         ai_model=ai_model,
         ai_api_key_file=ai_api_key_file,
         ai_base_url=ai_base_url,
+        ai_workers=ai_workers,
         ai_min_confidence=ai_min_confidence,
     )
     # Even when resuming expensive upstream stages, keep downstream deliverables fresh.

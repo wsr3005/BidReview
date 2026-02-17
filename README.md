@@ -49,6 +49,7 @@ When `runs/<x>/eval/gold.jsonl` exists, `run` auto-generates `eval/metrics.json`
 `run` also writes `evidence-packs.jsonl` to preserve task-level support/counter evidence traces.
 `verdict` applies a second-pass conflict audit before finalizing `pass` decisions.
 With `--ai-provider deepseek`, `verdict` can run task-level LLM judging before requirement aggregation.
+Task-level LLM judging uses `--ai-workers` with a built-in safety cap to reduce 429 burst risk.
 
 ## Notes
 

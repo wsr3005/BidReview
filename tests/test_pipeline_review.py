@@ -547,6 +547,7 @@ class PipelineReviewTests(unittest.TestCase):
                     resume=False,
                     ai_provider="deepseek",
                     ai_model="deepseek-chat",
+                    ai_workers=16,
                 )
 
             self.assertEqual(result["verdicts"], 1)
@@ -555,6 +556,11 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertEqual(rows[0]["status"], "fail")
             self.assertIn("LLM任务判定失败", rows[0]["reason"])
             self.assertEqual((rows[0].get("model") or {}).get("provider"), "deepseek")
+            trace = rows[0].get("decision_trace") or {}
+            rate_limit = (trace.get("task_verdicts") or {}).get("llm_rate_limit") or {}
+            self.assertEqual(rate_limit.get("strategy"), "deepseek_concurrency_cap_4")
+            self.assertEqual(rate_limit.get("requested_workers"), 16)
+            self.assertEqual(rate_limit.get("max_workers"), 4)
 
     def test_verdict_downgrades_unstable_pass_to_risk_on_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

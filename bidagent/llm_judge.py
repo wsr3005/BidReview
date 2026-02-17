@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -124,122 +125,167 @@ def _apply_final_decision(
     return row
 
 
+def _judge_one_task(
+    *,
+    index: int,
+    task: dict[str, Any],
+    reviewer: TaskReviewer,
+    provider: str,
+    model: str,
+    threshold: float,
+) -> tuple[int, dict[str, Any]]:
+    row = dict(task)
+    trace = _ensure_trace(row, index=index)
+    base_status = _base_status(row)
+    base_reason = _base_reason(row, base_status)
+
+    if base_status == "needs_ocr":
+        trace["llm_review"] = {"provider": provider, "model": model, "skipped": "needs_ocr"}
+        return (
+            index,
+            _apply_final_decision(
+                row,
+                trace,
+                status="needs_ocr",
+                reason=base_reason,
+                source="rule",
+                confidence=None,
+            ),
+        )
+
+    try:
+        llm_result = _review_task(reviewer, row)
+        if not isinstance(llm_result, dict):
+            raise RuntimeError("LLM reviewer returned non-dict result")
+    except Exception as exc:  # noqa: BLE001
+        trace["llm_review"] = {"provider": provider, "model": model, "error": str(exc)}
+        trace["fallback"] = {
+            "type": "llm_error",
+            "applied_status": base_status,
+            "applied_reason": base_reason,
+        }
+        return (
+            index,
+            _apply_final_decision(
+                row,
+                trace,
+                status=base_status,
+                reason=base_reason,
+                source="rule_fallback",
+                confidence=None,
+            ),
+        )
+
+    raw_status = str(llm_result.get("status") or "").strip()
+    llm_reason = str(llm_result.get("reason") or "").strip() or base_reason
+    confidence = _normalize_confidence(llm_result.get("confidence"))
+
+    trace["llm_review"] = {
+        "provider": provider,
+        "model": model,
+        "status": raw_status,
+        "confidence": confidence,
+    }
+
+    if raw_status not in ALLOWED_STATUS:
+        trace["fallback"] = {
+            "type": "invalid_llm_status",
+            "invalid_status": raw_status,
+            "applied_status": base_status,
+            "applied_reason": base_reason,
+        }
+        return (
+            index,
+            _apply_final_decision(
+                row,
+                trace,
+                status=base_status,
+                reason=base_reason,
+                source="rule_fallback",
+                confidence=confidence,
+            ),
+        )
+
+    if raw_status == "pass" and (confidence is None or confidence < threshold):
+        fallback_reason = f"LLM confidence too low ({confidence if confidence is not None else 'N/A'}), downgraded to risk."
+        trace["low_confidence_fallback"] = {
+            "min_confidence": threshold,
+            "confidence": confidence,
+            "action": "downgrade_pass_to_risk",
+            "previous": {"status": raw_status, "reason": llm_reason},
+        }
+        return (
+            index,
+            _apply_final_decision(
+                row,
+                trace,
+                status="risk",
+                reason=fallback_reason,
+                source="llm_low_confidence_fallback",
+                confidence=confidence,
+            ),
+        )
+
+    return (
+        index,
+        _apply_final_decision(
+            row,
+            trace,
+            status=raw_status,
+            reason=llm_reason,
+            source="llm",
+            confidence=confidence,
+        ),
+    )
+
+
 def judge_tasks_with_llm(
     tasks: list[dict[str, Any]],
     reviewer: TaskReviewer,
     *,
     min_confidence: float = 0.65,
+    max_workers: int = 1,
 ) -> list[dict[str, Any]]:
     threshold = float(min_confidence)
     provider = str(getattr(reviewer, "provider", "unknown"))
     model = str(getattr(reviewer, "model", "unknown"))
-    verdicts: list[dict[str, Any]] = []
+    if not tasks:
+        return []
 
-    for index, task in enumerate(tasks):
-        row = dict(task)
-        trace = _ensure_trace(row, index=index)
-        base_status = _base_status(row)
-        base_reason = _base_reason(row, base_status)
-
-        if base_status == "needs_ocr":
-            trace["llm_review"] = {"provider": provider, "model": model, "skipped": "needs_ocr"}
-            verdicts.append(
-                _apply_final_decision(
-                    row,
-                    trace,
-                    status="needs_ocr",
-                    reason=base_reason,
-                    source="rule",
-                    confidence=None,
-                )
+    worker_count = max(1, int(max_workers))
+    if worker_count == 1 or len(tasks) <= 1:
+        ordered: list[dict[str, Any]] = []
+        for index, task in enumerate(tasks):
+            _, verdict_row = _judge_one_task(
+                index=index,
+                task=task,
+                reviewer=reviewer,
+                provider=provider,
+                model=model,
+                threshold=threshold,
             )
-            continue
+            ordered.append(verdict_row)
+        return ordered
 
-        try:
-            llm_result = _review_task(reviewer, row)
-            if not isinstance(llm_result, dict):
-                raise RuntimeError("LLM reviewer returned non-dict result")
-        except Exception as exc:  # noqa: BLE001
-            trace["llm_review"] = {"provider": provider, "model": model, "error": str(exc)}
-            trace["fallback"] = {
-                "type": "llm_error",
-                "applied_status": base_status,
-                "applied_reason": base_reason,
-            }
-            verdicts.append(
-                _apply_final_decision(
-                    row,
-                    trace,
-                    status=base_status,
-                    reason=base_reason,
-                    source="rule_fallback",
-                    confidence=None,
-                )
+    ordered_rows: list[dict[str, Any] | None] = [None] * len(tasks)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(
+                _judge_one_task,
+                index=index,
+                task=task,
+                reviewer=reviewer,
+                provider=provider,
+                model=model,
+                threshold=threshold,
             )
-            continue
+            for index, task in enumerate(tasks)
+        ]
+        for future in as_completed(futures):
+            index, verdict_row = future.result()
+            ordered_rows[index] = verdict_row
 
-        raw_status = str(llm_result.get("status") or "").strip()
-        llm_reason = str(llm_result.get("reason") or "").strip() or base_reason
-        confidence = _normalize_confidence(llm_result.get("confidence"))
-
-        trace["llm_review"] = {
-            "provider": provider,
-            "model": model,
-            "status": raw_status,
-            "confidence": confidence,
-        }
-
-        if raw_status not in ALLOWED_STATUS:
-            trace["fallback"] = {
-                "type": "invalid_llm_status",
-                "invalid_status": raw_status,
-                "applied_status": base_status,
-                "applied_reason": base_reason,
-            }
-            verdicts.append(
-                _apply_final_decision(
-                    row,
-                    trace,
-                    status=base_status,
-                    reason=base_reason,
-                    source="rule_fallback",
-                    confidence=confidence,
-                )
-            )
-            continue
-
-        if raw_status == "pass" and (confidence is None or confidence < threshold):
-            fallback_reason = f"LLM confidence too low ({confidence if confidence is not None else 'N/A'}), downgraded to risk."
-            trace["low_confidence_fallback"] = {
-                "min_confidence": threshold,
-                "confidence": confidence,
-                "action": "downgrade_pass_to_risk",
-                "previous": {"status": raw_status, "reason": llm_reason},
-            }
-            verdicts.append(
-                _apply_final_decision(
-                    row,
-                    trace,
-                    status="risk",
-                    reason=fallback_reason,
-                    source="llm_low_confidence_fallback",
-                    confidence=confidence,
-                )
-            )
-            continue
-
-        verdicts.append(
-            _apply_final_decision(
-                row,
-                trace,
-                status=raw_status,
-                reason=llm_reason,
-                source="llm",
-                confidence=confidence,
-            )
-        )
-
-    return verdicts
+    return [row for row in ordered_rows if isinstance(row, dict)]
 
 
 def write_verdicts_jsonl(path: Path, verdicts: list[dict[str, Any]]) -> int:

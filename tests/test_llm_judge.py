@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -50,6 +51,21 @@ class _CountCallsReviewer:
     def review_task(self, task: dict) -> dict:
         self.calls += 1
         return {"status": "pass", "reason": "ok", "confidence": 0.9}
+
+
+class _SlowOrderedReviewer:
+    provider = "deepseek"
+    model = "deepseek-chat"
+
+    def review_task(self, task: dict) -> dict:
+        task_id = str(task.get("task_id") or "T0000")
+        try:
+            order = int(task_id.replace("T", ""))
+        except ValueError:
+            order = 0
+        # Reverse latency to force out-of-order completion under parallel execution.
+        time.sleep(max(0, 6 - order) * 0.01)
+        return {"status": "pass", "reason": f"ok-{task_id}", "confidence": 0.91}
 
 
 class LlmJudgeTests(unittest.TestCase):
@@ -117,6 +133,18 @@ class LlmJudgeTests(unittest.TestCase):
         self.assertEqual(verdicts[0]["status"], "needs_ocr")
         trace = verdicts[0]["decision_trace"] or {}
         self.assertEqual((trace.get("llm_review") or {}).get("skipped"), "needs_ocr")
+
+    def test_judge_tasks_parallel_keeps_input_order(self) -> None:
+        tasks = [
+            {"task_id": "T0001", "clause_id": "R0001", "rule_status": "risk", "rule_reason": "rule check"},
+            {"task_id": "T0002", "clause_id": "R0001", "rule_status": "risk", "rule_reason": "rule check"},
+            {"task_id": "T0003", "clause_id": "R0001", "rule_status": "risk", "rule_reason": "rule check"},
+            {"task_id": "T0004", "clause_id": "R0001", "rule_status": "risk", "rule_reason": "rule check"},
+        ]
+
+        verdicts = judge_tasks_with_llm(tasks, _SlowOrderedReviewer(), max_workers=4)
+        self.assertEqual([row["task_id"] for row in verdicts], [row["task_id"] for row in tasks])
+        self.assertTrue(all(row["status"] == "pass" for row in verdicts))
 
     def test_write_verdicts_jsonl_accepts_allowed_statuses_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
