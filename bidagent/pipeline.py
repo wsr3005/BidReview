@@ -3,20 +3,29 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
+import subprocess
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from bidagent import __version__
 from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
 from bidagent.consistency import find_inconsistencies
 from bidagent.document import iter_document_blocks
 from bidagent.eval import evaluate_run
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
-from bidagent.llm import DeepSeekReviewer, apply_llm_review
+from bidagent.llm import DEEPSEEK_PROMPT_VERSION, DeepSeekReviewer, apply_llm_review
 from bidagent.models import Block, Location, Requirement
 from bidagent.ocr import iter_document_ocr_blocks, ocr_selfcheck
-from bidagent.review import enforce_evidence_quality_gate, extract_requirements, review_requirements
+from bidagent.review import (
+    REVIEW_RULE_ENGINE,
+    REVIEW_RULE_VERSION,
+    enforce_evidence_quality_gate,
+    extract_requirements,
+    review_requirements,
+)
 
 VALID_RELEASE_MODES = {"assist_only", "auto_final"}
 VALID_GATE_FAIL_FAST_MODES = {"off", "critical", "all"}
@@ -28,6 +37,10 @@ DEFAULT_GATE_THRESHOLDS = {
     "evidence_traceability": 0.99,
     "llm_coverage": 1.0,
 }
+VERDICT_STRATEGY_VERSION = "verdict-harvest-v1"
+CANARY_POLICY_VERSION = "release-canary-v1"
+RUN_METADATA_SCHEMA_VERSION = "run-metadata-v1"
+RELEASE_TRACE_SCHEMA_VERSION = "release-trace-v1"
 EVIDENCE_TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{2,}")
 POSITIVE_EVIDENCE_HINTS = (
     "已提供",
@@ -236,6 +249,268 @@ def _validate_release_mode(release_mode: str) -> str:
         return value
     allowed = ", ".join(sorted(VALID_RELEASE_MODES))
     raise ValueError(f"release_mode must be one of: {allowed}")
+
+
+def _utc_now_z() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _safe_git_value(*args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if result.returncode != 0:
+        return None
+    value = str(result.stdout or "").strip()
+    return value or None
+
+
+def _resolve_prompt_version(provider: str | None) -> str:
+    if provider == "deepseek":
+        return DEEPSEEK_PROMPT_VERSION
+    return "rule-only-v1"
+
+
+def _build_run_metadata(
+    *,
+    out_dir: Path,
+    focus: str,
+    page_range: tuple[int, int] | None,
+    ocr_mode: str,
+    ai_provider: str | None,
+    ai_model: str,
+    ai_base_url: str,
+    ai_workers: int,
+    ai_min_confidence: float,
+    requested_release_mode: str,
+) -> dict[str, Any]:
+    release_dir = out_dir / "release"
+    ensure_dir(release_dir)
+    out_path = release_dir / "run-metadata.json"
+
+    provider = ai_provider or "none"
+    model_name = ai_model if ai_provider else None
+    model_base_url = ai_base_url if ai_provider else None
+    run_id = datetime.now(UTC).strftime("run-%Y%m%d-%H%M%S")
+    commit = _safe_git_value("rev-parse", "--short", "HEAD")
+    branch = _safe_git_value("rev-parse", "--abbrev-ref", "HEAD")
+
+    payload = {
+        "schema_version": RUN_METADATA_SCHEMA_VERSION,
+        "run_id": run_id,
+        "generated_at": _utc_now_z(),
+        "bidagent_version": __version__,
+        "git": {
+            "branch": branch,
+            "commit": commit,
+        },
+        "model": {
+            "provider": provider,
+            "name": model_name,
+            "base_url": model_base_url,
+        },
+        "prompt": {
+            "provider": provider,
+            "version": _resolve_prompt_version(ai_provider),
+        },
+        "strategy": {
+            "review_rule_engine": REVIEW_RULE_ENGINE,
+            "review_rule_version": REVIEW_RULE_VERSION,
+            "verdict_strategy_version": VERDICT_STRATEGY_VERSION,
+            "canary_policy_version": CANARY_POLICY_VERSION,
+        },
+        "run_config": {
+            "focus": focus,
+            "page_range": list(page_range) if page_range else None,
+            "ocr_mode": ocr_mode,
+            "release_mode_requested": requested_release_mode,
+            "ai_workers": int(ai_workers),
+            "ai_min_confidence": float(ai_min_confidence),
+        },
+    }
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _collect_release_artifacts(out_dir: Path) -> list[dict[str, Any]]:
+    files = [
+        "requirements.jsonl",
+        "review-tasks.jsonl",
+        "findings.jsonl",
+        "verdicts.jsonl",
+        "gate-result.json",
+        "annotations.jsonl",
+        "manual-review.jsonl",
+        "consistency-findings.jsonl",
+        "review-report.md",
+        "eval/metrics.json",
+    ]
+    rows: list[dict[str, Any]] = []
+    for rel in files:
+        path = out_dir / rel
+        if not path.exists() or not path.is_file():
+            continue
+        rows.append(
+            {
+                "path": rel.replace("\\", "/"),
+                "size_bytes": int(path.stat().st_size),
+                "sha256": _sha256_file(path),
+            }
+        )
+    return rows
+
+
+def _run_canary(
+    *,
+    out_dir: Path,
+    requested_release_mode: str,
+    gate_result: dict[str, Any],
+) -> dict[str, Any]:
+    release_dir = out_dir / "release"
+    ensure_dir(release_dir)
+    out_path = release_dir / "canary-result.json"
+
+    findings_path = out_dir / "findings.jsonl"
+    verdicts_path = out_dir / "verdicts.jsonl"
+    findings_rows = list(read_jsonl(findings_path)) if findings_path.exists() else []
+    verdict_rows = list(read_jsonl(verdicts_path)) if verdicts_path.exists() else []
+
+    canary_required = requested_release_mode == "auto_final"
+    checks: list[dict[str, Any]] = []
+    release_mode = "assist_only"
+    status = "skipped"
+
+    if canary_required:
+        gate_ok = bool(gate_result.get("eligible_for_auto_final"))
+        checks.append(
+            {
+                "name": "gate_eligible_for_auto_final",
+                "ok": gate_ok,
+                "value": bool(gate_result.get("eligible_for_auto_final")),
+            }
+        )
+
+        required_files = [
+            out_dir / "requirements.jsonl",
+            out_dir / "findings.jsonl",
+            out_dir / "verdicts.jsonl",
+            out_dir / "gate-result.json",
+            out_dir / "review-report.md",
+        ]
+        files_ok = all(path.exists() for path in required_files)
+        checks.append(
+            {
+                "name": "required_release_files_present",
+                "ok": files_ok,
+                "missing": [str(path.relative_to(out_dir)) for path in required_files if not path.exists()],
+            }
+        )
+
+        trace_ok = all(
+            isinstance(row.get("decision_trace"), dict) and isinstance(row.get("evidence_refs"), list)
+            for row in verdict_rows
+        )
+        checks.append(
+            {
+                "name": "verdict_trace_complete",
+                "ok": trace_ok,
+                "sample_size": len(verdict_rows),
+            }
+        )
+
+        signature_set = {
+            (str((row.get("model") or {}).get("provider") or ""), str((row.get("model") or {}).get("name") or ""))
+            for row in verdict_rows
+        }
+        signature_set = {item for item in signature_set if item != ("", "")}
+        model_ok = len(signature_set) <= 1 and (len(verdict_rows) == 0 or len(signature_set) == 1)
+        checks.append(
+            {
+                "name": "single_model_signature",
+                "ok": model_ok,
+                "signatures": [f"{provider}:{name}" for provider, name in sorted(signature_set)],
+            }
+        )
+
+        findings_have_location = all(_finding_has_traceable_evidence(row) for row in findings_rows) if findings_rows else False
+        checks.append(
+            {
+                "name": "findings_traceable_evidence",
+                "ok": findings_have_location,
+                "sample_size": len(findings_rows),
+            }
+        )
+
+        canary_pass = all(bool(item.get("ok")) for item in checks)
+        status = "pass" if canary_pass else "fail"
+        release_mode = "auto_final" if canary_pass else "assist_only"
+
+    result = {
+        "policy_version": CANARY_POLICY_VERSION,
+        "generated_at": _utc_now_z(),
+        "requested_release_mode": requested_release_mode,
+        "canary_required": canary_required,
+        "status": status,
+        "release_mode": release_mode,
+        "checks": checks,
+    }
+    out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+def _write_release_trace(
+    *,
+    out_dir: Path,
+    run_metadata: dict[str, Any],
+    gate_result: dict[str, Any],
+    canary_result: dict[str, Any],
+) -> dict[str, Any]:
+    release_dir = out_dir / "release"
+    ensure_dir(release_dir)
+    out_path = release_dir / "release-trace.json"
+
+    artifacts = _collect_release_artifacts(out_dir)
+    payload = {
+        "schema_version": RELEASE_TRACE_SCHEMA_VERSION,
+        "generated_at": _utc_now_z(),
+        "final_release_mode": canary_result.get("release_mode", "assist_only"),
+        "requested_release_mode": gate_result.get("requested_release_mode", "assist_only"),
+        "gate": {
+            "eligible_for_auto_final": bool(gate_result.get("eligible_for_auto_final")),
+            "release_mode": gate_result.get("release_mode", "assist_only"),
+            "checks": gate_result.get("checks", []),
+        },
+        "canary": {
+            "status": canary_result.get("status", "skipped"),
+            "checks": canary_result.get("checks", []),
+        },
+        "run_metadata": {
+            "run_id": run_metadata.get("run_id"),
+            "model": run_metadata.get("model"),
+            "prompt": run_metadata.get("prompt"),
+            "strategy": run_metadata.get("strategy"),
+        },
+        "artifacts": artifacts,
+    }
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
 
 
 def ingest(
@@ -1230,8 +1505,9 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         model = {}
         provider = str((llm or {}).get("provider") or "")
         model_name = str((llm or {}).get("model") or "")
-        if provider or model_name:
-            model = {"provider": provider, "name": model_name}
+        prompt_version = str((llm or {}).get("prompt_version") or "")
+        if provider or model_name or prompt_version:
+            model = {"provider": provider, "name": model_name, "prompt_version": prompt_version or None}
 
         decision_trace = finding.get("decision_trace")
         if not isinstance(decision_trace, dict):
@@ -1444,7 +1720,7 @@ def gate(
             "eval_metrics": eval_metrics or {},
         },
         "checks": checks,
-        "generated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "generated_at": _utc_now_z(),
     }
     gate_out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
@@ -1590,10 +1866,35 @@ def run_pipeline(
     summary["checklist"] = checklist(out_dir=out_dir, resume=downstream_resume)
     summary["consistency"] = consistency(out_dir=out_dir, resume=downstream_resume)
     summary["report"] = report(out_dir=out_dir)
-    summary["gate"] = gate(
+    gate_result = gate(
         out_dir=out_dir,
         requested_release_mode=requested_release_mode,
         threshold_overrides=gate_threshold_overrides,
         fail_fast=gate_fail_fast,
     )
+    summary["gate"] = gate_result
+    summary["run_metadata"] = _build_run_metadata(
+        out_dir=out_dir,
+        focus=focus,
+        page_range=page_range,
+        ocr_mode=ocr_mode,
+        ai_provider=ai_provider,
+        ai_model=ai_model,
+        ai_base_url=ai_base_url,
+        ai_workers=ai_workers,
+        ai_min_confidence=ai_min_confidence,
+        requested_release_mode=requested_release_mode,
+    )
+    summary["canary"] = _run_canary(
+        out_dir=out_dir,
+        requested_release_mode=requested_release_mode,
+        gate_result=gate_result,
+    )
+    summary["release_trace"] = _write_release_trace(
+        out_dir=out_dir,
+        run_metadata=summary["run_metadata"],
+        gate_result=gate_result,
+        canary_result=summary["canary"],
+    )
+    summary["release_mode"] = str((summary.get("canary") or {}).get("release_mode") or "assist_only")
     return summary

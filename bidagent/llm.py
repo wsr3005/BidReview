@@ -16,6 +16,7 @@ from bidagent.models import Finding, Requirement
 
 ALLOWED_STATUS = {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"}
 ALLOWED_SEVERITY = {"none", "low", "medium", "high"}
+DEEPSEEK_PROMPT_VERSION = "deepseek-review-v1"
 
 
 class Reviewer(Protocol):
@@ -47,6 +48,7 @@ def _extract_json_object(text: str) -> dict:
 
 class DeepSeekReviewer:
     provider = "deepseek"
+    prompt_version = DEEPSEEK_PROMPT_VERSION
 
     def __init__(
         self,
@@ -250,6 +252,7 @@ def apply_llm_review(
     min_confidence: float = 0.65,
 ) -> list[Finding]:
     worker_count = max(1, int(max_workers))
+    prompt_version = str(getattr(reviewer, "prompt_version", "") or "").strip() or None
     req_map = {item.requirement_id: item for item in requirements}
 
     def _review_one(index: int, finding: Finding) -> tuple[int, Finding]:
@@ -267,6 +270,7 @@ def apply_llm_review(
             finding.llm = {
                 "provider": reviewer.provider,
                 "model": reviewer.model,
+                "prompt_version": prompt_version,
                 "skipped": "needs_ocr",
             }
             return index, finding
@@ -277,12 +281,14 @@ def apply_llm_review(
             trace["llm_review"] = {
                 "provider": reviewer.provider,
                 "model": reviewer.model,
+                "prompt_version": prompt_version,
                 "error": str(exc),
             }
             finding.decision_trace = trace
             finding.llm = {
                 "provider": reviewer.provider,
                 "model": reviewer.model,
+                "prompt_version": prompt_version,
                 "error": str(exc),
             }
             return index, finding
@@ -312,6 +318,7 @@ def apply_llm_review(
         trace["llm_review"] = {
             "provider": reviewer.provider,
             "model": reviewer.model,
+            "prompt_version": prompt_version,
             "status": llm_result["status"],
             "severity": llm_result["severity"],
             "confidence": llm_result["confidence"],
@@ -320,6 +327,7 @@ def apply_llm_review(
         finding.llm = {
             "provider": reviewer.provider,
             "model": reviewer.model,
+            "prompt_version": prompt_version,
             "confidence": llm_result["confidence"],
             "decision": llm_result,
             "requirement": {
