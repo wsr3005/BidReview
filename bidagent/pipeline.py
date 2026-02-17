@@ -398,12 +398,15 @@ def _run_canary(
     status = "skipped"
 
     if canary_required:
+        # Canary checks release integrity only.
+        # Business thresholds must be enforced by gate() and reflected via gate_eligible_for_auto_final.
         gate_ok = bool(gate_result.get("eligible_for_auto_final"))
         checks.append(
             {
                 "name": "gate_eligible_for_auto_final",
                 "ok": gate_ok,
                 "value": bool(gate_result.get("eligible_for_auto_final")),
+                "blocking": True,
             }
         )
 
@@ -420,6 +423,7 @@ def _run_canary(
                 "name": "required_release_files_present",
                 "ok": files_ok,
                 "missing": [str(path.relative_to(out_dir)) for path in required_files if not path.exists()],
+                "blocking": True,
             }
         )
 
@@ -432,6 +436,7 @@ def _run_canary(
                 "name": "verdict_trace_complete",
                 "ok": trace_ok,
                 "sample_size": len(verdict_rows),
+                "blocking": True,
             }
         )
 
@@ -446,19 +451,14 @@ def _run_canary(
                 "name": "single_model_signature",
                 "ok": model_ok,
                 "signatures": [f"{provider}:{name}" for provider, name in sorted(signature_set)],
+                "blocking": True,
             }
         )
-
-        findings_have_location = all(_finding_has_traceable_evidence(row) for row in findings_rows) if findings_rows else False
-        checks.append(
-            {
-                "name": "findings_traceable_evidence",
-                "ok": findings_have_location,
-                "sample_size": len(findings_rows),
-            }
+        canary_pass = all(
+            bool(item.get("ok"))
+            for item in checks
+            if bool(item.get("blocking", True))
         )
-
-        canary_pass = all(bool(item.get("ok")) for item in checks)
         status = "pass" if canary_pass else "fail"
         release_mode = "auto_final" if canary_pass else "assist_only"
 

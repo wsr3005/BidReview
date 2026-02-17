@@ -517,6 +517,78 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertIsInstance(release_trace["artifacts"], list)
             self.assertGreaterEqual(len(release_trace["artifacts"]), 1)
 
+    def test_run_pipeline_release_mode_follows_gate_threshold_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            tender = base / "tender.txt"
+            bid = base / "bid.txt"
+            out_dir = base / "out"
+            tender.write_text("商务要求：投标人必须提供营业执照。", encoding="utf-8")
+            bid.write_text("我司响应本项目商务要求。", encoding="utf-8")
+            (out_dir / "eval").mkdir(parents=True, exist_ok=True)
+            (out_dir / "eval" / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "hard_fail_recall": 1.0,
+                            "false_positive_fail_rate": 0.0,
+                            "false_positive_fail": 0,
+                            "non_fail_total": 1,
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            def _fake_review(**kwargs):
+                lane_out = Path(kwargs["out_dir"])
+                write_jsonl(
+                    lane_out / "findings.jsonl",
+                    [
+                        {
+                            "requirement_id": "R0001",
+                            "status": "pass",
+                            "score": 2,
+                            "severity": "none",
+                            "reason": "LLM判定通过",
+                            "llm": {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "prompt_version": "deepseek-review-v1",
+                                "confidence": 0.92,
+                            },
+                            "decision_trace": {
+                                "decision": {"status": "pass", "reason": "LLM判定通过", "source": "llm"}
+                            },
+                            "evidence": [],
+                        }
+                    ],
+                )
+                return {"findings": 1, "status_counts": {"pass": 1}}
+
+            with patch("bidagent.pipeline.review", side_effect=_fake_review):
+                result = run_pipeline(
+                    tender_path=tender,
+                    bid_path=bid,
+                    out_dir=out_dir,
+                    focus="business",
+                    resume=False,
+                    ocr_mode="auto",
+                    ai_provider="deepseek",
+                    release_mode="auto_final",
+                    gate_threshold_overrides={"evidence_traceability": 0.0},
+                )
+
+            self.assertEqual(result["gate"]["release_mode"], "auto_final")
+            self.assertTrue(result["gate"]["eligible_for_auto_final"])
+            self.assertEqual(result["release_mode"], "auto_final")
+
+            canary_result = json.loads((out_dir / "release" / "canary-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(canary_result["status"], "pass")
+            self.assertEqual(canary_result["release_mode"], "auto_final")
+
 
 if __name__ == "__main__":
     unittest.main()
