@@ -80,6 +80,18 @@ NEGATIVE_EVIDENCE_HINTS = (
     "无",
     "没有",
 )
+STRONG_CONFLICT_HINTS = (
+    "未提供",
+    "未提交",
+    "缺失",
+    "缺少",
+    "不满足",
+    "不符合",
+    "不具备",
+    "无效",
+    "作废",
+    "驳回",
+)
 
 
 def _row_to_block(row: dict[str, Any]) -> Block:
@@ -1497,6 +1509,136 @@ def _aggregate_task_verdicts(task_verdicts: list[dict[str, Any]]) -> dict[str, A
     }
 
 
+def _max_pack_score(items: list[dict[str, Any]]) -> int:
+    scores: list[int] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            scores.append(int(item.get("score") or 0))
+        except (TypeError, ValueError):
+            continue
+    return max(scores) if scores else 0
+
+
+def _derive_task_rule_decision(
+    *,
+    task: dict[str, Any],
+    pack: dict[str, Any],
+    mandatory: bool,
+    default_status: str,
+    default_reason: str,
+    default_confidence: float | None,
+) -> dict[str, Any]:
+    support_pack = [item for item in (pack.get("evidence_pack") or []) if isinstance(item, dict)]
+    counter_pack = [item for item in (pack.get("counter_evidence_pack") or []) if isinstance(item, dict)]
+    support_score = _max_pack_score(support_pack)
+    counter_score = _max_pack_score(counter_pack)
+
+    support_reference_only = bool(support_pack) and all(bool(item.get("reference_only")) for item in support_pack)
+    has_any_support = support_score > 0
+    has_any_counter = counter_score > 0
+
+    status = default_status or "insufficient_evidence"
+    reason = default_reason or "任务规则判定"
+    if not has_any_support and not has_any_counter:
+        status = "insufficient_evidence"
+        reason = "任务未检索到有效证据"
+    elif support_reference_only and not has_any_counter:
+        status = "needs_ocr" if mandatory else "insufficient_evidence"
+        reason = "任务仅命中附件/扫描件引用，需OCR复核"
+    elif has_any_counter and counter_score >= max(6, support_score + 2):
+        if has_any_support:
+            status = "risk"
+            reason = "任务支持与高置信反证冲突证据并存，需人工复核"
+        else:
+            status = "fail" if mandatory else "risk"
+            reason = "任务命中高置信反证，当前结论不成立"
+    elif has_any_support and support_score >= max(5, counter_score + 1):
+        status = "pass"
+        reason = "任务命中支持证据且强于反证"
+    elif has_any_support and has_any_counter:
+        status = "risk"
+        reason = "任务支持证据与反证并存，需人工复核"
+    elif has_any_support:
+        status = "risk"
+        reason = "任务仅命中弱支持证据，需人工复核"
+    elif has_any_counter:
+        status = "fail" if mandatory and counter_score >= 4 else "risk"
+        reason = "任务命中反证但缺少充分支持证据"
+
+    confidence = default_confidence
+    if confidence is None:
+        confidence = _status_confidence_hint(status)
+    confidence = max(0.0, min(1.0, float(confidence)))
+    return {
+        "status": status,
+        "reason": reason,
+        "confidence": confidence,
+        "trace": {
+            "task_type": str(task.get("task_type") or ""),
+            "support_score": support_score,
+            "counter_score": counter_score,
+            "support_reference_only": support_reference_only,
+        },
+    }
+
+
+def _counter_conflict_second_pass(
+    *,
+    status: str,
+    reason: str,
+    confidence: float,
+    task_packs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    support_top = 0
+    counter_top = 0
+    strong_hits = 0
+    for pack in task_packs:
+        if not isinstance(pack, dict):
+            continue
+        support_pack = [item for item in (pack.get("evidence_pack") or []) if isinstance(item, dict)]
+        counter_pack = [item for item in (pack.get("counter_evidence_pack") or []) if isinstance(item, dict)]
+        support_top = max(support_top, _max_pack_score(support_pack))
+        counter_top = max(counter_top, _max_pack_score(counter_pack))
+        for item in counter_pack:
+            excerpt = str(item.get("excerpt") or "")
+            terms = [str(term or "") for term in (item.get("matched_terms") or [])]
+            text = excerpt + " " + " ".join(terms)
+            if any(token in text for token in STRONG_CONFLICT_HINTS):
+                strong_hits += 1
+
+    conflict_level = "none"
+    downgraded = False
+    next_status = status
+    next_reason = reason
+    next_confidence = confidence
+
+    if status == "pass" and counter_top > 0:
+        if strong_hits > 0 or counter_top >= support_top:
+            conflict_level = "strong"
+            downgraded = True
+            next_status = "risk"
+            next_reason = "命中强反证/冲突证据，pass结论不稳定，已降级为risk"
+            next_confidence = min(confidence, 0.55)
+        else:
+            conflict_level = "weak"
+
+    return {
+        "status": next_status,
+        "reason": next_reason,
+        "confidence": next_confidence,
+        "audit": {
+            "support_top_score": support_top,
+            "counter_top_score": counter_top,
+            "strong_counter_hits": strong_hits,
+            "conflict_level": conflict_level,
+            "downgraded": downgraded,
+            "action": "downgrade_pass_to_risk_conflict_second_pass" if downgraded else None,
+        },
+    }
+
+
 def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     requirements_path = out_dir / "requirements.jsonl"
     findings_path = out_dir / "findings.jsonl"
@@ -1536,11 +1678,14 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         "source_type_counts": dict(source_type_counts),
     }
     requirements_rows = list(read_jsonl(requirements_path)) if requirements_path.exists() else []
+    requirements_by_id: dict[str, dict[str, Any]] = {}
     requirement_order: list[str] = []
     for index, row in enumerate(requirements_rows, start=1):
         requirement_id = str(row.get("requirement_id") or f"R{index:04d}").strip()
         if requirement_id and requirement_id not in requirement_order:
             requirement_order.append(requirement_id)
+        if requirement_id:
+            requirements_by_id[requirement_id] = row
 
     finding_rows = list(read_jsonl(findings_path)) if findings_path.exists() else []
     finding_by_requirement: dict[str, dict[str, Any]] = {}
@@ -1561,9 +1706,10 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     for index, requirement_id in enumerate(requirement_order, start=1):
         finding = finding_by_requirement.get(requirement_id, {})
         task_rows = list(tasks_by_requirement.get(requirement_id, []))
-        status = str(finding.get("status") or "insufficient_evidence")
+        fallback_status = str(finding.get("status") or "insufficient_evidence")
         llm = finding.get("llm") if isinstance(finding.get("llm"), dict) else {}
         llm_confidence = _safe_float((llm or {}).get("confidence"))
+        mandatory = bool((requirements_by_id.get(requirement_id) or {}).get("mandatory", False))
 
         existing_refs = [
             _to_evidence_ref(item, source="finding")
@@ -1580,36 +1726,9 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
                 }
             ]
         base_reason = str(finding.get("reason") or "规则判定结果")
-        provider = str((llm or {}).get("provider") or "rule_fallback")
-        model_name = str((llm or {}).get("model") or "rule-only")
-        reviewer = _PipelineTaskReviewer(
-            provider=provider,
-            model=model_name,
-            default_status=status,
-            default_reason=base_reason,
-            default_confidence=llm_confidence,
-        )
-        task_inputs: list[dict[str, Any]] = []
-        for task in task_rows:
-            task_row = dict(task)
-            task_row["rule_status"] = status
-            task_row["rule_reason"] = base_reason
-            task_row["rule_confidence"] = llm_confidence
-            task_row["evidence_refs"] = existing_refs
-            trace = task_row.get("decision_trace")
-            if not isinstance(trace, dict):
-                trace = {}
-            trace.setdefault("source", "pipeline_task_bridge")
-            trace.setdefault("requirement_id", requirement_id)
-            task_row["decision_trace"] = trace
-            task_inputs.append(task_row)
-        task_verdict_rows = judge_tasks_with_llm(task_inputs, reviewer, min_confidence=0.65)
-        aggregated = _aggregate_task_verdicts(task_verdict_rows)
-        status = str(aggregated.get("status") or "insufficient_evidence")
-        confidence = max(0.0, min(1.0, _safe_float(aggregated.get("confidence")) or _status_confidence_hint(status)))
 
         task_pack_rows: list[dict[str, Any]] = []
-        for task in task_inputs:
+        for task in task_rows:
             pack = harvest_task_evidence(
                 task,
                 task_evidence_index,
@@ -1628,6 +1747,46 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             task_pack_rows.append(pack)
 
         evidence_pack_rows.extend(task_pack_rows)
+
+        provider = str((llm or {}).get("provider") or "rule_fallback")
+        model_name = str((llm or {}).get("model") or "rule-only")
+        reviewer = _PipelineTaskReviewer(
+            provider=provider,
+            model=model_name,
+            default_status=fallback_status,
+            default_reason=base_reason,
+            default_confidence=llm_confidence,
+        )
+        task_inputs: list[dict[str, Any]] = []
+        for task, task_pack in zip(task_rows, task_pack_rows, strict=False):
+            task_rule = _derive_task_rule_decision(
+                task=task,
+                pack=task_pack,
+                mandatory=mandatory,
+                default_status=fallback_status,
+                default_reason=base_reason,
+                default_confidence=llm_confidence,
+            )
+            task_row = dict(task)
+            task_row["rule_status"] = task_rule["status"]
+            task_row["rule_reason"] = task_rule["reason"]
+            task_row["rule_confidence"] = task_rule["confidence"]
+            task_row["evidence_refs"] = _merge_evidence_refs(
+                existing_refs,
+                [item for item in (task_pack.get("evidence_refs") or []) if isinstance(item, dict)],
+            )
+            trace = task_row.get("decision_trace")
+            if not isinstance(trace, dict):
+                trace = {}
+            trace.setdefault("source", "pipeline_task_bridge")
+            trace.setdefault("requirement_id", requirement_id)
+            trace["task_rule"] = task_rule.get("trace")
+            task_row["decision_trace"] = trace
+            task_inputs.append(task_row)
+        task_verdict_rows = judge_tasks_with_llm(task_inputs, reviewer, min_confidence=0.65)
+        aggregated = _aggregate_task_verdicts(task_verdict_rows)
+        status = str(aggregated.get("status") or "insufficient_evidence")
+        confidence = max(0.0, min(1.0, _safe_float(aggregated.get("confidence")) or _status_confidence_hint(status)))
 
         task_support_refs: list[dict[str, Any]] = []
         task_counter_refs: list[dict[str, Any]] = []
@@ -1656,12 +1815,17 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
 
         reason = str(aggregated.get("reason") or base_reason)
         status_before_audit = status
-        downgrade_action: str | None = None
-        if status == "pass" and counter_evidence_refs:
-            status = "risk"
-            reason = "命中反证/冲突证据，pass结论不稳定，已降级为risk"
-            confidence = min(confidence, 0.55)
-            downgrade_action = "downgrade_pass_to_risk_conflict"
+        second_pass = _counter_conflict_second_pass(
+            status=status,
+            reason=reason,
+            confidence=confidence,
+            task_packs=task_pack_rows,
+        )
+        status = str(second_pass.get("status") or status)
+        reason = str(second_pass.get("reason") or reason)
+        confidence = max(0.0, min(1.0, _safe_float(second_pass.get("confidence")) or confidence))
+        second_pass_audit = second_pass.get("audit") if isinstance(second_pass.get("audit"), dict) else {}
+        downgrade_action = second_pass_audit.get("action") if second_pass_audit else None
 
         model = {}
         provider = str((llm or {}).get("provider") or "")
@@ -1693,10 +1857,12 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         }
         decision_trace["counter_evidence_audit"] = {
             "counter_evidence_refs": counter_refs,
-            "conflict_detected": bool(counter_evidence_refs),
+            "conflict_detected": bool(counter_evidence_refs)
+            or bool(second_pass_audit.get("conflict_level") not in {None, "none"}),
             "status_before": status_before_audit,
             "status_after": status,
             "action": downgrade_action,
+            "second_pass": second_pass_audit,
         }
         decision_trace["evidence_refs"] = support_refs
         decision_trace["counter_evidence_refs"] = counter_refs

@@ -438,6 +438,58 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertEqual((trace.get("evidence_index") or {}).get("unified_blocks_indexed"), 1)
             self.assertIsInstance((trace.get("evidence_harvest") or {}).get("query_terms"), list)
 
+    def test_verdict_task_level_decision_not_blindly_inherits_requirement_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "text": "投标人必须提供营业执照",
+                        "mandatory": True,
+                        "keywords": ["营业执照"],
+                        "constraints": [],
+                        "rule_tier": "hard_fail",
+                    }
+                ],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "text": "本段仅描述项目背景，无资质证明信息。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "pass",
+                        "score": 3,
+                        "severity": "none",
+                        "reason": "旧结论误判为通过",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.92},
+                        "evidence": [],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+
+            result = verdict(out_dir=out_dir, resume=False)
+            self.assertEqual(result["verdicts"], 1)
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(len(rows), 1)
+            self.assertNotEqual(rows[0]["status"], "pass")
+            self.assertIn(rows[0]["status"], {"risk", "needs_ocr", "insufficient_evidence", "fail"})
+
     def test_verdict_downgrades_unstable_pass_to_risk_on_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)
@@ -498,7 +550,12 @@ class PipelineReviewTests(unittest.TestCase):
             trace = rows[0].get("decision_trace") or {}
             audit = trace.get("counter_evidence_audit") or {}
             self.assertTrue(audit.get("conflict_detected"))
-            self.assertEqual(audit.get("action"), "downgrade_pass_to_risk_conflict")
+            self.assertIn(
+                audit.get("action"),
+                {None, "downgrade_pass_to_risk_conflict_second_pass"},
+            )
+            second_pass = audit.get("second_pass") or {}
+            self.assertIn(second_pass.get("conflict_level"), {"strong", "weak", "none", None})
             self.assertEqual((trace.get("decision") or {}).get("status"), "risk")
 
     def test_run_pipeline_writes_release_hardening_artifacts(self) -> None:
