@@ -24,7 +24,7 @@ from bidagent.eval import evaluate_run
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm_judge import judge_tasks_with_llm, write_verdicts_jsonl
 from bidagent.llm import DEEPSEEK_PROMPT_VERSION, DeepSeekReviewer, apply_llm_review
-from bidagent.models import Block, Location, Requirement
+from bidagent.models import Block, Finding, Location, Requirement
 from bidagent.ocr import iter_document_ocr_blocks, ocr_selfcheck
 from bidagent.review import (
     REVIEW_RULE_ENGINE,
@@ -1468,6 +1468,101 @@ class _PipelineTaskReviewer:
         }
 
 
+def _task_keywords(task: dict[str, Any], limit: int = 8) -> list[str]:
+    values: list[Any] = [task.get("query"), task.get("task_type")]
+    expected_logic = task.get("expected_logic")
+    if isinstance(expected_logic, dict):
+        values.append(expected_logic.get("keywords"))
+        values.append(expected_logic.get("requirement_text"))
+    return _extract_query_terms(values, limit=limit)
+
+
+def _task_evidence_for_llm(task: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key in ("evidence_pack", "counter_evidence_pack"):
+        for item in (task.get(key) or []):
+            if not isinstance(item, dict):
+                continue
+            excerpt = str(item.get("excerpt") or "")
+            polarity = str(item.get("polarity") or ("counter" if key == "counter_evidence_pack" else "support"))
+            rows.append(
+                {
+                    "score": item.get("score"),
+                    "location": item.get("location"),
+                    "excerpt": f"[{polarity}] {excerpt}".strip(),
+                }
+            )
+    if rows:
+        return rows
+
+    for item in (task.get("evidence_refs") or []):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "score": item.get("score"),
+                "location": item.get("location"),
+                "excerpt": str(item.get("excerpt") or ""),
+            }
+        )
+    return rows
+
+
+def _status_to_severity(status: str) -> str:
+    if status == "pass":
+        return "none"
+    if status == "risk":
+        return "medium"
+    if status == "fail":
+        return "high"
+    if status == "needs_ocr":
+        return "medium"
+    return "medium"
+
+
+class _PipelineDeepSeekTaskReviewer:
+    provider = "deepseek"
+
+    def __init__(self, *, api_key: str, model: str, base_url: str) -> None:
+        self._reviewer = DeepSeekReviewer(api_key=api_key, model=model, base_url=base_url)
+        self.model = model
+
+    def review_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        requirement_id = str(task.get("requirement_id") or task.get("task_id") or "T")
+        query = str(task.get("query") or "")
+        expected_logic = task.get("expected_logic")
+        expected_logic_dict = expected_logic if isinstance(expected_logic, dict) else {}
+        requirement = Requirement(
+            requirement_id=requirement_id,
+            text=query,
+            category=str(task.get("task_type") or "task"),
+            mandatory=bool(expected_logic_dict.get("mandatory", False)),
+            keywords=_task_keywords(task),
+            constraints=list(expected_logic_dict.get("constraints") or []),
+            rule_tier=str(task.get("priority") or "general"),
+            source={"task_id": task.get("task_id")},
+        )
+        rule_status = str(task.get("rule_status") or task.get("status") or "insufficient_evidence")
+        rule_reason = str(task.get("rule_reason") or task.get("reason") or "task rule fallback")
+        finding = Finding(
+            requirement_id=requirement_id,
+            status=rule_status,
+            score=0,
+            severity=_status_to_severity(rule_status),
+            reason=rule_reason,
+            clause_id=requirement_id,
+            evidence=_task_evidence_for_llm(task),
+            decision_trace=task.get("decision_trace") if isinstance(task.get("decision_trace"), dict) else {},
+            llm=None,
+        )
+        result = self._reviewer.review(requirement, finding)
+        return {
+            "status": str(result.get("status") or rule_status),
+            "reason": str(result.get("reason") or rule_reason),
+            "confidence": _safe_float(result.get("confidence")),
+        }
+
+
 def _aggregate_task_verdicts(task_verdicts: list[dict[str, Any]]) -> dict[str, Any]:
     if not task_verdicts:
         return {
@@ -1639,7 +1734,15 @@ def _counter_conflict_second_pass(
     }
 
 
-def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
+def verdict(
+    out_dir: Path,
+    resume: bool = False,
+    ai_provider: str | None = None,
+    ai_model: str = "deepseek-chat",
+    ai_api_key_file: Path | None = None,
+    ai_base_url: str = "https://api.deepseek.com/v1",
+    ai_min_confidence: float = 0.65,
+) -> dict[str, Any]:
     requirements_path = out_dir / "requirements.jsonl"
     findings_path = out_dir / "findings.jsonl"
     tasks_path = out_dir / "review-tasks.jsonl"
@@ -1701,6 +1804,16 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         if requirement_id not in requirement_order:
             requirement_order.append(requirement_id)
 
+    shared_task_llm_reviewer: _PipelineDeepSeekTaskReviewer | None = None
+    if ai_provider == "deepseek":
+        api_key = _load_api_key(ai_provider, ai_api_key_file)
+        if api_key:
+            shared_task_llm_reviewer = _PipelineDeepSeekTaskReviewer(
+                api_key=api_key,
+                model=ai_model,
+                base_url=ai_base_url,
+            )
+
     verdict_rows: list[dict[str, Any]] = []
     evidence_pack_rows: list[dict[str, Any]] = []
     for index, requirement_id in enumerate(requirement_order, start=1):
@@ -1750,13 +1863,17 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
 
         provider = str((llm or {}).get("provider") or "rule_fallback")
         model_name = str((llm or {}).get("model") or "rule-only")
-        reviewer = _PipelineTaskReviewer(
-            provider=provider,
-            model=model_name,
-            default_status=fallback_status,
-            default_reason=base_reason,
-            default_confidence=llm_confidence,
-        )
+        task_reviewer: Any
+        if shared_task_llm_reviewer is not None:
+            task_reviewer = shared_task_llm_reviewer
+        else:
+            task_reviewer = _PipelineTaskReviewer(
+                provider=provider,
+                model=model_name,
+                default_status=fallback_status,
+                default_reason=base_reason,
+                default_confidence=llm_confidence,
+            )
         task_inputs: list[dict[str, Any]] = []
         for task, task_pack in zip(task_rows, task_pack_rows, strict=False):
             task_rule = _derive_task_rule_decision(
@@ -1783,7 +1900,7 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             trace["task_rule"] = task_rule.get("trace")
             task_row["decision_trace"] = trace
             task_inputs.append(task_row)
-        task_verdict_rows = judge_tasks_with_llm(task_inputs, reviewer, min_confidence=0.65)
+        task_verdict_rows = judge_tasks_with_llm(task_inputs, task_reviewer, min_confidence=ai_min_confidence)
         aggregated = _aggregate_task_verdicts(task_verdict_rows)
         status = str(aggregated.get("status") or "insufficient_evidence")
         confidence = max(0.0, min(1.0, _safe_float(aggregated.get("confidence")) or _status_confidence_hint(status)))
@@ -1828,9 +1945,11 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         downgrade_action = second_pass_audit.get("action") if second_pass_audit else None
 
         model = {}
-        provider = str((llm or {}).get("provider") or "")
-        model_name = str((llm or {}).get("model") or "")
+        provider = str((llm or {}).get("provider") or getattr(task_reviewer, "provider", "") or "")
+        model_name = str((llm or {}).get("model") or getattr(task_reviewer, "model", "") or "")
         prompt_version = str((llm or {}).get("prompt_version") or "")
+        if not prompt_version and provider == "deepseek":
+            prompt_version = DEEPSEEK_PROMPT_VERSION
         if provider or model_name or prompt_version:
             model = {"provider": provider, "name": model_name, "prompt_version": prompt_version or None}
 
@@ -2212,7 +2331,15 @@ def run_pipeline(
         ai_workers=ai_workers,
         ai_min_confidence=ai_min_confidence,
     )
-    summary["verdict"] = verdict(out_dir=out_dir, resume=False)
+    summary["verdict"] = verdict(
+        out_dir=out_dir,
+        resume=False,
+        ai_provider=ai_provider,
+        ai_model=ai_model,
+        ai_api_key_file=ai_api_key_file,
+        ai_base_url=ai_base_url,
+        ai_min_confidence=ai_min_confidence,
+    )
     # Even when resuming expensive upstream stages, keep downstream deliverables fresh.
     # This also guarantees a new timestamped annotated copy after each `run`.
     downstream_resume = False

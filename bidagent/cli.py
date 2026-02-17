@@ -193,7 +193,15 @@ def main(argv: list[str] | None = None) -> int:
                 ai_min_confidence=args.ai_min_confidence,
             )
         elif args.command == "verdict":
-            result = verdict(out_dir=out_dir, resume=args.resume)
+            result = verdict(
+                out_dir=out_dir,
+                resume=args.resume,
+                ai_provider=ai_provider,
+                ai_model=args.ai_model,
+                ai_api_key_file=ai_api_key_file,
+                ai_base_url=args.ai_base_url,
+                ai_min_confidence=args.ai_min_confidence,
+            )
         elif args.command == "gate":
             result = gate(
                 out_dir=out_dir,

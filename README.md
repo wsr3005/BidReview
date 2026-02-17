@@ -48,6 +48,7 @@ uv run bidagent run \
 When `runs/<x>/eval/gold.jsonl` exists, `run` auto-generates `eval/metrics.json` before gate checks.
 `run` also writes `evidence-packs.jsonl` to preserve task-level support/counter evidence traces.
 `verdict` applies a second-pass conflict audit before finalizing `pass` decisions.
+With `--ai-provider deepseek`, `verdict` can run task-level LLM judging before requirement aggregation.
 
 ## Notes
 

@@ -490,6 +490,72 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertNotEqual(rows[0]["status"], "pass")
             self.assertIn(rows[0]["status"], {"risk", "needs_ocr", "insufficient_evidence", "fail"})
 
+    def test_verdict_uses_task_level_llm_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "text": "投标人必须提供营业执照",
+                        "mandatory": True,
+                        "keywords": ["营业执照"],
+                        "constraints": [],
+                        "rule_tier": "hard_fail",
+                    }
+                ],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "text": "投标文件附有营业执照相关说明。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "pass",
+                        "score": 2,
+                        "severity": "none",
+                        "reason": "规则初判通过",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.86},
+                        "evidence": [],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+
+            with (
+                patch("bidagent.pipeline._load_api_key", return_value="sk-test"),
+                patch(
+                    "bidagent.pipeline._PipelineDeepSeekTaskReviewer.review_task",
+                    return_value={"status": "fail", "reason": "LLM任务判定失败", "confidence": 0.91},
+                ) as mocked_task_review,
+            ):
+                result = verdict(
+                    out_dir=out_dir,
+                    resume=False,
+                    ai_provider="deepseek",
+                    ai_model="deepseek-chat",
+                )
+
+            self.assertEqual(result["verdicts"], 1)
+            self.assertTrue(mocked_task_review.called)
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(rows[0]["status"], "fail")
+            self.assertIn("LLM任务判定失败", rows[0]["reason"])
+            self.assertEqual((rows[0].get("model") or {}).get("provider"), "deepseek")
+
     def test_verdict_downgrades_unstable_pass_to_risk_on_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)
