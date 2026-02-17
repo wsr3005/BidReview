@@ -10,6 +10,61 @@ from bidagent.eval import evaluate_and_write
 from bidagent.pipeline import annotate, checklist, extract_req, gate, ingest, plan_tasks, report, review, run_pipeline, verdict
 
 
+def _add_gate_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--gate-fail-fast",
+        choices=["off", "critical", "all"],
+        default="off",
+        help="gate short-circuit strategy: off=check all, critical=stop on key metric failure, all=stop on first failure",
+    )
+    parser.add_argument(
+        "--gate-threshold-auto-review-coverage",
+        type=float,
+        default=None,
+        help="override gate threshold for auto_review_coverage",
+    )
+    parser.add_argument(
+        "--gate-threshold-hard-fail-recall",
+        type=float,
+        default=None,
+        help="override gate threshold for hard_fail_recall",
+    )
+    parser.add_argument(
+        "--gate-threshold-false-positive-fail-rate",
+        type=float,
+        default=None,
+        help="override gate threshold for false_positive_fail_rate",
+    )
+    parser.add_argument(
+        "--gate-threshold-evidence-traceability",
+        type=float,
+        default=None,
+        help="override gate threshold for evidence_traceability",
+    )
+    parser.add_argument(
+        "--gate-threshold-llm-coverage",
+        type=float,
+        default=None,
+        help="override gate threshold for llm_coverage",
+    )
+
+
+def _gate_threshold_overrides_from_args(args: argparse.Namespace) -> dict[str, float]:
+    mapping = {
+        "gate_threshold_auto_review_coverage": "auto_review_coverage",
+        "gate_threshold_hard_fail_recall": "hard_fail_recall",
+        "gate_threshold_false_positive_fail_rate": "false_positive_fail_rate",
+        "gate_threshold_evidence_traceability": "evidence_traceability",
+        "gate_threshold_llm_coverage": "llm_coverage",
+    }
+    overrides: dict[str, float] = {}
+    for attr_name, threshold_name in mapping.items():
+        value = getattr(args, attr_name, None)
+        if value is not None:
+            overrides[threshold_name] = float(value)
+    return overrides
+
+
 def _common_parent() -> argparse.ArgumentParser:
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument("--out", required=True, help="output directory")
@@ -82,7 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("plan-tasks", parents=[common], help="split requirements into review tasks")
     subparsers.add_parser("review", parents=[common], help="review bid against requirements")
     subparsers.add_parser("verdict", parents=[common], help="materialize normalized verdict protocol")
-    subparsers.add_parser("gate", parents=[common], help="apply L3 release gate and write gate-result.json")
+    gate_parser = subparsers.add_parser("gate", parents=[common], help="apply L3 release gate and write gate-result.json")
+    _add_gate_options(gate_parser)
     annotate_parser = subparsers.add_parser("annotate", parents=[common], help="generate annotations sidecar")
     annotate_parser.add_argument("--bid-source", default=None, help="optional original bid file for annotated copy")
     subparsers.add_parser("report", parents=[common], help="generate markdown report")
@@ -92,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", parents=[common], help="run full pipeline")
     run_parser.add_argument("--tender", required=True, help="tender file path")
     run_parser.add_argument("--bid", required=True, help="bid file path")
+    _add_gate_options(run_parser)
 
     return parser
 
@@ -108,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     page_range = parse_page_range(args.page_range) if args.page_range else None
     ai_provider = None if args.ai_provider == "none" else args.ai_provider
     ai_api_key_file = Path(args.ai_api_key_file) if args.ai_api_key_file else None
+    gate_threshold_overrides = _gate_threshold_overrides_from_args(args) or None
 
     try:
         if args.command == "ingest":
@@ -137,7 +195,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verdict":
             result = verdict(out_dir=out_dir, resume=args.resume)
         elif args.command == "gate":
-            result = gate(out_dir=out_dir, requested_release_mode=args.release_mode)
+            result = gate(
+                out_dir=out_dir,
+                requested_release_mode=args.release_mode,
+                threshold_overrides=gate_threshold_overrides,
+                fail_fast=args.gate_fail_fast,
+            )
         elif args.command == "annotate":
             bid_source = Path(args.bid_source) if getattr(args, "bid_source", None) else None
             result = annotate(out_dir=out_dir, resume=args.resume, bid_source=bid_source)
@@ -163,6 +226,8 @@ def main(argv: list[str] | None = None) -> int:
                 ai_workers=args.ai_workers,
                 ai_min_confidence=args.ai_min_confidence,
                 release_mode=args.release_mode,
+                gate_threshold_overrides=gate_threshold_overrides,
+                gate_fail_fast=args.gate_fail_fast,
             )
         else:
             parser.error(f"unsupported command: {args.command}")

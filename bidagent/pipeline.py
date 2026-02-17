@@ -19,7 +19,9 @@ from bidagent.ocr import iter_document_ocr_blocks, ocr_selfcheck
 from bidagent.review import enforce_evidence_quality_gate, extract_requirements, review_requirements
 
 VALID_RELEASE_MODES = {"assist_only", "auto_final"}
-GATE_THRESHOLDS = {
+VALID_GATE_FAIL_FAST_MODES = {"off", "critical", "all"}
+CRITICAL_GATE_CHECKS = {"hard_fail_recall", "false_positive_fail_rate"}
+DEFAULT_GATE_THRESHOLDS = {
     "auto_review_coverage": 0.95,
     "hard_fail_recall": 0.98,
     "false_positive_fail_rate": 0.01,
@@ -849,6 +851,32 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _validate_gate_fail_fast_mode(fail_fast: str) -> str:
+    value = str(fail_fast or "off").strip().lower()
+    if value in VALID_GATE_FAIL_FAST_MODES:
+        return value
+    allowed = ", ".join(sorted(VALID_GATE_FAIL_FAST_MODES))
+    raise ValueError(f"gate fail_fast must be one of: {allowed}")
+
+
+def _resolve_gate_thresholds(threshold_overrides: dict[str, Any] | None) -> dict[str, float]:
+    thresholds = dict(DEFAULT_GATE_THRESHOLDS)
+    if not threshold_overrides:
+        return thresholds
+
+    allowed = ", ".join(sorted(DEFAULT_GATE_THRESHOLDS))
+    for name, raw_value in threshold_overrides.items():
+        if name not in DEFAULT_GATE_THRESHOLDS:
+            raise ValueError(f"unknown gate threshold override '{name}', allowed: {allowed}")
+        value = _safe_float(raw_value)
+        if value is None:
+            raise ValueError(f"gate threshold '{name}' must be numeric")
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"gate threshold '{name}' must be between 0 and 1")
+        thresholds[name] = value
+    return thresholds
+
+
 def _status_confidence_hint(status: str) -> float:
     if status == "pass":
         return 0.70
@@ -1286,8 +1314,16 @@ def _finding_has_traceable_evidence(finding: dict[str, Any]) -> bool:
     return False
 
 
-def gate(out_dir: Path, *, requested_release_mode: str = "assist_only") -> dict[str, Any]:
+def gate(
+    out_dir: Path,
+    *,
+    requested_release_mode: str = "assist_only",
+    threshold_overrides: dict[str, Any] | None = None,
+    fail_fast: str = "off",
+) -> dict[str, Any]:
     requested_mode = _validate_release_mode(requested_release_mode)
+    fail_fast_mode = _validate_gate_fail_fast_mode(fail_fast)
+    thresholds = _resolve_gate_thresholds(threshold_overrides)
 
     requirements_path = out_dir / "requirements.jsonl"
     findings_path = out_dir / "findings.jsonl"
@@ -1321,47 +1357,81 @@ def gate(out_dir: Path, *, requested_release_mode: str = "assist_only") -> dict[
         non_fail_total = _safe_float(eval_metrics.get("non_fail_total")) or 0.0
         false_positive_fail_rate = (false_positive_fail / non_fail_total) if non_fail_total > 0 else 0.0
 
-    checks = [
+    check_defs = [
         {
             "name": "auto_review_coverage",
             "value": auto_review_coverage,
-            "threshold": GATE_THRESHOLDS["auto_review_coverage"],
-            "ok": auto_review_coverage >= GATE_THRESHOLDS["auto_review_coverage"],
+            "threshold": thresholds["auto_review_coverage"],
+            "ok": auto_review_coverage >= thresholds["auto_review_coverage"],
         },
         {
             "name": "hard_fail_recall",
             "value": hard_fail_recall,
-            "threshold": GATE_THRESHOLDS["hard_fail_recall"],
-            "ok": hard_fail_recall is not None and hard_fail_recall >= GATE_THRESHOLDS["hard_fail_recall"],
+            "threshold": thresholds["hard_fail_recall"],
+            "ok": hard_fail_recall is not None and hard_fail_recall >= thresholds["hard_fail_recall"],
         },
         {
             "name": "false_positive_fail_rate",
             "value": false_positive_fail_rate,
-            "threshold": GATE_THRESHOLDS["false_positive_fail_rate"],
+            "threshold": thresholds["false_positive_fail_rate"],
             "ok": false_positive_fail_rate is not None
-            and false_positive_fail_rate <= GATE_THRESHOLDS["false_positive_fail_rate"],
+            and false_positive_fail_rate <= thresholds["false_positive_fail_rate"],
         },
         {
             "name": "evidence_traceability",
             "value": evidence_traceability,
-            "threshold": GATE_THRESHOLDS["evidence_traceability"],
-            "ok": evidence_traceability >= GATE_THRESHOLDS["evidence_traceability"],
+            "threshold": thresholds["evidence_traceability"],
+            "ok": evidence_traceability >= thresholds["evidence_traceability"],
         },
         {
             "name": "llm_coverage",
             "value": llm_coverage,
-            "threshold": GATE_THRESHOLDS["llm_coverage"],
-            "ok": llm_coverage >= GATE_THRESHOLDS["llm_coverage"],
+            "threshold": thresholds["llm_coverage"],
+            "ok": llm_coverage >= thresholds["llm_coverage"],
         },
     ]
-    all_checks_pass = all(bool(item.get("ok")) for item in checks)
+    checks: list[dict[str, Any]] = []
+    fail_fast_triggered_by: str | None = None
+    for check in check_defs:
+        checks.append(dict(check))
+        if check.get("ok"):
+            continue
+        should_fail_fast = fail_fast_mode == "all" or (
+            fail_fast_mode == "critical" and check["name"] in CRITICAL_GATE_CHECKS
+        )
+        if should_fail_fast:
+            fail_fast_triggered_by = check["name"]
+            break
+
+    if fail_fast_triggered_by is not None:
+        evaluated = {item["name"] for item in checks}
+        for check in check_defs:
+            if check["name"] in evaluated:
+                continue
+            checks.append(
+                {
+                    "name": check["name"],
+                    "value": check["value"],
+                    "threshold": check["threshold"],
+                    "ok": False,
+                    "skipped": True,
+                    "reason": f"fail_fast_triggered_by:{fail_fast_triggered_by}",
+                }
+            )
+
+    all_checks_pass = fail_fast_triggered_by is None and all(bool(item.get("ok")) for item in checks)
     release_mode = "auto_final" if requested_mode == "auto_final" and all_checks_pass else "assist_only"
 
     result = {
         "requested_release_mode": requested_mode,
         "release_mode": release_mode,
         "eligible_for_auto_final": all_checks_pass,
-        "thresholds": GATE_THRESHOLDS,
+        "thresholds": thresholds,
+        "fail_fast": {
+            "mode": fail_fast_mode,
+            "triggered": fail_fast_triggered_by is not None,
+            "triggered_by": fail_fast_triggered_by,
+        },
         "metrics": {
             "requirements_total": requirements_total,
             "verdict_total": len(verdict_rows),
@@ -1482,6 +1552,8 @@ def run_pipeline(
     ai_workers: int = 4,
     ai_min_confidence: float = 0.65,
     release_mode: str = "assist_only",
+    gate_threshold_overrides: dict[str, Any] | None = None,
+    gate_fail_fast: str = "off",
 ) -> dict[str, Any]:
     ensure_dir(out_dir)
     summary: dict[str, Any] = {}
@@ -1518,5 +1590,10 @@ def run_pipeline(
     summary["checklist"] = checklist(out_dir=out_dir, resume=downstream_resume)
     summary["consistency"] = consistency(out_dir=out_dir, resume=downstream_resume)
     summary["report"] = report(out_dir=out_dir)
-    summary["gate"] = gate(out_dir=out_dir, requested_release_mode=requested_release_mode)
+    summary["gate"] = gate(
+        out_dir=out_dir,
+        requested_release_mode=requested_release_mode,
+        threshold_overrides=gate_threshold_overrides,
+        fail_fast=gate_fail_fast,
+    )
     return summary
