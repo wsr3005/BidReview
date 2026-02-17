@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from bidagent.io_utils import ensure_dir, read_jsonl, write_jsonl
+from bidagent.io_utils import ensure_dir, read_jsonl
+
+VALID_GOLD_STATUSES = {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"}
+VALID_GOLD_TIERS = {"hard_fail", "scored", "general"}
 
 
 @dataclass(slots=True)
@@ -23,8 +27,109 @@ class EvalMetrics:
         return asdict(self)
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _normalize_gold_tier(row: dict[str, Any]) -> str:
+    return str(row.get("tier") or row.get("rule_tier") or "general").strip()
+
+
+def validate_gold_rows(
+    rows: list[dict[str, Any]],
+    *,
+    min_rows: int = 1,
+    require_all_tiers: bool = False,
+    require_all_statuses: bool = False,
+    min_per_tier: int = 0,
+    min_per_status: int = 0,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    requirement_ids: set[str] = set()
+    duplicate_ids: set[str] = set()
+    tier_counts: Counter[str] = Counter()
+    status_counts: Counter[str] = Counter()
+
+    for index, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            errors.append(f"row {index}: must be an object")
+            continue
+
+        requirement_id = str(row.get("requirement_id") or "").strip()
+        if not requirement_id:
+            errors.append(f"row {index}: requirement_id is required")
+        elif requirement_id in requirement_ids:
+            duplicate_ids.add(requirement_id)
+        else:
+            requirement_ids.add(requirement_id)
+
+        tier = _normalize_gold_tier(row)
+        expected_status = str(row.get("expected_status") or "").strip()
+
+        if tier not in VALID_GOLD_TIERS:
+            errors.append(
+                f"row {index}: tier '{tier}' is invalid (allowed: {', '.join(sorted(VALID_GOLD_TIERS))})"
+            )
+        else:
+            tier_counts[tier] += 1
+
+        if expected_status not in VALID_GOLD_STATUSES:
+            errors.append(
+                "row "
+                + f"{index}: expected_status '{expected_status}' is invalid "
+                + f"(allowed: {', '.join(sorted(VALID_GOLD_STATUSES))})"
+            )
+        else:
+            status_counts[expected_status] += 1
+
+    if duplicate_ids:
+        errors.append(f"duplicate requirement_id values: {', '.join(sorted(duplicate_ids))}")
+
+    if len(rows) < min_rows:
+        errors.append(f"gold set rows={len(rows)} is below minimum required rows={min_rows}")
+
+    if require_all_tiers:
+        missing_tiers = sorted(VALID_GOLD_TIERS - set(tier_counts.keys()))
+        if missing_tiers:
+            errors.append(f"missing tiers: {', '.join(missing_tiers)}")
+
+    if require_all_statuses:
+        missing_statuses = sorted(VALID_GOLD_STATUSES - set(status_counts.keys()))
+        if missing_statuses:
+            errors.append(f"missing expected_status labels: {', '.join(missing_statuses)}")
+
+    if min_per_tier > 0:
+        low_tiers = sorted(
+            tier for tier in VALID_GOLD_TIERS if int(tier_counts.get(tier, 0)) < int(min_per_tier)
+        )
+        if low_tiers:
+            errors.append(
+                "tier stratification below minimum: "
+                + ", ".join(f"{tier}={int(tier_counts.get(tier, 0))}" for tier in low_tiers)
+                + f" (min={min_per_tier})"
+            )
+
+    if min_per_status > 0:
+        low_statuses = sorted(
+            status
+            for status in VALID_GOLD_STATUSES
+            if int(status_counts.get(status, 0)) < int(min_per_status)
+        )
+        if low_statuses:
+            errors.append(
+                "status stratification below minimum: "
+                + ", ".join(f"{status}={int(status_counts.get(status, 0))}" for status in low_statuses)
+                + f" (min={min_per_status})"
+            )
+
+    if errors:
+        preview = errors[:20]
+        detail = "\n".join(f"- {item}" for item in preview)
+        if len(errors) > len(preview):
+            detail = f"{detail}\n- ... (+{len(errors) - len(preview)} more)"
+        raise ValueError(f"gold set validation failed:\n{detail}")
+
+    return {
+        "total": len(rows),
+        "tier_counts": {key: int(value) for key, value in sorted(tier_counts.items())},
+        "status_counts": {key: int(value) for key, value in sorted(status_counts.items())},
+    }
 
 
 def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, Any]:
@@ -44,6 +149,7 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
         raise FileNotFoundError(f"findings not found: {findings_path}")
 
     gold_rows = list(read_jsonl(gold_path))
+    validate_gold_rows(gold_rows)
     gold_map = {row["requirement_id"]: row for row in gold_rows if isinstance(row, dict) and row.get("requirement_id")}
 
     pred_rows = list(read_jsonl(findings_path))
