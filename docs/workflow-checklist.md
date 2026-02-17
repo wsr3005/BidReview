@@ -22,6 +22,7 @@ Use this checklist for each task lane.
 
 Run `.\scripts\verify.ps1` first, then fill gaps manually if needed.
 Optional discipline check: `.\scripts\check-task-cards.ps1` (use `-FailOnUntracked` to enforce).
+Use `docs/l3-test-matrix.md` as the canonical L3 test dimensions and thresholds.
 
 1. Run lint or static checks.
 2. Run relevant unit tests.
