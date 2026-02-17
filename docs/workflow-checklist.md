@@ -40,3 +40,49 @@ Optional discipline check: `.\scripts\check-task-cards.ps1` (use `-FailOnUntrack
 - Checks run:
 - Risks:
 - Next best action:
+
+## Active Parallel Board (L3 Phase 1)
+
+Date: 2026-02-17
+Target: move current `bidagent` to L3-ready Phase 1 baseline.
+
+Lane A
+- Objective: requirement -> review tasks decomposition (`plan-tasks` core logic).
+- Owner: Codex-Lane-A
+- Task card: `docs/tasks/TASK-2026-02-17-l3p1-task-planner.md`
+- File ownership: `bidagent/task_planner.py`, `tests/test_task_planner.py`
+
+Lane B
+- Objective: LLM-first task verdict engine and verdict protocol writer.
+- Owner: Codex-Lane-B
+- Task card: `docs/tasks/TASK-2026-02-17-l3p1-llm-verdict-engine.md`
+- File ownership: `bidagent/llm_judge.py`, `tests/test_llm_judge.py`
+
+Lane C
+- Objective: CLI/pipeline integration and gate decision (`assist_only` vs `auto_final`).
+- Owner: Codex-Lane-C
+- Task card: `docs/tasks/TASK-2026-02-17-l3p1-gate-integration.md`
+- File ownership: `bidagent/cli.py`, `bidagent/pipeline.py`, `bidagent/eval.py`, `tests/test_pipeline_review.py`
+
+Merge order
+1. Lane A
+2. Lane B
+3. Lane C (integrates A/B outputs)
+
+Required checks per lane
+1. `.\scripts\verify.ps1`
+2. lane-specific unit tests listed in task card
+3. if eval fixtures changed: `uv run bidagent eval --out <run_dir>`
+
+## Forward Plan (Phase 2 + Phase 3)
+
+Source of truth: `docs/l3-task-board.md`
+
+Prepared phase bundles:
+1. Phase 2: evidence indexing, active evidence harvesting, counter-evidence auditing
+2. Phase 3: gold set expansion, gate threshold tuning, release hardening and canary
+
+Recommended execution policy:
+1. Do not open Phase 2 lanes before Phase 1 merge is green.
+2. Do not open Phase 3 lanes before Phase 2 eval targets are met.
+3. Keep one integration lane owner for `bidagent/pipeline.py` and `bidagent/cli.py`.
