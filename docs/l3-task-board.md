@@ -20,15 +20,13 @@ This document preserves multi-phase execution context for L3 automation.
 
 ## Phase 1 Lane Cards
 
-1. `docs/tasks/TASK-2026-02-17-l3p1-task-planner.md`
-2. `docs/tasks/TASK-2026-02-17-l3p1-llm-verdict-engine.md`
-3. `docs/tasks/TASK-2026-02-17-l3p1-gate-integration.md`
+Use tracked lane briefs:
+1. `docs/l3-lane-cards.md` (Phase 1 sections)
 
 ## Phase 2 Lane Cards
 
-1. `docs/tasks/TASK-2026-02-17-l3p2-evidence-index.md`
-2. `docs/tasks/TASK-2026-02-17-l3p2-evidence-harvester.md`
-3. `docs/tasks/TASK-2026-02-17-l3p2-counter-auditor.md`
+Planning source:
+1. `docs/l3-task-board.md` (this section)
 
 Phase 2 focus:
 1. Build unified evidence index for text/table/OCR blocks.
@@ -42,9 +40,8 @@ Phase 2 target metrics:
 
 ## Phase 3 Lane Cards
 
-1. `docs/tasks/TASK-2026-02-17-l3p3-goldset-expansion.md`
-2. `docs/tasks/TASK-2026-02-17-l3p3-gate-tuning.md`
-3. `docs/tasks/TASK-2026-02-17-l3p3-release-hardening.md`
+Planning source:
+1. `docs/l3-task-board.md` (this section)
 
 Phase 3 focus:
 1. Expand and stratify gold set for realistic business clauses.

@@ -49,19 +49,19 @@ Target: move current `bidagent` to L3-ready Phase 1 baseline.
 Lane A
 - Objective: requirement -> review tasks decomposition (`plan-tasks` core logic).
 - Owner: Codex-Lane-A
-- Task card: `docs/tasks/TASK-2026-02-17-l3p1-task-planner.md`
+- Task card: `docs/l3-lane-cards.md` (Phase 1 / Lane A)
 - File ownership: `bidagent/task_planner.py`, `tests/test_task_planner.py`
 
 Lane B
 - Objective: LLM-first task verdict engine and verdict protocol writer.
 - Owner: Codex-Lane-B
-- Task card: `docs/tasks/TASK-2026-02-17-l3p1-llm-verdict-engine.md`
+- Task card: `docs/l3-lane-cards.md` (Phase 1 / Lane B)
 - File ownership: `bidagent/llm_judge.py`, `tests/test_llm_judge.py`
 
 Lane C
 - Objective: CLI/pipeline integration and gate decision (`assist_only` vs `auto_final`).
 - Owner: Codex-Lane-C
-- Task card: `docs/tasks/TASK-2026-02-17-l3p1-gate-integration.md`
+- Task card: `docs/l3-lane-cards.md` (Phase 1 / Lane C)
 - File ownership: `bidagent/cli.py`, `bidagent/pipeline.py`, `bidagent/eval.py`, `tests/test_pipeline_review.py`
 
 Merge order
@@ -77,6 +77,7 @@ Required checks per lane
 ## Forward Plan (Phase 2 + Phase 3)
 
 Source of truth: `docs/l3-task-board.md`
+Lane briefs: `docs/l3-lane-cards.md`
 
 Prepared phase bundles:
 1. Phase 2: evidence indexing, active evidence harvesting, counter-evidence auditing
