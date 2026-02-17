@@ -741,6 +741,7 @@ class PipelineReviewTests(unittest.TestCase):
                     ai_provider="deepseek",
                     release_mode="auto_final",
                     gate_threshold_overrides={"evidence_traceability": 0.0},
+                    canary_min_streak=1,
                 )
 
             self.assertEqual(result["gate"]["release_mode"], "auto_final")
@@ -750,6 +751,91 @@ class PipelineReviewTests(unittest.TestCase):
             canary_result = json.loads((out_dir / "release" / "canary-result.json").read_text(encoding="utf-8"))
             self.assertEqual(canary_result["status"], "pass")
             self.assertEqual(canary_result["release_mode"], "auto_final")
+
+    def test_run_pipeline_auto_final_guard_requires_consecutive_core_pass_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            tender = base / "tender.txt"
+            bid = base / "bid.txt"
+            tender.write_text("商务要求：投标人必须提供营业执照。", encoding="utf-8")
+            bid.write_text("我司已提供营业执照复印件。", encoding="utf-8")
+
+            def _prepare_out(out_dir: Path) -> None:
+                (out_dir / "eval").mkdir(parents=True, exist_ok=True)
+                (out_dir / "eval" / "metrics.json").write_text(
+                    json.dumps(
+                        {
+                            "metrics": {
+                                "hard_fail_recall": 1.0,
+                                "false_positive_fail_rate": 0.0,
+                                "false_positive_fail": 0,
+                                "non_fail_total": 1,
+                            }
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+            def _fake_review(**kwargs):
+                lane_out = Path(kwargs["out_dir"])
+                write_jsonl(
+                    lane_out / "findings.jsonl",
+                    [
+                        {
+                            "requirement_id": "R0001",
+                            "status": "pass",
+                            "score": 2,
+                            "severity": "none",
+                            "reason": "LLM判定通过",
+                            "llm": {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "prompt_version": "deepseek-review-v1",
+                                "confidence": 0.92,
+                            },
+                            "decision_trace": {
+                                "decision": {"status": "pass", "reason": "LLM判定通过", "source": "llm"}
+                            },
+                            "evidence": [],
+                        }
+                    ],
+                )
+                return {"findings": 1, "status_counts": {"pass": 1}}
+
+            outputs: list[dict] = []
+            with patch("bidagent.pipeline.review", side_effect=_fake_review):
+                for index in (1, 2, 3):
+                    out_dir = base / f"out-{index}"
+                    _prepare_out(out_dir)
+                    outputs.append(
+                        run_pipeline(
+                            tender_path=tender,
+                            bid_path=bid,
+                            out_dir=out_dir,
+                            focus="business",
+                            resume=False,
+                            ocr_mode="auto",
+                            ai_provider=None,
+                            release_mode="auto_final",
+                            gate_threshold_overrides={"evidence_traceability": 0.0},
+                            canary_min_streak=3,
+                        )
+                    )
+
+            self.assertEqual(outputs[0]["release_mode"], "assist_only")
+            self.assertEqual(outputs[1]["release_mode"], "assist_only")
+            self.assertEqual(outputs[2]["release_mode"], "auto_final")
+            self.assertEqual((outputs[0]["canary"].get("guard") or {}).get("streak_after"), 1)
+            self.assertEqual((outputs[1]["canary"].get("guard") or {}).get("streak_after"), 2)
+            self.assertEqual((outputs[2]["canary"].get("guard") or {}).get("streak_after"), 3)
+
+            history = list(read_jsonl(base / "auto-final-history.jsonl"))
+            self.assertEqual(len(history), 3)
+            self.assertTrue(all(bool(row.get("core_ok")) for row in history))
+            self.assertEqual(history[-1].get("streak_after"), 3)
+            self.assertEqual(history[-1].get("final_release_mode"), "auto_final")
 
 
 if __name__ == "__main__":

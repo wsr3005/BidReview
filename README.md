@@ -44,6 +44,7 @@ uv run bidagent run \
 - `run-metadata.json`: model/prompt/strategy version metadata for the run
 - `canary-result.json`: canary checks used before `auto_final` promotion
 - `release-trace.json`: release decision + key artifact checksums for audit traceability
+- `../auto-final-history.jsonl`: cross-run auto-final guard history (consecutive core-pass streak)
 
 When `runs/<x>/eval/gold.jsonl` exists, `run` auto-generates `eval/metrics.json` before gate checks.
 `run` also writes `evidence-packs.jsonl` to preserve task-level support/counter evidence traces.
@@ -63,3 +64,4 @@ Task-level LLM judging uses `--ai-workers` with a built-in safety cap to reduce 
 - If `--ai-provider deepseek` is enabled, the tool reads API key from:
   1) `DEEPSEEK_API_KEY`, 2) `--ai-api-key-file`, 3) `deepseek api key.txt`.
 - `gate` / `run` support threshold tuning via `--gate-threshold-*` and short-circuit strategy via `--gate-fail-fast off|critical|all`.
+- `run` supports `--canary-min-streak` (default `3`) to require N consecutive canary core-pass runs before promoting to `auto_final`.

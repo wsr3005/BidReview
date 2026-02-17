@@ -149,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--tender", required=True, help="tender file path")
     run_parser.add_argument("--bid", required=True, help="bid file path")
     _add_gate_options(run_parser)
+    run_parser.add_argument(
+        "--canary-min-streak",
+        type=int,
+        default=3,
+        help="minimum consecutive canary core-pass runs required before auto_final is released",
+    )
 
     return parser
 
@@ -237,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
                 release_mode=args.release_mode,
                 gate_threshold_overrides=gate_threshold_overrides,
                 gate_fail_fast=args.gate_fail_fast,
+                canary_min_streak=args.canary_min_streak,
             )
         else:
             parser.error(f"unsupported command: {args.command}")

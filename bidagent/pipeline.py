@@ -49,6 +49,9 @@ VERDICT_STRATEGY_VERSION = "verdict-harvest-v1"
 CANARY_POLICY_VERSION = "release-canary-v1"
 RUN_METADATA_SCHEMA_VERSION = "run-metadata-v1"
 RELEASE_TRACE_SCHEMA_VERSION = "release-trace-v1"
+AUTO_FINAL_GUARD_POLICY_VERSION = "auto-final-guard-v1"
+AUTO_FINAL_HISTORY_FILENAME = "auto-final-history.jsonl"
+DEFAULT_CANARY_MIN_STREAK = 3
 EVIDENCE_TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{2,}")
 POSITIVE_EVIDENCE_HINTS = (
     "已提供",
@@ -310,6 +313,7 @@ def _build_run_metadata(
     ai_workers: int,
     ai_min_confidence: float,
     requested_release_mode: str,
+    canary_min_streak: int,
 ) -> dict[str, Any]:
     release_dir = out_dir / "release"
     ensure_dir(release_dir)
@@ -345,6 +349,7 @@ def _build_run_metadata(
             "review_rule_version": REVIEW_RULE_VERSION,
             "verdict_strategy_version": VERDICT_STRATEGY_VERSION,
             "canary_policy_version": CANARY_POLICY_VERSION,
+            "auto_final_guard_policy_version": AUTO_FINAL_GUARD_POLICY_VERSION,
         },
         "run_config": {
             "focus": focus,
@@ -353,6 +358,7 @@ def _build_run_metadata(
             "release_mode_requested": requested_release_mode,
             "ai_workers": int(ai_workers),
             "ai_min_confidence": float(ai_min_confidence),
+            "canary_min_streak": int(canary_min_streak),
         },
     }
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -398,11 +404,72 @@ def _collect_release_artifacts(out_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _validate_canary_min_streak(value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("canary_min_streak must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError("canary_min_streak must be >= 1")
+    return parsed
+
+
+def _auto_final_history_path(out_dir: Path) -> Path:
+    return out_dir.parent / AUTO_FINAL_HISTORY_FILENAME
+
+
+def _load_auto_final_core_streak(history_path: Path) -> int:
+    if not history_path.exists():
+        return 0
+    streak = 0
+    for row in read_jsonl(history_path):
+        if bool(row.get("core_ok")):
+            streak += 1
+        else:
+            streak = 0
+    return streak
+
+
+def _append_auto_final_history(
+    *,
+    history_path: Path,
+    out_dir: Path,
+    requested_release_mode: str,
+    gate_eligible: bool,
+    core_ok: bool,
+    guard_ok: bool,
+    streak_before: int,
+    streak_after: int,
+    canary_status: str,
+    final_release_mode: str,
+) -> None:
+    ensure_dir(history_path.parent)
+    append_jsonl(
+        history_path,
+        [
+            {
+                "generated_at": _utc_now_z(),
+                "policy_version": AUTO_FINAL_GUARD_POLICY_VERSION,
+                "run_dir": str(out_dir),
+                "requested_release_mode": requested_release_mode,
+                "gate_eligible_for_auto_final": bool(gate_eligible),
+                "core_ok": bool(core_ok),
+                "guard_ok": bool(guard_ok),
+                "streak_before": int(streak_before),
+                "streak_after": int(streak_after),
+                "canary_status": canary_status,
+                "final_release_mode": final_release_mode,
+            }
+        ],
+    )
+
+
 def _run_canary(
     *,
     out_dir: Path,
     requested_release_mode: str,
     gate_result: dict[str, Any],
+    min_streak: int = DEFAULT_CANARY_MIN_STREAK,
 ) -> dict[str, Any]:
     release_dir = out_dir / "release"
     ensure_dir(release_dir)
@@ -417,6 +484,12 @@ def _run_canary(
     checks: list[dict[str, Any]] = []
     release_mode = "assist_only"
     status = "skipped"
+    min_streak_value = _validate_canary_min_streak(min_streak)
+    history_path = _auto_final_history_path(out_dir)
+    streak_before = 0
+    streak_after = 0
+    core_ok = False
+    guard_ok = False
 
     if canary_required:
         # Canary checks release integrity only.
@@ -477,6 +550,25 @@ def _run_canary(
                 "blocking": True,
             }
         )
+        core_ok = all(
+            bool(item.get("ok"))
+            for item in checks
+            if bool(item.get("blocking", True))
+        )
+        streak_before = _load_auto_final_core_streak(history_path)
+        streak_after = streak_before + 1 if core_ok else 0
+        guard_ok = core_ok and streak_after >= min_streak_value
+        checks.append(
+            {
+                "name": "auto_final_guard_streak",
+                "ok": guard_ok,
+                "streak_before": streak_before,
+                "streak_after": streak_after,
+                "min_required": min_streak_value,
+                "history_file": str(history_path),
+                "blocking": True,
+            }
+        )
         canary_pass = all(
             bool(item.get("ok"))
             for item in checks
@@ -484,6 +576,18 @@ def _run_canary(
         )
         status = "pass" if canary_pass else "fail"
         release_mode = "auto_final" if canary_pass else "assist_only"
+        _append_auto_final_history(
+            history_path=history_path,
+            out_dir=out_dir,
+            requested_release_mode=requested_release_mode,
+            gate_eligible=gate_ok,
+            core_ok=core_ok,
+            guard_ok=guard_ok,
+            streak_before=streak_before,
+            streak_after=streak_after,
+            canary_status=status,
+            final_release_mode=release_mode,
+        )
 
     result = {
         "policy_version": CANARY_POLICY_VERSION,
@@ -493,6 +597,16 @@ def _run_canary(
         "status": status,
         "release_mode": release_mode,
         "checks": checks,
+        "guard": {
+            "policy_version": AUTO_FINAL_GUARD_POLICY_VERSION,
+            "enabled": canary_required,
+            "min_consecutive_core_pass": min_streak_value,
+            "history_file": str(history_path),
+            "streak_before": streak_before if canary_required else None,
+            "streak_after": streak_after if canary_required else None,
+            "core_ok": core_ok if canary_required else None,
+            "ok": guard_ok if canary_required else None,
+        },
     }
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
@@ -523,6 +637,7 @@ def _write_release_trace(
         "canary": {
             "status": canary_result.get("status", "skipped"),
             "checks": canary_result.get("checks", []),
+            "guard": canary_result.get("guard", {}),
         },
         "run_metadata": {
             "run_id": run_metadata.get("run_id"),
@@ -2333,10 +2448,12 @@ def run_pipeline(
     release_mode: str = "assist_only",
     gate_threshold_overrides: dict[str, Any] | None = None,
     gate_fail_fast: str = "off",
+    canary_min_streak: int = DEFAULT_CANARY_MIN_STREAK,
 ) -> dict[str, Any]:
     ensure_dir(out_dir)
     summary: dict[str, Any] = {}
     requested_release_mode = _validate_release_mode(release_mode)
+    min_streak_value = _validate_canary_min_streak(canary_min_streak)
     summary["ingest"] = ingest(
         tender_path=tender_path,
         bid_path=bid_path,
@@ -2401,11 +2518,13 @@ def run_pipeline(
         ai_workers=ai_workers,
         ai_min_confidence=ai_min_confidence,
         requested_release_mode=requested_release_mode,
+        canary_min_streak=min_streak_value,
     )
     summary["canary"] = _run_canary(
         out_dir=out_dir,
         requested_release_mode=requested_release_mode,
         gate_result=gate_result,
+        min_streak=min_streak_value,
     )
     summary["release_trace"] = _write_release_trace(
         out_dir=out_dir,
