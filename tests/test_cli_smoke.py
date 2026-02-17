@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -70,6 +71,13 @@ class CliSmokeTests(unittest.TestCase):
             self.assertTrue((out / "annotations.jsonl").exists())
             self.assertTrue((out / "manual-review.jsonl").exists())
             self.assertTrue((out / "review-report.md").exists())
+            self.assertTrue((out / "release" / "run-metadata.json").exists())
+            self.assertTrue((out / "release" / "canary-result.json").exists())
+            self.assertTrue((out / "release" / "release-trace.json").exists())
+            run_metadata = json.loads((out / "release" / "run-metadata.json").read_text(encoding="utf-8"))
+            self.assertIn("model", run_metadata)
+            self.assertIn("prompt", run_metadata)
+            self.assertIn("strategy", run_metadata)
             report_text = (out / "review-report.md").read_text(encoding="utf-8")
             self.assertIn("| trace: clause=", report_text)
             self.assertIn("rule=keyword_match:r1-trace-v1", report_text)

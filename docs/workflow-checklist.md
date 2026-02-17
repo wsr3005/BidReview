@@ -30,7 +30,8 @@ Optional discipline check: `.\scripts\check-task-cards.ps1` (use `-FailOnUntrack
 5. Perform smoke test for critical path.
 6. If gold data exists, run evaluation metrics and verify thresholds.
 7. If any gate fails: fix -> rerun failed gate -> rerun full gate.
-8. Prepare handoff summary.
+8. Verify release artifacts for release lanes: `release/run-metadata.json`, `release/canary-result.json`, `release/release-trace.json`.
+9. Prepare handoff summary.
 
 ## Handoff Template
 

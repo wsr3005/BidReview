@@ -29,10 +29,19 @@ uv run bidagent run \
 - `ingest`: parse tender and bid files into JSONL blocks
 - `extract-req`: extract business requirements from tender blocks
 - `review`: check bid document against extracted requirements
+- `gate`: apply release thresholds and output `gate-result.json`
 - `annotate`: generate issue annotations sidecar files and annotated document copy (`.docx` / `.pdf`)
 - `checklist`: export manual review list (`fail` + `high risk` + `needs_ocr`)
 - `report`: generate markdown summary report
 - `run`: execute the full pipeline
+
+## Release Outputs
+
+`run` also writes release hardening artifacts under `<out>/release/`:
+
+- `run-metadata.json`: model/prompt/strategy version metadata for the run
+- `canary-result.json`: canary checks used before `auto_final` promotion
+- `release-trace.json`: release decision + key artifact checksums for audit traceability
 
 ## Notes
 

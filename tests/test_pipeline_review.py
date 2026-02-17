@@ -368,7 +368,7 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertEqual(audit.get("action"), "downgrade_pass_to_risk_conflict")
             self.assertEqual((trace.get("decision") or {}).get("status"), "risk")
 
-    def test_run_pipeline_writes_gate_result_json(self) -> None:
+    def test_run_pipeline_writes_release_hardening_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             tender = base / "tender.txt"
@@ -393,6 +393,26 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertTrue((out_dir / "review-tasks.jsonl").exists())
             self.assertTrue((out_dir / "verdicts.jsonl").exists())
             self.assertTrue((out_dir / "gate-result.json").exists())
+            self.assertTrue((out_dir / "release" / "run-metadata.json").exists())
+            self.assertTrue((out_dir / "release" / "canary-result.json").exists())
+            self.assertTrue((out_dir / "release" / "release-trace.json").exists())
+            self.assertIn("run_metadata", result)
+            self.assertIn("canary", result)
+            self.assertIn("release_trace", result)
+
+            run_metadata = json.loads((out_dir / "release" / "run-metadata.json").read_text(encoding="utf-8"))
+            self.assertIn("model", run_metadata)
+            self.assertIn("prompt", run_metadata)
+            self.assertIn("strategy", run_metadata)
+
+            canary_result = json.loads((out_dir / "release" / "canary-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(canary_result["requested_release_mode"], "auto_final")
+            self.assertIn(canary_result["status"], {"pass", "fail"})
+
+            release_trace = json.loads((out_dir / "release" / "release-trace.json").read_text(encoding="utf-8"))
+            self.assertIn("artifacts", release_trace)
+            self.assertIsInstance(release_trace["artifacts"], list)
+            self.assertGreaterEqual(len(release_trace["artifacts"]), 1)
 
 
 if __name__ == "__main__":
