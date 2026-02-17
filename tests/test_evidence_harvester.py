@@ -74,6 +74,32 @@ class EvidenceHarvesterTests(unittest.TestCase):
         self.assertIn("license", row["retrieval_trace"]["positive_terms"])
         self.assertGreater(row["counter_evidence_pack"][0]["score"], 0)
 
+    def test_harvest_task_evidence_detects_chinese_counter_phrases(self) -> None:
+        blocks = [
+            {
+                "doc_id": "bid",
+                "text": "我司已提供营业执照复印件，材料齐全。",
+                "location": {"block_index": 1, "page": 1, "section": "Normal"},
+            },
+            {
+                "doc_id": "bid",
+                "text": "经核查，营业执照未提供，存在缺失。",
+                "location": {"block_index": 2, "page": 1, "section": "Normal"},
+            },
+        ]
+        task = {
+            "task_id": "T-R0007-01",
+            "requirement_id": "R0007",
+            "task_type": "evidence_check",
+            "query": "核验是否提供营业执照",
+            "expected_logic": {"keywords": ["营业执照"]},
+        }
+
+        row = harvest_task_evidence(task, build_evidence_index(blocks), top_k=1, counter_k=1)
+        self.assertEqual(len(row["counter_evidence_pack"]), 1)
+        self.assertEqual(row["counter_evidence_pack"][0]["location"]["block_index"], 2)
+        self.assertIn("未提供", "".join(row["counter_evidence_pack"][0].get("matched_terms") or []))
+
     def test_harvest_task_evidence_returns_empty_pack_without_terms(self) -> None:
         blocks = [
             {"doc_id": "bid", "text": "General statement with no link.", "location": {"block_index": 1, "page": 1}}

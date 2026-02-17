@@ -428,12 +428,14 @@ class PipelineReviewTests(unittest.TestCase):
 
             result = verdict(out_dir=out_dir, resume=False)
             self.assertEqual(result["verdicts"], 1)
+            self.assertGreaterEqual(result.get("evidence_packs", 0), 1)
             rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
             self.assertEqual(len(rows), 1)
             self.assertTrue(rows[0]["evidence_refs"])
             self.assertEqual(rows[0]["counter_evidence_refs"], [])
+            self.assertTrue((out_dir / "evidence-packs.jsonl").exists())
             trace = rows[0].get("decision_trace") or {}
-            self.assertEqual((trace.get("evidence_index") or {}).get("blocks_indexed"), 1)
+            self.assertEqual((trace.get("evidence_index") or {}).get("unified_blocks_indexed"), 1)
             self.assertIsInstance((trace.get("evidence_harvest") or {}).get("query_terms"), list)
 
     def test_verdict_downgrades_unstable_pass_to_risk_on_conflict(self) -> None:
@@ -487,10 +489,11 @@ class PipelineReviewTests(unittest.TestCase):
 
             result = verdict(out_dir=out_dir, resume=False)
             self.assertEqual(result["verdicts"], 1)
+            self.assertGreaterEqual(result.get("evidence_packs", 0), 1)
             rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["status"], "risk")
-            self.assertIn("E-bid-p1-b2-sBODY", rows[0]["counter_evidence_refs"])
+            self.assertTrue(any("p1-b2" in token for token in rows[0]["counter_evidence_refs"]))
             self.assertIn("冲突证据", rows[0]["reason"])
             trace = rows[0].get("decision_trace") or {}
             audit = trace.get("counter_evidence_audit") or {}
@@ -521,6 +524,7 @@ class PipelineReviewTests(unittest.TestCase):
 
             self.assertIn(result["gate"]["release_mode"], {"assist_only", "auto_final"})
             self.assertTrue((out_dir / "review-tasks.jsonl").exists())
+            self.assertTrue((out_dir / "evidence-packs.jsonl").exists())
             self.assertTrue((out_dir / "verdicts.jsonl").exists())
             self.assertTrue((out_dir / "gate-result.json").exists())
             self.assertTrue((out_dir / "release" / "run-metadata.json").exists())

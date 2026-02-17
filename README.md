@@ -46,6 +46,7 @@ uv run bidagent run \
 - `release-trace.json`: release decision + key artifact checksums for audit traceability
 
 When `runs/<x>/eval/gold.jsonl` exists, `run` auto-generates `eval/metrics.json` before gate checks.
+`run` also writes `evidence-packs.jsonl` to preserve task-level support/counter evidence traces.
 
 ## Notes
 

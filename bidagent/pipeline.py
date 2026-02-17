@@ -14,6 +14,12 @@ from bidagent import __version__
 from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
 from bidagent.consistency import find_inconsistencies
 from bidagent.document import iter_document_blocks
+from bidagent.evidence_harvester import (
+    build_evidence_index as build_task_evidence_index,
+    harvest_task_evidence,
+    write_evidence_packs_jsonl,
+)
+from bidagent.evidence_index import build_unified_evidence_index, retrieve_evidence_candidates
 from bidagent.eval import evaluate_run
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm_judge import judge_tasks_with_llm, write_verdicts_jsonl
@@ -355,6 +361,7 @@ def _collect_release_artifacts(out_dir: Path) -> list[dict[str, Any]]:
     files = [
         "requirements.jsonl",
         "review-tasks.jsonl",
+        "evidence-packs.jsonl",
         "findings.jsonl",
         "verdicts.jsonl",
         "gate-result.json",
@@ -414,6 +421,8 @@ def _run_canary(
 
         required_files = [
             out_dir / "requirements.jsonl",
+            out_dir / "review-tasks.jsonl",
+            out_dir / "evidence-packs.jsonl",
             out_dir / "findings.jsonl",
             out_dir / "verdicts.jsonl",
             out_dir / "gate-result.json",
@@ -1493,6 +1502,7 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     findings_path = out_dir / "findings.jsonl"
     tasks_path = out_dir / "review-tasks.jsonl"
     bid_blocks_path = out_dir / "ingest" / "bid_blocks.jsonl"
+    evidence_packs_path = out_dir / "evidence-packs.jsonl"
     verdicts_path = out_dir / "verdicts.jsonl"
     if path_ready(verdicts_path, resume):
         rows = list(read_jsonl(verdicts_path))
@@ -1501,7 +1511,13 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             sum(1 for row in rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
             len(rows),
         )
-        return {"verdicts": len(rows), "status_counts": dict(counts), "llm_coverage": llm_coverage}
+        evidence_packs_total = sum(1 for _ in read_jsonl(evidence_packs_path)) if evidence_packs_path.exists() else 0
+        return {
+            "verdicts": len(rows),
+            "evidence_packs": evidence_packs_total,
+            "status_counts": dict(counts),
+            "llm_coverage": llm_coverage,
+        }
 
     tasks_by_requirement: dict[str, list[dict[str, Any]]] = {}
     if tasks_path.exists():
@@ -1510,8 +1526,15 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             if requirement_id:
                 tasks_by_requirement.setdefault(requirement_id, []).append(row)
 
-    evidence_index = _load_evidence_index(bid_blocks_path)
-    evidence_index_stats = dict(evidence_index.get("stats") or {})
+    bid_block_rows = list(read_jsonl(bid_blocks_path)) if bid_blocks_path.exists() else []
+    unified_evidence_index = build_unified_evidence_index(bid_block_rows)
+    task_evidence_index = build_task_evidence_index(bid_block_rows)
+    source_type_counts = Counter(str(item.get("source_type") or "unknown") for item in unified_evidence_index)
+    evidence_index_stats = {
+        "unified_blocks_indexed": len(unified_evidence_index),
+        "harvest_blocks_indexed": len(task_evidence_index),
+        "source_type_counts": dict(source_type_counts),
+    }
     requirements_rows = list(read_jsonl(requirements_path)) if requirements_path.exists() else []
     requirement_order: list[str] = []
     for index, row in enumerate(requirements_rows, start=1):
@@ -1534,6 +1557,7 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             requirement_order.append(requirement_id)
 
     verdict_rows: list[dict[str, Any]] = []
+    evidence_pack_rows: list[dict[str, Any]] = []
     for index, requirement_id in enumerate(requirement_order, start=1):
         finding = finding_by_requirement.get(requirement_id, {})
         task_rows = list(tasks_by_requirement.get(requirement_id, []))
@@ -1584,15 +1608,49 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         status = str(aggregated.get("status") or "insufficient_evidence")
         confidence = max(0.0, min(1.0, _safe_float(aggregated.get("confidence")) or _status_confidence_hint(status)))
 
-        query_terms = _collect_query_terms_for_requirement(requirement_id, finding, task_rows)
-        harvested = _harvest_evidence_refs(
-            evidence_index,
-            query_terms=query_terms,
-            existing_refs=existing_refs,
-            status=status,
-        )
-        support_refs = list(harvested.get("support_refs") or [])
-        counter_refs = list(harvested.get("counter_refs") or [])
+        task_pack_rows: list[dict[str, Any]] = []
+        for task in task_inputs:
+            pack = harvest_task_evidence(
+                task,
+                task_evidence_index,
+                top_k=3,
+                counter_k=2,
+            )
+            query = str(task.get("query") or "")
+            retrieved_candidates = retrieve_evidence_candidates(unified_evidence_index, query, top_k=3)
+            retrieved_refs = [_to_evidence_ref(item, source="evidence_index_retrieval") for item in retrieved_candidates]
+            pack["evidence_refs"] = _merge_evidence_refs(list(pack.get("evidence_refs") or []), retrieved_refs)
+            trace = pack.get("retrieval_trace")
+            if not isinstance(trace, dict):
+                trace = {}
+            trace["retriever_candidates"] = len(retrieved_candidates)
+            pack["retrieval_trace"] = trace
+            task_pack_rows.append(pack)
+
+        evidence_pack_rows.extend(task_pack_rows)
+
+        task_support_refs: list[dict[str, Any]] = []
+        task_counter_refs: list[dict[str, Any]] = []
+        query_terms: list[str] = []
+        for pack in task_pack_rows:
+            task_support_refs.extend(
+                item for item in (pack.get("evidence_refs") or []) if isinstance(item, dict)
+            )
+            task_counter_refs.extend(
+                item for item in (pack.get("counter_evidence_refs") or []) if isinstance(item, dict)
+            )
+            trace = pack.get("retrieval_trace")
+            if isinstance(trace, dict):
+                for term in (trace.get("positive_terms") or []):
+                    token = str(term or "").strip()
+                    if token:
+                        query_terms.append(token)
+
+        if not query_terms:
+            query_terms = _collect_query_terms_for_requirement(requirement_id, finding, task_rows)
+
+        support_refs = _merge_evidence_refs(existing_refs, task_support_refs)
+        counter_refs = _merge_evidence_refs(task_counter_refs)
         evidence_refs = [str(item.get("evidence_id")) for item in support_refs if item.get("evidence_id")]
         counter_evidence_refs = [str(item.get("evidence_id")) for item in counter_refs if item.get("evidence_id")]
 
@@ -1631,6 +1689,7 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         decision_trace["evidence_harvest"] = {
             "query_terms": query_terms,
             "support_refs": support_refs,
+            "task_packs": len(task_pack_rows),
         }
         decision_trace["counter_evidence_audit"] = {
             "counter_evidence_refs": counter_refs,
@@ -1663,13 +1722,19 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             }
         )
 
+    write_evidence_packs_jsonl(evidence_packs_path, evidence_pack_rows)
     write_verdicts_jsonl(verdicts_path, verdict_rows)
     counts = Counter(str(row.get("status") or "") for row in verdict_rows)
     llm_coverage = _safe_ratio(
         sum(1 for row in verdict_rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
         len(verdict_rows),
     )
-    return {"verdicts": len(verdict_rows), "status_counts": dict(counts), "llm_coverage": llm_coverage}
+    return {
+        "verdicts": len(verdict_rows),
+        "evidence_packs": len(evidence_pack_rows),
+        "status_counts": dict(counts),
+        "llm_coverage": llm_coverage,
+    }
 
 
 def _load_eval_metrics(out_dir: Path) -> dict[str, Any] | None:

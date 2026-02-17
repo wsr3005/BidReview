@@ -38,6 +38,16 @@ _SUPPORT_HINTS = {
     "complies",
     "meet",
     "meets",
+    "已提供",
+    "提供",
+    "已提交",
+    "提交",
+    "随附",
+    "已附",
+    "附上",
+    "符合",
+    "满足",
+    "具备",
 }
 
 _COUNTER_HINTS = {
@@ -50,6 +60,34 @@ _COUNTER_HINTS = {
     "fail",
     "reject",
     "invalid",
+    "未提供",
+    "未提交",
+    "未附",
+    "缺失",
+    "缺少",
+    "不满足",
+    "不符合",
+    "不具备",
+    "无效",
+    "作废",
+    "驳回",
+}
+
+_STRONG_COUNTER_HINTS = {
+    "not",
+    "without",
+    "missing",
+    "invalid",
+    "未提供",
+    "未提交",
+    "缺失",
+    "缺少",
+    "不满足",
+    "不符合",
+    "不具备",
+    "无效",
+    "作废",
+    "驳回",
 }
 
 _REFERENCE_HINTS = {
@@ -58,6 +96,13 @@ _REFERENCE_HINTS = {
     "refer",
     "see attachment",
     "scan copy",
+    "附件",
+    "见附件",
+    "详见附件",
+    "附后",
+    "扫描件",
+    "复印件",
+    "影印件",
 }
 
 
@@ -66,6 +111,16 @@ def _normalize_text(text: Any) -> str:
 
 
 def _extract_terms(value: Any, *, limit: int = 24) -> list[str]:
+    def _token_variants(token: str) -> list[str]:
+        variants = [token]
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            for size in (2, 3, 4):
+                if len(token) <= size:
+                    continue
+                for start in range(0, len(token) - size + 1):
+                    variants.append(token[start : start + size])
+        return variants
+
     if isinstance(value, list):
         source = " ".join(str(item) for item in value if item is not None)
     else:
@@ -74,12 +129,15 @@ def _extract_terms(value: Any, *, limit: int = 24) -> list[str]:
     terms: list[str] = []
     seen: set[str] = set()
     for match in _TERM_PATTERN.findall(source.lower()):
-        if match in _STOP_TERMS:
-            continue
-        if match in seen:
-            continue
-        seen.add(match)
-        terms.append(match)
+        for token in _token_variants(match):
+            if token in _STOP_TERMS:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            terms.append(token)
+            if len(terms) >= limit:
+                break
         if len(terms) >= limit:
             break
     return terms
@@ -215,7 +273,8 @@ def _support_score(entry: dict[str, Any], positive_terms: list[str]) -> tuple[in
     if not matched:
         return 0, []
     score = len(matched) * 3
-    if any(hint in normalized for hint in _SUPPORT_HINTS):
+    has_counter_phrase = any(hint in normalized for hint in _COUNTER_HINTS)
+    if (not has_counter_phrase) and any(hint in normalized for hint in _SUPPORT_HINTS):
         score += 2
     if entry.get("block_type") in {"ocr", "table"}:
         score += 1
@@ -236,6 +295,9 @@ def _counter_score(
 
     matched_counter = [term for term in counter_terms if term and term in normalized]
     score = len(matched_counter) * 4
+    strong_hits = [term for term in matched_counter if term in _STRONG_COUNTER_HINTS]
+    if strong_hits:
+        score += 20
     if bool(entry.get("reference_only")):
         matched_counter.append("reference_only")
         score += 3
