@@ -29,6 +29,7 @@ Optional discipline check: `.\scripts\check-task-cards.ps1` (use `-FailOnUntrack
 4. Run build or type checks.
 5. Perform smoke test for critical path.
 6. If gold data exists, run evaluation metrics and verify thresholds.
+   Recommended when gold fixtures are changed: `uv run python scripts/validate-goldset.py`
 7. If any gate fails: fix -> rerun failed gate -> rerun full gate.
 8. Prepare handoff summary.
 

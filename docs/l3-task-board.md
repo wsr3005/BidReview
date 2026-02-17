@@ -47,6 +47,9 @@ Phase 3 focus:
 1. Expand and stratify gold set for realistic business clauses.
 2. Tune release gate thresholds and add fail-fast checks in pipeline.
 3. Add release hardening (metadata, prompt/model versioning, canary flow).
+4. Keep canonical fixture + validation command in repo:
+   - `docs/goldset/l3-gold.jsonl` (>=200)
+   - `uv run python scripts/validate-goldset.py`
 
 Phase 3 target metrics:
 1. hard_fail_recall >=0.98

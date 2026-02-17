@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bidagent.eval import evaluate_run
+from bidagent.eval import evaluate_run, validate_gold_rows
 from bidagent.io_utils import ensure_dir, write_jsonl
 
 
@@ -43,6 +43,37 @@ class EvalTests(unittest.TestCase):
             self.assertEqual(metrics["hard_fail_missed"], 1)
             self.assertAlmostEqual(metrics["hard_fail_recall"], 0.5)
             self.assertEqual(metrics["false_positive_fail"], 1)
+
+    def test_validate_gold_rows_rejects_unknown_labels(self) -> None:
+        rows = [
+            {"requirement_id": "R0001", "tier": "hard_fail", "expected_status": "pass"},
+            {"requirement_id": "R0002", "tier": "critical", "expected_status": "maybe"},
+        ]
+        with self.assertRaisesRegex(ValueError, "gold set validation failed"):
+            validate_gold_rows(rows)
+
+    def test_evaluate_run_rejects_invalid_gold_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "run"
+            ensure_dir(run_dir / "eval")
+
+            write_jsonl(
+                run_dir / "eval" / "gold.jsonl",
+                [
+                    {"requirement_id": "R0001", "tier": "hard_fail", "expected_status": "fail"},
+                    {"requirement_id": "R0002", "tier": "unknown_tier", "expected_status": "pass"},
+                ],
+            )
+            write_jsonl(
+                run_dir / "findings.jsonl",
+                [
+                    {"requirement_id": "R0001", "status": "fail"},
+                    {"requirement_id": "R0002", "status": "pass"},
+                ],
+            )
+
+            with self.assertRaisesRegex(ValueError, "gold set validation failed"):
+                evaluate_run(run_dir)
 
 
 if __name__ == "__main__":
