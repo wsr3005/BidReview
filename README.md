@@ -28,7 +28,9 @@ uv run bidagent run \
 
 - `ingest`: parse tender and bid files into JSONL blocks
 - `extract-req`: extract business requirements from tender blocks
+- `plan-tasks`: decompose each requirement into multiple review tasks (`2-6` tasks when constraints exist)
 - `review`: check bid document against extracted requirements
+- `verdict`: aggregate task-level verdict protocol into requirement-level final verdicts
 - `gate`: apply release thresholds and output `gate-result.json`
 - `annotate`: generate issue annotations sidecar files and annotated document copy (`.docx` / `.pdf`)
 - `checklist`: export manual review list (`fail` + `high risk` + `needs_ocr`)
@@ -42,6 +44,8 @@ uv run bidagent run \
 - `run-metadata.json`: model/prompt/strategy version metadata for the run
 - `canary-result.json`: canary checks used before `auto_final` promotion
 - `release-trace.json`: release decision + key artifact checksums for audit traceability
+
+When `runs/<x>/eval/gold.jsonl` exists, `run` auto-generates `eval/metrics.json` before gate checks.
 
 ## Notes
 

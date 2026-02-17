@@ -157,6 +157,33 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[-1]["location"]["section"], "OCR_MEDIA")
 
+    def test_plan_tasks_uses_requirement_decomposition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "text": "投标人必须提供营业执照且保证金不少于50万元",
+                        "category": "资质与证照",
+                        "mandatory": True,
+                        "keywords": ["营业执照", "保证金"],
+                        "constraints": [{"type": "amount", "field": "保证金", "op": ">=", "value_fen": 50000000}],
+                        "rule_tier": "hard_fail",
+                    }
+                ],
+            )
+
+            result = plan_tasks(out_dir=out_dir, resume=False)
+            rows = list(read_jsonl(out_dir / "review-tasks.jsonl"))
+
+            self.assertGreaterEqual(result["review_tasks"], 2)
+            self.assertGreaterEqual(len(rows), 2)
+            task_types = {str(row.get("task_type") or "") for row in rows}
+            self.assertIn("evidence_check", task_types)
+            self.assertIn("keyword_check", task_types)
+
     def test_gate_allows_auto_final_when_all_metrics_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)
@@ -502,6 +529,8 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertIn("run_metadata", result)
             self.assertIn("canary", result)
             self.assertIn("release_trace", result)
+            self.assertIn("eval", result)
+            self.assertIn("metrics_available", result["eval"])
 
             run_metadata = json.loads((out_dir / "release" / "run-metadata.json").read_text(encoding="utf-8"))
             self.assertIn("model", run_metadata)

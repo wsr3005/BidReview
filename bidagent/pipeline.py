@@ -16,6 +16,7 @@ from bidagent.consistency import find_inconsistencies
 from bidagent.document import iter_document_blocks
 from bidagent.eval import evaluate_run
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
+from bidagent.llm_judge import judge_tasks_with_llm, write_verdicts_jsonl
 from bidagent.llm import DEEPSEEK_PROMPT_VERSION, DeepSeekReviewer, apply_llm_review
 from bidagent.models import Block, Location, Requirement
 from bidagent.ocr import iter_document_ocr_blocks, ocr_selfcheck
@@ -26,6 +27,7 @@ from bidagent.review import (
     extract_requirements,
     review_requirements,
 )
+from bidagent.task_planner import ensure_review_tasks
 
 VALID_RELEASE_MODES = {"assist_only", "auto_final"}
 VALID_GATE_FAIL_FAST_MODES = {"off", "critical", "all"}
@@ -1410,34 +1412,84 @@ def _requirement_task_id(requirement_id: str, index: int) -> str:
 def plan_tasks(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     requirements_path = out_dir / "requirements.jsonl"
     tasks_path = out_dir / "review-tasks.jsonl"
-    if path_ready(tasks_path, resume):
-        total = sum(1 for _ in read_jsonl(tasks_path))
-        return {"review_tasks": total}
+    tasks = ensure_review_tasks(requirements_path=requirements_path, review_tasks_path=tasks_path, resume=resume)
+    return {"review_tasks": len(tasks)}
 
-    requirements = list(read_jsonl(requirements_path))
-    task_rows: list[dict[str, Any]] = []
-    for index, requirement in enumerate(requirements, start=1):
-        requirement_id = str(requirement.get("requirement_id") or f"R{index:04d}")
-        tier = str(requirement.get("rule_tier") or "general")
-        task_rows.append(
-            {
-                "task_id": _requirement_task_id(requirement_id, index),
-                "requirement_id": requirement_id,
-                "task_type": "requirement_check",
-                "query": str(requirement.get("text") or ""),
-                "expected_logic": {
-                    "constraints": list(requirement.get("constraints") or []),
-                    "mandatory": bool(requirement.get("mandatory", False)),
-                },
-                "priority": tier,
-            }
-        )
 
-    write_jsonl(tasks_path, task_rows)
-    return {"review_tasks": len(task_rows)}
+class _PipelineTaskReviewer:
+    def __init__(
+        self,
+        *,
+        provider: str,
+        model: str,
+        default_status: str,
+        default_reason: str,
+        default_confidence: float | None,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self._default_status = default_status
+        self._default_reason = default_reason
+        self._default_confidence = default_confidence
+
+    def review_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        status = str(task.get("rule_status") or task.get("status") or self._default_status or "insufficient_evidence")
+        reason = str(task.get("rule_reason") or task.get("reason") or self._default_reason or "Rule fallback")
+        confidence = _safe_float(task.get("rule_confidence"))
+        if confidence is None:
+            confidence = self._default_confidence
+        if confidence is None:
+            confidence = _status_confidence_hint(status)
+        return {
+            "status": status,
+            "reason": reason,
+            "confidence": confidence,
+        }
+
+
+def _aggregate_task_verdicts(task_verdicts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not task_verdicts:
+        return {
+            "status": "insufficient_evidence",
+            "reason": "未生成任务判决",
+            "confidence": _status_confidence_hint("insufficient_evidence"),
+            "status_counts": {},
+        }
+
+    status_order = ("fail", "needs_ocr", "risk", "insufficient_evidence", "pass")
+    status_counts = Counter(str(row.get("status") or "insufficient_evidence") for row in task_verdicts)
+    selected_status = "insufficient_evidence"
+    for status in status_order:
+        if status_counts.get(status):
+            selected_status = status
+            break
+
+    selected_reason = ""
+    for row in task_verdicts:
+        if str(row.get("status") or "") != selected_status:
+            continue
+        selected_reason = str(row.get("reason") or "").strip()
+        if selected_reason:
+            break
+    if not selected_reason:
+        selected_reason = f"任务聚合结论: {selected_status}"
+
+    confidence_values = [value for value in (_safe_float(row.get("confidence")) for row in task_verdicts) if value is not None]
+    confidence = (
+        max(0.0, min(1.0, sum(confidence_values) / len(confidence_values)))
+        if confidence_values
+        else _status_confidence_hint(selected_status)
+    )
+    return {
+        "status": selected_status,
+        "reason": selected_reason,
+        "confidence": confidence,
+        "status_counts": dict(status_counts),
+    }
 
 
 def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
+    requirements_path = out_dir / "requirements.jsonl"
     findings_path = out_dir / "findings.jsonl"
     tasks_path = out_dir / "review-tasks.jsonl"
     bid_blocks_path = out_dir / "ingest" / "bid_blocks.jsonl"
@@ -1451,36 +1503,87 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         )
         return {"verdicts": len(rows), "status_counts": dict(counts), "llm_coverage": llm_coverage}
 
-    task_by_requirement: dict[str, str] = {}
     tasks_by_requirement: dict[str, list[dict[str, Any]]] = {}
     if tasks_path.exists():
         for row in read_jsonl(tasks_path):
             requirement_id = str(row.get("requirement_id") or "").strip()
-            task_id = str(row.get("task_id") or "").strip()
-            if requirement_id and task_id and requirement_id not in task_by_requirement:
-                task_by_requirement[requirement_id] = task_id
             if requirement_id:
                 tasks_by_requirement.setdefault(requirement_id, []).append(row)
 
     evidence_index = _load_evidence_index(bid_blocks_path)
     evidence_index_stats = dict(evidence_index.get("stats") or {})
+    requirements_rows = list(read_jsonl(requirements_path)) if requirements_path.exists() else []
+    requirement_order: list[str] = []
+    for index, row in enumerate(requirements_rows, start=1):
+        requirement_id = str(row.get("requirement_id") or f"R{index:04d}").strip()
+        if requirement_id and requirement_id not in requirement_order:
+            requirement_order.append(requirement_id)
 
-    finding_rows = list(read_jsonl(findings_path))
+    finding_rows = list(read_jsonl(findings_path)) if findings_path.exists() else []
+    finding_by_requirement: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(finding_rows, start=1):
+        requirement_id = str(row.get("requirement_id") or f"R{index:04d}").strip()
+        if not requirement_id:
+            continue
+        finding_by_requirement[requirement_id] = row
+        if requirement_id not in requirement_order:
+            requirement_order.append(requirement_id)
+
+    for requirement_id in tasks_by_requirement:
+        if requirement_id not in requirement_order:
+            requirement_order.append(requirement_id)
+
     verdict_rows: list[dict[str, Any]] = []
-    for index, finding in enumerate(finding_rows, start=1):
-        requirement_id = str(finding.get("requirement_id") or f"R{index:04d}")
-        task_rows = tasks_by_requirement.get(requirement_id, [])
-        status = str(finding.get("status") or "risk")
+    for index, requirement_id in enumerate(requirement_order, start=1):
+        finding = finding_by_requirement.get(requirement_id, {})
+        task_rows = list(tasks_by_requirement.get(requirement_id, []))
+        status = str(finding.get("status") or "insufficient_evidence")
         llm = finding.get("llm") if isinstance(finding.get("llm"), dict) else {}
-        confidence = _safe_float((llm or {}).get("confidence"))
-        if confidence is None:
-            confidence = _status_confidence_hint(status)
-        confidence = max(0.0, min(1.0, confidence))
+        llm_confidence = _safe_float((llm or {}).get("confidence"))
+
         existing_refs = [
             _to_evidence_ref(item, source="finding")
             for item in (finding.get("evidence") or [])
             if isinstance(item, dict)
         ]
+        if not task_rows:
+            task_rows = [
+                {
+                    "task_id": _requirement_task_id(requirement_id, index),
+                    "requirement_id": requirement_id,
+                    "task_type": "requirement_check",
+                    "query": str(finding.get("reason") or ""),
+                }
+            ]
+        base_reason = str(finding.get("reason") or "规则判定结果")
+        provider = str((llm or {}).get("provider") or "rule_fallback")
+        model_name = str((llm or {}).get("model") or "rule-only")
+        reviewer = _PipelineTaskReviewer(
+            provider=provider,
+            model=model_name,
+            default_status=status,
+            default_reason=base_reason,
+            default_confidence=llm_confidence,
+        )
+        task_inputs: list[dict[str, Any]] = []
+        for task in task_rows:
+            task_row = dict(task)
+            task_row["rule_status"] = status
+            task_row["rule_reason"] = base_reason
+            task_row["rule_confidence"] = llm_confidence
+            task_row["evidence_refs"] = existing_refs
+            trace = task_row.get("decision_trace")
+            if not isinstance(trace, dict):
+                trace = {}
+            trace.setdefault("source", "pipeline_task_bridge")
+            trace.setdefault("requirement_id", requirement_id)
+            task_row["decision_trace"] = trace
+            task_inputs.append(task_row)
+        task_verdict_rows = judge_tasks_with_llm(task_inputs, reviewer, min_confidence=0.65)
+        aggregated = _aggregate_task_verdicts(task_verdict_rows)
+        status = str(aggregated.get("status") or "insufficient_evidence")
+        confidence = max(0.0, min(1.0, _safe_float(aggregated.get("confidence")) or _status_confidence_hint(status)))
+
         query_terms = _collect_query_terms_for_requirement(requirement_id, finding, task_rows)
         harvested = _harvest_evidence_refs(
             evidence_index,
@@ -1493,7 +1596,7 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         evidence_refs = [str(item.get("evidence_id")) for item in support_refs if item.get("evidence_id")]
         counter_evidence_refs = [str(item.get("evidence_id")) for item in counter_refs if item.get("evidence_id")]
 
-        reason = str(finding.get("reason") or "")
+        reason = str(aggregated.get("reason") or base_reason)
         status_before_audit = status
         downgrade_action: str | None = None
         if status == "pass" and counter_evidence_refs:
@@ -1512,6 +1615,18 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         decision_trace = finding.get("decision_trace")
         if not isinstance(decision_trace, dict):
             decision_trace = {"source": "pipeline_findings_bridge", "fallbacks": []}
+        decision_trace["task_verdicts"] = {
+            "total": len(task_verdict_rows),
+            "status_counts": aggregated.get("status_counts", {}),
+            "sample": [
+                {
+                    "task_id": row.get("task_id"),
+                    "status": row.get("status"),
+                    "confidence": row.get("confidence"),
+                }
+                for row in task_verdict_rows[:5]
+            ],
+        }
         decision_trace["evidence_index"] = evidence_index_stats
         decision_trace["evidence_harvest"] = {
             "query_terms": query_terms,
@@ -1536,7 +1651,7 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
 
         verdict_rows.append(
             {
-                "task_id": task_by_requirement.get(requirement_id, _requirement_task_id(requirement_id, index)),
+                "task_id": str((task_rows[0] or {}).get("task_id") or _requirement_task_id(requirement_id, index)),
                 "requirement_id": requirement_id,
                 "status": status,
                 "confidence": confidence,
@@ -1548,7 +1663,7 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
             }
         )
 
-    write_jsonl(verdicts_path, verdict_rows)
+    write_verdicts_jsonl(verdicts_path, verdict_rows)
     counts = Counter(str(row.get("status") or "") for row in verdict_rows)
     llm_coverage = _safe_ratio(
         sum(1 for row in verdict_rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
@@ -1615,15 +1730,25 @@ def gate(
     if requirements_total <= 0:
         requirements_total = max(len(finding_rows), len(verdict_rows))
 
-    auto_review_coverage = _safe_ratio(len(verdict_rows), requirements_total)
+    verdict_requirement_ids = {
+        str(row.get("requirement_id") or "").strip()
+        for row in verdict_rows
+        if str(row.get("requirement_id") or "").strip()
+    }
+    llm_requirement_ids = {
+        str(row.get("requirement_id") or "").strip()
+        for row in verdict_rows
+        if str(row.get("requirement_id") or "").strip()
+        and isinstance(row.get("model"), dict)
+        and row.get("model", {}).get("provider")
+    }
+
+    auto_review_coverage = _safe_ratio(len(verdict_requirement_ids), requirements_total)
     evidence_traceability = _safe_ratio(
         sum(1 for row in finding_rows if _finding_has_traceable_evidence(row)),
         len(finding_rows),
     )
-    llm_coverage = _safe_ratio(
-        sum(1 for row in verdict_rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
-        len(verdict_rows),
-    )
+    llm_coverage = _safe_ratio(len(llm_requirement_ids), requirements_total)
 
     eval_metrics = _load_eval_metrics(out_dir)
     hard_fail_recall = _safe_float((eval_metrics or {}).get("hard_fail_recall"))
@@ -1711,6 +1836,8 @@ def gate(
         "metrics": {
             "requirements_total": requirements_total,
             "verdict_total": len(verdict_rows),
+            "verdict_requirement_covered": len(verdict_requirement_ids),
+            "llm_requirement_covered": len(llm_requirement_ids),
             "findings_total": len(finding_rows),
             "auto_review_coverage": auto_review_coverage,
             "hard_fail_recall": hard_fail_recall,
@@ -1866,6 +1993,11 @@ def run_pipeline(
     summary["checklist"] = checklist(out_dir=out_dir, resume=downstream_resume)
     summary["consistency"] = consistency(out_dir=out_dir, resume=downstream_resume)
     summary["report"] = report(out_dir=out_dir)
+    eval_metrics = _load_eval_metrics(out_dir)
+    summary["eval"] = {
+        "metrics_available": eval_metrics is not None,
+        "metrics": eval_metrics,
+    }
     gate_result = gate(
         out_dir=out_dir,
         requested_release_mode=requested_release_mode,
