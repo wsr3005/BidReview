@@ -74,13 +74,11 @@ def _extract_kv_text(text: str, keys: list[str]) -> list[tuple[str, str]]:
     for key in keys:
         # Key can appear as "KEY: VALUE" or "KEY：VALUE"
         pattern = rf"{re.escape(key)}\s*[:：]\s*([^\r\n]{{2,120}})"
-        match = re.search(pattern, text)
-        if not match:
-            continue
-        value = match.group(1).strip()
-        # Stop at obvious trailing punctuation.
-        value = re.split(r"[。；;]\s*", value)[0].strip()
-        results.append((key, value))
+        for match in re.finditer(pattern, text):
+            value = match.group(1).strip()
+            # Stop at obvious trailing punctuation.
+            value = re.split(r"[。；;]\s*", value)[0].strip()
+            results.append((key, value))
     return results
 
 
@@ -92,6 +90,70 @@ def _severity_for(fact_type: str) -> str:
     if fact_type in {"bidder_name", "bid_total_price_fen", "uscc"}:
         return "high"
     return "medium"
+
+
+def _extract_uscc_codes(text: str) -> list[str]:
+    # Only accept 18-char code when it is explicitly tied to credit-code keys.
+    keys = ["统一社会信用代码", "社会信用代码", "信用代码"]
+    codes: list[str] = []
+    for _, value in _extract_kv_text(text, keys):
+        match = re.search(r"\b[0-9A-Z]{18}\b", value.upper())
+        if match:
+            codes.append(match.group(0))
+    for match in re.finditer(r"(统一社会信用代码|社会信用代码|信用代码)\s*(?:[:：]|为)?\s*([0-9A-Z]{18})", text):
+        codes.append(match.group(2).upper())
+    return codes
+
+
+def _extract_bid_total_prices(text: str) -> list[tuple[str, int]]:
+    keys = ["投标总价", "投标报价", "总报价", "含税总价", "投标价", "报价金额", "报价"]
+    results: list[tuple[str, int]] = []
+
+    # Prefer key-value extraction first.
+    for _, value in _extract_kv_text(text, keys):
+        match = re.search(r"([￥¥]?\s*\d[\d,]*(?:\.\d{1,2})?\s*(?:元|万元))", value)
+        if not match:
+            continue
+        raw = match.group(1)
+        fen = _parse_amount_fen(raw)
+        if fen is not None:
+            results.append((raw, fen))
+    if results:
+        return results
+
+    # Fallback: free-form phrase with key adjacent to amount.
+    for match in re.finditer(
+        r"(投标总价|投标报价|总报价|含税总价|投标价|报价金额|报价)\s*(?:金额)?\s*(?:为|是|:|：)?\s*([￥¥]?\s*\d[\d,]*(?:\.\d{1,2})?\s*(?:元|万元))",
+        text,
+    ):
+        raw = match.group(2)
+        fen = _parse_amount_fen(raw)
+        if fen is not None:
+            results.append((raw, fen))
+    return results
+
+
+def _extract_key_dates(text: str) -> list[str]:
+    keys = ["签署日期", "投标日期", "开标日期", "日期"]
+    values: list[str] = []
+
+    # Prefer explicit key-value extraction.
+    for _, value in _extract_kv_text(text, keys):
+        parsed = _parse_date(value)
+        if parsed:
+            values.append(parsed)
+    if values:
+        return values
+
+    # Fallback: key + nearby date.
+    for match in re.finditer(
+        r"(签署日期|投标日期|开标日期|日期)\s*(?:为|是|:|：)?\s*(\d{4}[年\-/\.]\d{1,2}[月\-/\.]\d{1,2}日?)",
+        text,
+    ):
+        parsed = _parse_date(match.group(2))
+        if parsed:
+            values.append(parsed)
+    return values
 
 
 def find_inconsistencies(bid_blocks: Iterable[Block], *, max_examples_per_value: int = 3) -> list[ConsistencyFinding]:
@@ -124,25 +186,16 @@ def find_inconsistencies(bid_blocks: Iterable[Block], *, max_examples_per_value:
             _add("project_name", _compact(value), value, occ)
 
         # USCC / credit code.
-        if "统一社会信用代码" in text or re.search(r"\b[0-9A-Z]{18}\b", text):
-            for match in re.finditer(r"\b[0-9A-Z]{18}\b", text):
-                code = match.group(0)
-                _add("uscc", code, code, occ)
+        for code in _extract_uscc_codes(text):
+            _add("uscc", code, code, occ)
 
-        # Total bid price (keyed).
-        if re.search(r"(投标(总价|报价)|报价(总价)?|含税总价|总报价|投标价)", text):
-            for match in re.finditer(r"([￥¥]?\s*\d[\d,]*(?:\.\d{1,2})?\s*(?:元|万元)?)", text):
-                raw = match.group(1)
-                fen = _parse_amount_fen(raw)
-                if fen is None:
-                    continue
-                _add("bid_total_price_fen", str(fen), raw, occ)
+        # Total bid price (keyed + nearby fallback).
+        for raw, fen in _extract_bid_total_prices(text):
+            _add("bid_total_price_fen", str(fen), raw, occ)
 
         # Date (keyed to common headings).
-        if re.search(r"(日期|签署日期|投标日期|开标日期)", text):
-            parsed = _parse_date(text)
-            if parsed:
-                _add("key_date", parsed, parsed, occ)
+        for parsed in _extract_key_dates(text):
+            _add("key_date", parsed, parsed, occ)
 
     findings: list[ConsistencyFinding] = []
     for fact_type, values_map in bucket.items():
@@ -172,4 +225,3 @@ def find_inconsistencies(bid_blocks: Iterable[Block], *, max_examples_per_value:
         )
 
     return findings
-

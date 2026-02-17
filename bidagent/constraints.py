@@ -6,6 +6,25 @@ from typing import Any
 
 _OP_WORDS_GTE = ("不少于", "不低于", "不小于", "至少", "不得低于", "应不少于", "须不少于", "需不少于")
 _OP_WORDS_LTE = ("不超过", "不得超过", "不高于", "至多", "最高", "不得高于", "应不超过", "须不超过", "需不超过")
+_QTY_INTENT_WORDS = (
+    "提供",
+    "提交",
+    "递交",
+    "配备",
+    "投入",
+    "安排",
+    "出具",
+    "附上",
+    "纸质",
+    "原件",
+    "复印件",
+)
+_AMOUNT_FIELD_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("bid_bond", ("投标保证金", "保证金", "投标担保", "履约保证金")),
+    ("ceiling_price", ("最高限价", "控制价", "拦标价", "上限价")),
+    ("budget_price", ("预算金额", "项目预算", "预算价", "采购预算")),
+    ("bid_price", ("投标总价", "投标报价", "含税总价", "总价", "报价")),
+)
 
 
 def _detect_op(text: str) -> str | None:
@@ -29,6 +48,13 @@ def _detect_op_near(text: str, start: int, end: int, *, window: int = 16) -> str
     return _detect_op(text[left:right])
 
 
+def _has_qty_intent_near(text: str, start: int, end: int, *, window: int = 16) -> bool:
+    left = max(0, start - window)
+    right = min(len(text), end + window)
+    around = text[left:right]
+    return any(word in around for word in _QTY_INTENT_WORDS)
+
+
 def _parse_amount_fen(raw: str) -> int | None:
     value = raw.strip().replace(",", "")
     unit = 1
@@ -44,6 +70,40 @@ def _parse_amount_fen(raw: str) -> int | None:
     except ValueError:
         return None
     return int(round(amount * unit * 100))
+
+
+def _detect_amount_field_near(text: str, start: int, end: int, *, window: int = 24) -> str | None:
+    best_field: str | None = None
+    best_distance: int | None = None
+    best_is_left: bool | None = None
+    for field, keywords in _AMOUNT_FIELD_KEYWORDS:
+        for keyword in keywords:
+            for match in re.finditer(re.escape(keyword), text):
+                k_start, k_end = match.span()
+                if k_end <= start:
+                    distance = start - k_end
+                    is_left = True
+                elif k_start >= end:
+                    distance = k_start - end
+                    is_left = False
+                else:
+                    distance = 0
+                    is_left = True
+                if distance > window:
+                    continue
+                should_update = False
+                if best_distance is None or distance < best_distance:
+                    should_update = True
+                elif distance == best_distance and best_is_left is not None and is_left and not best_is_left:
+                    # Tie-breaker: prefer keyword on the left side of amount.
+                    should_update = True
+                if should_update:
+                    best_distance = distance
+                    best_field = field
+                    best_is_left = is_left
+                if distance == 0:
+                    return field
+    return best_field
 
 
 def extract_constraints(text: str) -> list[dict[str, Any]]:
@@ -69,9 +129,11 @@ def extract_constraints(text: str) -> list[dict[str, Any]]:
                 if fen is None:
                     continue
                 local_op = _detect_op_near(clause, match.start(1), match.end(1)) or clause_op
+                amount_field = _detect_amount_field_near(clause, match.start(1), match.end(1))
                 constraints.append(
                     {
                         "type": "amount",
+                        "field": amount_field,
                         "op": local_op,
                         "value_fen": fen,
                         "unit": "fen",
@@ -98,12 +160,14 @@ def extract_constraints(text: str) -> list[dict[str, Any]]:
                 }
             )
 
-        # Quantity: "至少 3 份" / "不少于 2 套" etc.
-        qty_match = re.search(
-            r"(不少于|不低于|不小于|至少|不得低于|不超过|不得超过|不高于|至多)?\s*(\d{1,4})\s*(份|套|台|项|个|人|家)",
-            clause,
+        # Quantity: require explicit op words (e.g. 至少/不少于) OR nearby quantity intent.
+        qty_pattern = re.compile(
+            r"(不少于|不低于|不小于|至少|不得低于|不超过|不得超过|不高于|至多)?\s*(\d{1,4})\s*(份|套|台|项|个|人|家)"
         )
-        if qty_match:
+        for qty_match in qty_pattern.finditer(clause):
+            has_explicit_op = bool(qty_match.group(1))
+            if not has_explicit_op and not _has_qty_intent_near(clause, qty_match.start(0), qty_match.end(0)):
+                continue
             local_op = _detect_op(qty_match.group(0)) or clause_op
             value = int(qty_match.group(2))
             unit = qty_match.group(3)
