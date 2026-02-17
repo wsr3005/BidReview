@@ -854,11 +854,18 @@ def report(out_dir: Path) -> dict[str, Any]:
                 top_values.append(
                     f"{value_row.get('value_raw_examples', [''])[0]}(count={value_row.get('count')})"
                 )
+            more_count = max(0, len(values) - len(top_values))
+            values_text = ", ".join(_sanitize_md_text(v, limit=60) for v in top_values if v)
+            if more_count > 0:
+                if values_text:
+                    values_text = f"{values_text} (+{more_count} more)"
+                else:
+                    values_text = f"(+{more_count} more)"
             lines.append(
                 "- "
                 + f"[{item.get('status', 'risk')}/{item.get('severity', 'medium')}] "
                 + f"{item.get('type')}: {item.get('reason')} "
-                + f"| values: {', '.join(_sanitize_md_text(v, limit=60) for v in top_values if v)}"
+                + f"| values: {values_text}"
             )
 
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

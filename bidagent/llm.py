@@ -8,6 +8,8 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Protocol
 
 from bidagent.models import Finding, Requirement
@@ -68,7 +70,7 @@ class DeepSeekReviewer:
             until = float(self._cooldown_until)
         now = time.time()
         if until > now:
-            time.sleep(min(60.0, until - now))
+            time.sleep(until - now)
 
     def _set_cooldown(self, seconds: float) -> None:
         delay = max(0.0, float(seconds))
@@ -80,13 +82,25 @@ class DeepSeekReviewer:
     def _parse_retry_after(value: str | None) -> float | None:
         if not value:
             return None
+        text = str(value).strip()
+        if not text:
+            return None
         try:
-            seconds = float(str(value).strip())
+            seconds = float(text)
         except ValueError:
+            seconds = None
+        if seconds is not None:
+            if seconds < 0:
+                return None
+            return seconds
+
+        try:
+            retry_at = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError, OverflowError):
             return None
-        if seconds < 0:
-            return None
-        return seconds
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, retry_at.timestamp() - time.time())
 
     def _build_messages(self, requirement: Requirement, finding: Finding) -> list[dict]:
         evidence_rows = []
@@ -172,8 +186,10 @@ class DeepSeekReviewer:
                 # - 5xx/408: retry with backoff.
                 # - others: fail fast.
                 if attempt < self.max_retries and (code == 429 or code == 408 or 500 <= code <= 599):
-                    base = retry_after if retry_after is not None else (1.0 * (2**attempt))
-                    delay = min(60.0, base + random.uniform(0.0, 0.5))
+                    if retry_after is not None:
+                        delay = retry_after
+                    else:
+                        delay = min(60.0, (1.0 * (2**attempt)) + random.uniform(0.0, 0.5))
                     if code == 429:
                         self._set_cooldown(delay)
                     time.sleep(delay)

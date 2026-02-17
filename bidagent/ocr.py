@@ -299,54 +299,54 @@ def iter_pdf_ocr_blocks(
                 return iter(())
             return iter(((page_no, text),))
 
-    for page_no in range(start_page, end_page + 1):
-        page = reader.pages[page_no - 1]
-        try:
-            images = list(page.images)
-        except Exception:  # noqa: BLE001
-            images = []
-        for image in images:
-            data = getattr(image, "data", None)
-            if not isinstance(data, (bytes, bytearray)):
-                continue
-            if isinstance(stats, dict):
-                stats["images_total"] = int(stats.get("images_total", 0)) + 1
-            fut = executor.submit(_ocr_bytes, bytes(data))
-            in_flight[seq] = (page_no, fut)
-            seq += 1
+        for page_no in range(start_page, end_page + 1):
+            page = reader.pages[page_no - 1]
+            try:
+                images = list(page.images)
+            except Exception:  # noqa: BLE001
+                images = []
+            for image in images:
+                data = getattr(image, "data", None)
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                if isinstance(stats, dict):
+                    stats["images_total"] = int(stats.get("images_total", 0)) + 1
+                fut = executor.submit(_ocr_bytes, bytes(data))
+                in_flight[seq] = (page_no, fut)
+                seq += 1
 
-            while len(in_flight) >= max_in_flight and next_seq in in_flight:
-                for page_for_text, text in _drain_one(next_seq):
-                    for chunk in split_text_blocks(text):
-                        if isinstance(stats, dict):
-                            stats["chars_total"] = int(stats.get("chars_total", 0)) + len(chunk)
-                        current_index += 1
-                        if isinstance(stats, dict):
-                            stats["blocks_emitted"] = int(stats.get("blocks_emitted", 0)) + 1
-                        yield Block(
-                            doc_id=doc_id,
-                            text=chunk,
-                            location=Location(block_index=current_index, page=page_for_text, section="OCR_MEDIA"),
-                        )
+                while len(in_flight) >= max_in_flight and next_seq in in_flight:
+                    for page_for_text, text in _drain_one(next_seq):
+                        for chunk in split_text_blocks(text):
+                            if isinstance(stats, dict):
+                                stats["chars_total"] = int(stats.get("chars_total", 0)) + len(chunk)
+                            current_index += 1
+                            if isinstance(stats, dict):
+                                stats["blocks_emitted"] = int(stats.get("blocks_emitted", 0)) + 1
+                            yield Block(
+                                doc_id=doc_id,
+                                text=chunk,
+                                location=Location(block_index=current_index, page=page_for_text, section="OCR_MEDIA"),
+                            )
+                    next_seq += 1
+
+        while next_seq < seq:
+            if next_seq not in in_flight:
                 next_seq += 1
-
-    while next_seq < seq:
-        if next_seq not in in_flight:
+                continue
+            for page_for_text, text in _drain_one(next_seq):
+                for chunk in split_text_blocks(text):
+                    if isinstance(stats, dict):
+                        stats["chars_total"] = int(stats.get("chars_total", 0)) + len(chunk)
+                    current_index += 1
+                    if isinstance(stats, dict):
+                        stats["blocks_emitted"] = int(stats.get("blocks_emitted", 0)) + 1
+                    yield Block(
+                        doc_id=doc_id,
+                        text=chunk,
+                        location=Location(block_index=current_index, page=page_for_text, section="OCR_MEDIA"),
+                    )
             next_seq += 1
-            continue
-        for page_for_text, text in _drain_one(next_seq):
-            for chunk in split_text_blocks(text):
-                if isinstance(stats, dict):
-                    stats["chars_total"] = int(stats.get("chars_total", 0)) + len(chunk)
-                current_index += 1
-                if isinstance(stats, dict):
-                    stats["blocks_emitted"] = int(stats.get("blocks_emitted", 0)) + 1
-                yield Block(
-                    doc_id=doc_id,
-                    text=chunk,
-                    location=Location(block_index=current_index, page=page_for_text, section="OCR_MEDIA"),
-                )
-        next_seq += 1
 
 
 def iter_document_ocr_blocks(
