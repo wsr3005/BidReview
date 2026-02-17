@@ -260,6 +260,114 @@ class PipelineReviewTests(unittest.TestCase):
             failed = [item for item in result.get("checks", []) if not item.get("ok")]
             self.assertTrue(any(item.get("name") == "hard_fail_recall" for item in failed))
 
+    def test_verdict_harvests_evidence_refs_from_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [{"requirement_id": "R0001", "text": "必须提供营业执照", "mandatory": True}],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "text": "我司已提供营业执照复印件，材料齐全。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "risk",
+                        "score": 1,
+                        "severity": "medium",
+                        "reason": "检索到部分证据，建议人工复核",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.72},
+                        "evidence": [],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+
+            result = verdict(out_dir=out_dir, resume=False)
+            self.assertEqual(result["verdicts"], 1)
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(rows[0]["evidence_refs"])
+            self.assertEqual(rows[0]["counter_evidence_refs"], [])
+            trace = rows[0].get("decision_trace") or {}
+            self.assertEqual((trace.get("evidence_index") or {}).get("blocks_indexed"), 1)
+            self.assertIsInstance((trace.get("evidence_harvest") or {}).get("query_terms"), list)
+
+    def test_verdict_downgrades_unstable_pass_to_risk_on_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [{"requirement_id": "R0001", "text": "必须提供营业执照", "mandatory": True}],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "text": "我司已提供营业执照复印件，符合要求。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    },
+                    {
+                        "doc_id": "bid",
+                        "text": "材料清单显示营业执照未提供，存在缺失。",
+                        "location": {"block_index": 2, "page": 1, "section": "BODY"},
+                    },
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "pass",
+                        "score": 3,
+                        "severity": "none",
+                        "reason": "匹配到充分证据",
+                        "llm": {"provider": "deepseek", "model": "deepseek-chat", "confidence": 0.93},
+                        "evidence": [
+                            {
+                                "evidence_id": "E-bid-p1-b1-sBODY",
+                                "doc_id": "bid",
+                                "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                                "excerpt": "我司已提供营业执照复印件，符合要求。",
+                                "score": 3,
+                            }
+                        ],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+
+            result = verdict(out_dir=out_dir, resume=False)
+            self.assertEqual(result["verdicts"], 1)
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "risk")
+            self.assertIn("E-bid-p1-b2-sBODY", rows[0]["counter_evidence_refs"])
+            self.assertIn("冲突证据", rows[0]["reason"])
+            trace = rows[0].get("decision_trace") or {}
+            audit = trace.get("counter_evidence_audit") or {}
+            self.assertTrue(audit.get("conflict_detected"))
+            self.assertEqual(audit.get("action"), "downgrade_pass_to_risk_conflict")
+            self.assertEqual((trace.get("decision") or {}).get("status"), "risk")
+
     def test_run_pipeline_writes_gate_result_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
