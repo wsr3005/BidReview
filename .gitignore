@@ -11,4 +11,7 @@ tests/__pycache__/
 test-assets/
 
 docs/tasks/
+bidagent.egg-info/
+git_diff.txt
+git_log.txt
 
