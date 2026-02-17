@@ -51,16 +51,39 @@ function Command-Exists {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Get-PythonRunner {
+    if (Command-Exists -Name "uv") { return "uv" }
+    if (Command-Exists -Name "python") { return "python" }
+    return $null
+}
+
+function Invoke-PythonRunner {
+    param(
+        [string]$Runner,
+        [string[]]$PyArgs
+    )
+
+    if ($Runner -eq "uv") {
+        & uv run python @PyArgs | Out-Host
+        return $LASTEXITCODE
+    }
+
+    & python @PyArgs | Out-Host
+    return $LASTEXITCODE
+}
+
 function Invoke-PythonChecks {
     param(
         [string[]]$Gates,
         [switch]$ContinueOnError
     )
 
-    if (-not (Command-Exists -Name "python")) {
-        Write-Error "Python project detected but 'python' command is unavailable."
+    $pythonRunner = Get-PythonRunner
+    if ($null -eq $pythonRunner) {
+        Write-Error "Python project detected but neither 'uv' nor 'python' command is available."
         exit 2
     }
+    $pythonLabel = if ($pythonRunner -eq "uv") { "uv run python" } else { "python" }
 
     $results = New-Object System.Collections.Generic.List[object]
     $hasFailure = $false
@@ -82,10 +105,9 @@ function Invoke-PythonChecks {
             }
             "test" {
                 if (Test-Path "tests") {
-                    $scriptName = "python -m unittest discover -s tests -v"
+                    $scriptName = "$pythonLabel -m unittest discover -s tests -v"
                     Write-Section "$gate -> $scriptName"
-                    & python -m unittest discover -s tests -v
-                    $exitCode = $LASTEXITCODE
+                    $exitCode = Invoke-PythonRunner -Runner $pythonRunner -PyArgs @("-m", "unittest", "discover", "-s", "tests", "-v")
                     $status = if ($exitCode -eq 0) { "pass" } else { "fail" }
                 }
             }
@@ -100,10 +122,9 @@ function Invoke-PythonChecks {
             }
             "build" {
                 if ((Test-Path "bidagent") -or (Test-Path "tests")) {
-                    $scriptName = "python -m compileall bidagent tests"
+                    $scriptName = "$pythonLabel -m compileall bidagent tests"
                     Write-Section "$gate -> $scriptName"
-                    & python -m compileall bidagent tests
-                    $exitCode = $LASTEXITCODE
+                    $exitCode = Invoke-PythonRunner -Runner $pythonRunner -PyArgs @("-m", "compileall", "bidagent", "tests")
                     $status = if ($exitCode -eq 0) { "pass" } else { "fail" }
                 }
             }

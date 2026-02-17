@@ -11,6 +11,7 @@ Ship useful changes fast with tight quality control.
 - CLI first. Prefer reproducible commands over manual UI steps.
 - Small diffs. Keep each change focused and reversible.
 - Fast loop. Plan -> implement -> verify -> report.
+- Business correctness first. A green unit test run is not enough if business e2e fails.
 - Control blast radius. Touch the minimum files needed.
 - Document decisions. Keep context in `docs/` so future sessions stay aligned.
 
@@ -37,6 +38,10 @@ Ship useful changes fast with tight quality control.
 4. Run verification checklist.
 5. Summarize results and next actions.
 
+If verification fails, continue in an auto-repair loop:
+fix -> rerun failing gate -> rerun full gate -> report.
+Do not hand off while any required gate is red unless explicitly blocked.
+
 ## Task Sizing Rules
 
 - Prefer tasks that can complete within 20-60 minutes.
@@ -58,11 +63,17 @@ Before handoff, run the strongest available checks for this project:
 Preferred command: `.\scripts\verify.ps1`
 
 1. Lint or static checks
-2. Unit or integration tests for touched areas
-3. Build or type check
-4. Quick manual smoke test for critical path
+2. Unit tests for touched areas
+3. Integration/business-path tests for touched areas (must include representative real input shape)
+4. Build or type check
+5. Quick manual smoke test for critical path
+6. If a gold dataset exists, run evaluation metrics and enforce thresholds (example: hard-fail recall floor)
 
-If any check is unavailable, state it explicitly in the handoff note.
+If any gate fails:
+- Fix and rerun until all required gates pass, or
+- Escalate with explicit blocker, impact, and rollback-safe state.
+
+If any check is unavailable, state it explicitly in the handoff note with reason and replacement check.
 
 ## Commit and Change Discipline
 

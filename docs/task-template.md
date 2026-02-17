@@ -20,6 +20,12 @@ Describe the user-visible outcome in one sentence.
 2. 
 3. 
 
+## Business Acceptance
+
+- Scenario input:
+- Expected business outcome:
+- Blocking failure condition:
+
 ## Scope
 
 - In scope:
@@ -34,9 +40,11 @@ Describe the user-visible outcome in one sentence.
 ## Verification
 
 - Lint/static:
-- Tests:
+- Unit tests:
+- Integration/business-path tests:
 - Build/typecheck:
 - Smoke test:
+- Eval metric thresholds (if applicable):
 
 ## Change Log
 
@@ -48,5 +56,5 @@ Describe the user-visible outcome in one sentence.
 
 - Summary:
 - Remaining risks:
+- Blockers (if any):
 - Recommended next step:
-
