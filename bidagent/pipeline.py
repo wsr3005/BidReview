@@ -26,6 +26,37 @@ GATE_THRESHOLDS = {
     "evidence_traceability": 0.99,
     "llm_coverage": 1.0,
 }
+EVIDENCE_TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{2,}")
+POSITIVE_EVIDENCE_HINTS = (
+    "已提供",
+    "已提交",
+    "已附",
+    "提供",
+    "提交",
+    "附",
+    "符合",
+    "满足",
+    "具备",
+    "通过",
+    "有效",
+    "齐全",
+)
+NEGATIVE_EVIDENCE_HINTS = (
+    "未提供",
+    "未提交",
+    "未附",
+    "未见",
+    "缺失",
+    "缺少",
+    "未满足",
+    "不满足",
+    "不符合",
+    "不具备",
+    "不通过",
+    "无效",
+    "无",
+    "没有",
+)
 
 
 def _row_to_block(row: dict[str, Any]) -> Block:
@@ -830,6 +861,242 @@ def _status_confidence_hint(status: str) -> float:
     return 0.30
 
 
+def _normalize_search_text(value: Any) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def _extract_query_terms(values: list[Any], *, limit: int = 16) -> list[str]:
+    def _token_variants(token: str) -> list[str]:
+        variants = [token]
+        # For long Chinese strings, add short contiguous slices to improve recall
+        # without introducing a full tokenizer dependency.
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            for size in (2, 3, 4):
+                if len(token) <= size:
+                    continue
+                for start in range(0, len(token) - size + 1):
+                    variants.append(token[start : start + size])
+        return variants
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        raw = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list, tuple, set)) else str(value or "")
+        for token in EVIDENCE_TOKEN_PATTERN.findall(raw):
+            for variant in _token_variants(_normalize_search_text(token)):
+                if len(variant) < 2 or variant in seen:
+                    continue
+                seen.add(variant)
+                terms.append(variant)
+                if len(terms) >= limit:
+                    return terms
+    return terms
+
+
+def _build_evidence_id_from_row(row: dict[str, Any]) -> str:
+    location = row.get("location") if isinstance(row.get("location"), dict) else {}
+    page = location.get("page") if isinstance(location, dict) else None
+    page_no = page if isinstance(page, int) else 0
+    block_index = location.get("block_index") if isinstance(location, dict) else None
+    block_no = block_index if isinstance(block_index, int) else 0
+    section = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", str((location or {}).get("section") or "NA"))[:16]
+    section = section or "NA"
+    doc_id = str(row.get("doc_id") or "bid")
+    return f"E-{doc_id}-p{page_no}-b{block_no}-s{section}"
+
+
+def _to_evidence_ref(item: dict[str, Any], *, source: str, harvest_score: int | None = None) -> dict[str, Any]:
+    location = item.get("location") if isinstance(item.get("location"), dict) else None
+    evidence_id = str(item.get("evidence_id") or "").strip() or _build_evidence_id_from_row(item)
+    score = _safe_float(item.get("score"))
+    if harvest_score is not None:
+        score = float(harvest_score)
+    return {
+        "evidence_id": evidence_id,
+        "doc_id": item.get("doc_id") or "bid",
+        "location": location,
+        "score": score,
+        "excerpt": item.get("excerpt"),
+        "source": source,
+    }
+
+
+def _merge_evidence_refs(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            evidence_id = str(item.get("evidence_id") or "").strip()
+            if evidence_id in seen:
+                continue
+            seen.add(evidence_id)
+            merged.append(item)
+    return merged
+
+
+def _load_evidence_index(path: Path) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    postings: dict[str, list[str]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return {
+            "records": records,
+            "postings": postings,
+            "by_id": by_id,
+            "stats": {"blocks_indexed": 0, "tokens_indexed": 0},
+        }
+
+    for row in read_jsonl(path):
+        if not isinstance(row, dict):
+            continue
+        evidence_id = str(row.get("evidence_id") or "").strip()
+        if not evidence_id:
+            evidence_id = _build_evidence_id_from_row(row)
+        if evidence_id in by_id:
+            continue
+
+        text = str(row.get("text") or "")
+        terms = _extract_query_terms([text], limit=64)
+        record = {
+            "evidence_id": evidence_id,
+            "doc_id": row.get("doc_id") or "bid",
+            "location": row.get("location"),
+            "excerpt": text[:240],
+            "normalized_text": _normalize_search_text(text),
+            "terms": terms,
+        }
+        records.append(record)
+        by_id[evidence_id] = record
+        for term in terms:
+            postings.setdefault(term, []).append(evidence_id)
+
+    return {
+        "records": records,
+        "postings": postings,
+        "by_id": by_id,
+        "stats": {"blocks_indexed": len(records), "tokens_indexed": len(postings)},
+    }
+
+
+def _evidence_polarity(text: str) -> int:
+    compact = _normalize_search_text(text)
+    if not compact:
+        return 0
+    positive_score = sum(1 for token in POSITIVE_EVIDENCE_HINTS if token in compact)
+    negative_score = sum(1 for token in NEGATIVE_EVIDENCE_HINTS if token in compact)
+    if positive_score > negative_score and positive_score > 0:
+        return 1
+    if negative_score > positive_score and negative_score > 0:
+        return -1
+    return 0
+
+
+def _collect_query_terms_for_requirement(
+    requirement_id: str,
+    finding: dict[str, Any],
+    task_rows: list[dict[str, Any]],
+) -> list[str]:
+    inputs: list[Any] = []
+    for task in task_rows:
+        if not isinstance(task, dict):
+            continue
+        inputs.append(task.get("query"))
+        inputs.append(task.get("expected_logic"))
+    inputs.extend([requirement_id, finding.get("reason"), finding.get("clause_id")])
+    for item in finding.get("evidence") or []:
+        if isinstance(item, dict):
+            inputs.append(item.get("excerpt"))
+    return _extract_query_terms(inputs, limit=120)
+
+
+def _harvest_evidence_refs(
+    evidence_index: dict[str, Any],
+    *,
+    query_terms: list[str],
+    existing_refs: list[dict[str, Any]],
+    status: str,
+    support_top_k: int = 3,
+    counter_top_k: int = 2,
+) -> dict[str, Any]:
+    by_id = evidence_index.get("by_id", {})
+    postings = evidence_index.get("postings", {})
+
+    existing = _merge_evidence_refs(existing_refs)
+    existing_ids = {str(item.get("evidence_id") or "") for item in existing}
+
+    candidate_ids: set[str] = set()
+    for term in query_terms:
+        for evidence_id in postings.get(term, []):
+            candidate_ids.add(str(evidence_id))
+
+    if not candidate_ids:
+        candidate_ids = {str(item.get("evidence_id") or "") for item in by_id.values()}
+
+    ranked: list[dict[str, Any]] = []
+    for evidence_id in candidate_ids:
+        record = by_id.get(evidence_id)
+        if not isinstance(record, dict):
+            continue
+        normalized_text = str(record.get("normalized_text") or "")
+        hit_count = sum(1 for term in query_terms if term and term in normalized_text)
+        if hit_count <= 0 and query_terms:
+            continue
+        polarity = _evidence_polarity(str(record.get("excerpt") or ""))
+        rank_score = hit_count * 4 + (2 if _is_mappable_location(record.get("location")) else 0)
+        ranked.append(
+            {
+                **record,
+                "hit_count": hit_count,
+                "harvest_score": rank_score,
+                "polarity": polarity,
+            }
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            int(item.get("harvest_score") or 0),
+            int(item.get("hit_count") or 0),
+            len(str(item.get("excerpt") or "")),
+        ),
+        reverse=True,
+    )
+
+    expected_sign = 1 if status == "pass" else -1 if status == "fail" else 0
+    harvested_support: list[dict[str, Any]] = []
+    harvested_counter: list[dict[str, Any]] = []
+    for item in ranked:
+        evidence_id = str(item.get("evidence_id") or "")
+        if not evidence_id or evidence_id in existing_ids:
+            continue
+        polarity = int(item.get("polarity") or 0)
+        ref = _to_evidence_ref(item, source="evidence_harvester", harvest_score=int(item.get("harvest_score") or 0))
+        if expected_sign != 0 and polarity == -expected_sign and len(harvested_counter) < counter_top_k:
+            harvested_counter.append(ref)
+            continue
+        if len(harvested_support) < support_top_k:
+            harvested_support.append(ref)
+        if len(harvested_support) >= support_top_k and len(harvested_counter) >= counter_top_k:
+            break
+
+    existing_counter: list[dict[str, Any]] = []
+    if expected_sign != 0:
+        for item in existing:
+            if _evidence_polarity(str(item.get("excerpt") or "")) == -expected_sign:
+                existing_counter.append(item)
+
+    support_refs = _merge_evidence_refs(existing, harvested_support)
+    counter_refs = _merge_evidence_refs(existing_counter, harvested_counter)
+    return {
+        "support_refs": support_refs,
+        "counter_refs": counter_refs,
+        "query_terms": query_terms,
+    }
+
+
 def _requirement_task_id(requirement_id: str, index: int) -> str:
     token = "".join(ch for ch in requirement_id if ch.isalnum())
     if not token:
@@ -870,6 +1137,7 @@ def plan_tasks(out_dir: Path, resume: bool = False) -> dict[str, Any]:
 def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     findings_path = out_dir / "findings.jsonl"
     tasks_path = out_dir / "review-tasks.jsonl"
+    bid_blocks_path = out_dir / "ingest" / "bid_blocks.jsonl"
     verdicts_path = out_dir / "verdicts.jsonl"
     if path_ready(verdicts_path, resume):
         rows = list(read_jsonl(verdicts_path))
@@ -881,28 +1149,56 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         return {"verdicts": len(rows), "status_counts": dict(counts), "llm_coverage": llm_coverage}
 
     task_by_requirement: dict[str, str] = {}
+    tasks_by_requirement: dict[str, list[dict[str, Any]]] = {}
     if tasks_path.exists():
         for row in read_jsonl(tasks_path):
             requirement_id = str(row.get("requirement_id") or "").strip()
             task_id = str(row.get("task_id") or "").strip()
             if requirement_id and task_id and requirement_id not in task_by_requirement:
                 task_by_requirement[requirement_id] = task_id
+            if requirement_id:
+                tasks_by_requirement.setdefault(requirement_id, []).append(row)
+
+    evidence_index = _load_evidence_index(bid_blocks_path)
+    evidence_index_stats = dict(evidence_index.get("stats") or {})
 
     finding_rows = list(read_jsonl(findings_path))
     verdict_rows: list[dict[str, Any]] = []
     for index, finding in enumerate(finding_rows, start=1):
         requirement_id = str(finding.get("requirement_id") or f"R{index:04d}")
+        task_rows = tasks_by_requirement.get(requirement_id, [])
         status = str(finding.get("status") or "risk")
         llm = finding.get("llm") if isinstance(finding.get("llm"), dict) else {}
         confidence = _safe_float((llm or {}).get("confidence"))
         if confidence is None:
             confidence = _status_confidence_hint(status)
         confidence = max(0.0, min(1.0, confidence))
-        evidence_refs = [
-            str(item.get("evidence_id"))
+        existing_refs = [
+            _to_evidence_ref(item, source="finding")
             for item in (finding.get("evidence") or [])
-            if isinstance(item, dict) and item.get("evidence_id")
+            if isinstance(item, dict)
         ]
+        query_terms = _collect_query_terms_for_requirement(requirement_id, finding, task_rows)
+        harvested = _harvest_evidence_refs(
+            evidence_index,
+            query_terms=query_terms,
+            existing_refs=existing_refs,
+            status=status,
+        )
+        support_refs = list(harvested.get("support_refs") or [])
+        counter_refs = list(harvested.get("counter_refs") or [])
+        evidence_refs = [str(item.get("evidence_id")) for item in support_refs if item.get("evidence_id")]
+        counter_evidence_refs = [str(item.get("evidence_id")) for item in counter_refs if item.get("evidence_id")]
+
+        reason = str(finding.get("reason") or "")
+        status_before_audit = status
+        downgrade_action: str | None = None
+        if status == "pass" and counter_evidence_refs:
+            status = "risk"
+            reason = "命中反证/冲突证据，pass结论不稳定，已降级为risk"
+            confidence = min(confidence, 0.55)
+            downgrade_action = "downgrade_pass_to_risk_conflict"
+
         model = {}
         provider = str((llm or {}).get("provider") or "")
         model_name = str((llm or {}).get("model") or "")
@@ -912,6 +1208,27 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         decision_trace = finding.get("decision_trace")
         if not isinstance(decision_trace, dict):
             decision_trace = {"source": "pipeline_findings_bridge", "fallbacks": []}
+        decision_trace["evidence_index"] = evidence_index_stats
+        decision_trace["evidence_harvest"] = {
+            "query_terms": query_terms,
+            "support_refs": support_refs,
+        }
+        decision_trace["counter_evidence_audit"] = {
+            "counter_evidence_refs": counter_refs,
+            "conflict_detected": bool(counter_evidence_refs),
+            "status_before": status_before_audit,
+            "status_after": status,
+            "action": downgrade_action,
+        }
+        decision_trace["evidence_refs"] = support_refs
+        decision_trace["counter_evidence_refs"] = counter_refs
+        decision_trace.setdefault("decision", {})
+        if isinstance(decision_trace.get("decision"), dict):
+            decision_trace["decision"]["status"] = status
+            decision_trace["decision"]["reason"] = reason
+            decision_trace["decision"]["source"] = (
+                "pipeline_counter_evidence_audit" if downgrade_action else "pipeline_findings_bridge"
+            )
 
         verdict_rows.append(
             {
@@ -919,9 +1236,9 @@ def verdict(out_dir: Path, resume: bool = False) -> dict[str, Any]:
                 "requirement_id": requirement_id,
                 "status": status,
                 "confidence": confidence,
-                "reason": str(finding.get("reason") or ""),
+                "reason": reason,
                 "evidence_refs": evidence_refs,
-                "counter_evidence_refs": [],
+                "counter_evidence_refs": counter_evidence_refs,
                 "model": model,
                 "decision_trace": decision_trace,
             }
