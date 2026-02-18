@@ -1,12 +1,45 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from bidagent.ocr import iter_pdf_ocr_blocks
+from bidagent.ocr import iter_pdf_ocr_blocks, load_ocr_engine
+
+
+class OcrBackendSelectionTests(unittest.TestCase):
+    def test_load_engine_prefers_paddle_in_auto_mode(self) -> None:
+        with (
+            patch.dict(os.environ, {"BIDAGENT_OCR_BACKEND": "auto"}, clear=False),
+            patch("bidagent.ocr._load_paddle_engine", return_value=lambda _data: "paddle"),
+            patch("bidagent.ocr._load_tesseract_engine", return_value=lambda _data: "tesseract"),
+        ):
+            engine = load_ocr_engine("auto")
+        self.assertIsNotNone(engine)
+        self.assertEqual(engine(b"demo"), "paddle")
+
+    def test_load_engine_fallbacks_to_tesseract_when_paddle_missing(self) -> None:
+        with (
+            patch.dict(os.environ, {"BIDAGENT_OCR_BACKEND": "auto"}, clear=False),
+            patch("bidagent.ocr._load_paddle_engine", return_value=None),
+            patch("bidagent.ocr._load_tesseract_engine", return_value=lambda _data: "tesseract"),
+        ):
+            engine = load_ocr_engine("auto")
+        self.assertIsNotNone(engine)
+        self.assertEqual(engine(b"demo"), "tesseract")
+
+    def test_load_engine_honors_tesseract_mode(self) -> None:
+        with (
+            patch.dict(os.environ, {"BIDAGENT_OCR_BACKEND": "paddle"}, clear=False),
+            patch("bidagent.ocr._load_paddle_engine", return_value=lambda _data: "paddle"),
+            patch("bidagent.ocr._load_tesseract_engine", return_value=lambda _data: "tesseract"),
+        ):
+            engine = load_ocr_engine("tesseract")
+        self.assertIsNotNone(engine)
+        self.assertEqual(engine(b"demo"), "tesseract")
 
 
 @unittest.skipUnless(importlib.util.find_spec("pypdf") is not None, "pypdf is required")

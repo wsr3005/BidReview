@@ -20,6 +20,28 @@ DEFAULT_TESSERACT_CANDIDATES = [
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
 ]
+DEFAULT_TESSERACT_LANG = "chi_sim+eng"
+DEFAULT_TESSERACT_CONFIG = "--oem 1 --psm 6"
+OCR_BACKEND_CANDIDATES = ("paddle", "tesseract")
+
+
+def _resolve_backend_preference(mode: str) -> str:
+    if mode == "tesseract":
+        return "tesseract"
+    env_value = str(os.getenv("BIDAGENT_OCR_BACKEND") or "").strip().lower()
+    if env_value in {"paddle", "tesseract"}:
+        return env_value
+    return "auto"
+
+
+def _backend_order(mode: str) -> list[str]:
+    preference = _resolve_backend_preference(mode)
+    if preference == "paddle":
+        return ["paddle", "tesseract"]
+    if preference == "tesseract":
+        return ["tesseract", "paddle"]
+    # auto: prefer PaddleOCR-VL style backend when available, then fallback to tesseract.
+    return ["paddle", "tesseract"]
 
 
 def _resolve_tesseract_cmd() -> str | None:
@@ -35,6 +57,58 @@ def _resolve_tesseract_cmd() -> str | None:
         if Path(candidate).exists():
             return candidate
     return None
+
+
+def _tesseract_selfcheck() -> dict[str, Any]:
+    payload: dict[str, Any] = {"engine": "tesseract"}
+
+    try:
+        import pytesseract  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except ModuleNotFoundError as exc:
+        payload.update({"engine_available": False, "reason": f"missing python deps: {exc.name}"})
+        return payload
+
+    cmd = _resolve_tesseract_cmd()
+    if not cmd:
+        payload.update({"engine_available": False, "reason": "tesseract binary not found (install it or set TESSERACT_CMD)"})
+        return payload
+
+    # Avoid calling pytesseract.get_tesseract_version() directly: on some Windows setups it can hang.
+    version = None
+    try:
+        proc = subprocess.run(
+            [cmd, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        version = (proc.stdout or proc.stderr or "").splitlines()[0].strip() if (proc.stdout or proc.stderr) else None
+    except Exception:
+        version = None
+
+    if not version:
+        payload.update({"engine_available": False, "reason": "tesseract binary detected but version check failed"})
+        return payload
+
+    payload.update({"engine_available": True, "tesseract_version": version})
+    return payload
+
+
+def _paddle_selfcheck() -> dict[str, Any]:
+    payload: dict[str, Any] = {"engine": "paddle"}
+    try:
+        import numpy  # noqa: F401
+        from PIL import Image  # noqa: F401
+        import paddleocr
+    except ModuleNotFoundError as exc:
+        payload.update({"engine_available": False, "reason": f"missing python deps: {exc.name}"})
+        return payload
+
+    version = getattr(paddleocr, "__version__", None)
+    payload.update({"engine_available": True, "paddleocr_version": version})
+    return payload
 
 
 def ocr_selfcheck(mode: str) -> dict[str, Any]:
@@ -53,53 +127,23 @@ def ocr_selfcheck(mode: str) -> dict[str, Any]:
             "reason": "unknown ocr mode",
         }
 
-    try:
-        import pytesseract  # noqa: F401
-        from PIL import Image  # noqa: F401
-    except ModuleNotFoundError as exc:
-        return {
-            "mode": mode,
-            "engine": "tesseract",
-            "engine_available": False,
-            "reason": f"missing python deps: {exc.name}",
-        }
-
-    cmd = _resolve_tesseract_cmd()
-    if not cmd:
-        return {
-            "mode": mode,
-            "engine": "tesseract",
-            "engine_available": False,
-            "reason": "tesseract binary not found (install it or set TESSERACT_CMD)",
-        }
-
-    # Avoid calling pytesseract.get_tesseract_version() directly: on some Windows setups it can hang.
-    version = None
-    try:
-        proc = subprocess.run(
-            [cmd, "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        version = (proc.stdout or proc.stderr or "").splitlines()[0].strip() if (proc.stdout or proc.stderr) else None
-    except Exception:
-        version = None
-
-    if not version:
-        return {
-            "mode": mode,
-            "engine": "tesseract",
-            "engine_available": False,
-            "reason": "tesseract binary detected but version check failed",
-        }
+    reasons: list[str] = []
+    for backend in _backend_order(mode):
+        if backend == "paddle":
+            check = _paddle_selfcheck()
+        else:
+            check = _tesseract_selfcheck()
+        if bool(check.get("engine_available")):
+            return {"mode": mode, **check}
+        reason = str(check.get("reason") or "").strip()
+        if reason:
+            reasons.append(f"{backend}:{reason}")
 
     return {
         "mode": mode,
-        "engine": "tesseract",
-        "engine_available": True,
-        "tesseract_version": version,
+        "engine": _backend_order(mode)[0] if _backend_order(mode) else None,
+        "engine_available": False,
+        "reason": "; ".join(reasons) if reasons else "no OCR backend available",
     }
 
 
@@ -114,10 +158,46 @@ def _load_tesseract_engine() -> Callable[[bytes], str] | None:
     if not cmd:
         return None
     pytesseract.pytesseract.tesseract_cmd = cmd
+    lang = str(os.getenv("BIDAGENT_TESSERACT_LANG") or DEFAULT_TESSERACT_LANG).strip() or DEFAULT_TESSERACT_LANG
+    extra_config = str(os.getenv("BIDAGENT_TESSERACT_CONFIG") or DEFAULT_TESSERACT_CONFIG).strip()
 
     def _extract(image_bytes: bytes) -> str:
         with Image.open(io.BytesIO(image_bytes)) as image:
-            return pytesseract.image_to_string(image, lang="chi_sim+eng")
+            rgb = image.convert("RGB")
+            return pytesseract.image_to_string(rgb, lang=lang, config=extra_config)
+
+    return _extract
+
+
+def _load_paddle_engine() -> Callable[[bytes], str] | None:
+    try:
+        import numpy as np
+        from PIL import Image
+        from paddleocr import PaddleOCR
+    except ModuleNotFoundError:
+        return None
+
+    ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+
+    def _extract(image_bytes: bytes) -> str:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            rgb = image.convert("RGB")
+            image_array = np.array(rgb)
+        result = ocr.ocr(image_array, cls=True)
+        lines: list[str] = []
+        for page in result or []:
+            if not page:
+                continue
+            for item in page:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                rec = item[1]
+                if not isinstance(rec, (list, tuple)) or not rec:
+                    continue
+                text = str(rec[0] or "").strip()
+                if text:
+                    lines.append(text)
+        return "\n".join(lines)
 
     return _extract
 
@@ -125,8 +205,15 @@ def _load_tesseract_engine() -> Callable[[bytes], str] | None:
 def load_ocr_engine(mode: str) -> Callable[[bytes], str] | None:
     if mode == "off":
         return None
-    if mode in {"auto", "tesseract"}:
-        return _load_tesseract_engine()
+    if mode not in {"auto", "tesseract"}:
+        return None
+    for backend in _backend_order(mode):
+        if backend == "paddle":
+            engine = _load_paddle_engine()
+        else:
+            engine = _load_tesseract_engine()
+        if engine is not None:
+            return engine
     return None
 
 
