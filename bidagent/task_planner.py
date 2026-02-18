@@ -152,12 +152,34 @@ def ensure_review_tasks(
     requirements_path: Path,
     review_tasks_path: Path,
     *,
+    requirements_atomic_path: Path | None = None,
     resume: bool = False,
 ) -> list[dict[str, Any]]:
+    def _load_atomic_enabled_ids(path: Path) -> set[str]:
+        enabled_ids: set[str] = set()
+        for row in read_jsonl(path):
+            if not isinstance(row, dict):
+                continue
+            requirement_id = str(row.get("requirement_id") or "").strip()
+            if not requirement_id:
+                continue
+            classification = str(row.get("classification") or "").strip()
+            engine_enabled = bool(row.get("engine_enabled"))
+            if classification and not engine_enabled:
+                if classification != "fluff":
+                    enabled_ids.add(requirement_id)
+                continue
+            if engine_enabled or classification != "fluff":
+                enabled_ids.add(requirement_id)
+        return enabled_ids
+
     if path_ready(review_tasks_path, resume):
         return list(read_jsonl(review_tasks_path))
 
     requirements = load_requirements(requirements_path)
+    if requirements_atomic_path is not None and requirements_atomic_path.exists():
+        enabled_requirement_ids = _load_atomic_enabled_ids(requirements_atomic_path)
+        requirements = [item for item in requirements if item.requirement_id in enabled_requirement_ids]
     planned = plan_review_tasks(requirements)
     review_tasks_path.parent.mkdir(parents=True, exist_ok=True)
     write_jsonl(review_tasks_path, planned)
@@ -168,12 +190,14 @@ def plan_review_tasks_file(
     requirements_path: Path,
     review_tasks_path: Path,
     *,
+    requirements_atomic_path: Path | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
     used_existing = path_ready(review_tasks_path, resume)
     tasks = ensure_review_tasks(
         requirements_path=requirements_path,
         review_tasks_path=review_tasks_path,
+        requirements_atomic_path=requirements_atomic_path,
         resume=resume,
     )
     return {

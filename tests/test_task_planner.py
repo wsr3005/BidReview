@@ -107,6 +107,63 @@ class TaskPlannerTests(unittest.TestCase):
             self.assertEqual(len(reused), 1)
             self.assertEqual(reused[0]["task_id"], "T-R9999-01")
 
+    def test_ensure_review_tasks_skips_fluff_requirements_with_atomic_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            requirements_path = base / "requirements.jsonl"
+            requirements_atomic_path = base / "requirements.atomic.jsonl"
+            review_tasks_path = base / "review-tasks.jsonl"
+
+            write_jsonl(
+                requirements_path,
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "text": "详见附件模板格式说明。",
+                        "category": "商务其他",
+                        "mandatory": False,
+                        "keywords": ["模板"],
+                        "constraints": [],
+                        "rule_tier": "general",
+                    },
+                    {
+                        "requirement_id": "R0002",
+                        "text": "必须提供营业执照。",
+                        "category": "资质",
+                        "mandatory": True,
+                        "keywords": ["营业执照"],
+                        "constraints": [],
+                        "rule_tier": "hard_fail",
+                    },
+                ],
+            )
+            write_jsonl(
+                requirements_atomic_path,
+                [
+                    {
+                        "atomic_id": "R0001-A01",
+                        "requirement_id": "R0001",
+                        "classification": "fluff",
+                        "engine_enabled": False,
+                    },
+                    {
+                        "atomic_id": "R0002-A01",
+                        "requirement_id": "R0002",
+                        "classification": "hard",
+                        "engine_enabled": True,
+                    },
+                ],
+            )
+
+            generated = ensure_review_tasks(
+                requirements_path=requirements_path,
+                requirements_atomic_path=requirements_atomic_path,
+                review_tasks_path=review_tasks_path,
+                resume=False,
+            )
+            self.assertTrue(generated)
+            self.assertTrue(all(row["requirement_id"] == "R0002" for row in generated))
+
 
 if __name__ == "__main__":
     unittest.main()

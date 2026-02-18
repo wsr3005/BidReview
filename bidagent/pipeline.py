@@ -1868,8 +1868,14 @@ def _requirement_task_id(requirement_id: str, index: int) -> str:
 
 def plan_tasks(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     requirements_path = out_dir / "requirements.jsonl"
+    requirements_atomic_path = out_dir / "requirements.atomic.jsonl"
     tasks_path = out_dir / "review-tasks.jsonl"
-    tasks = ensure_review_tasks(requirements_path=requirements_path, review_tasks_path=tasks_path, resume=resume)
+    tasks = ensure_review_tasks(
+        requirements_path=requirements_path,
+        requirements_atomic_path=requirements_atomic_path,
+        review_tasks_path=tasks_path,
+        resume=resume,
+    )
     return {"review_tasks": len(tasks)}
 
 
