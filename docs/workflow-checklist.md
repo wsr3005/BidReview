@@ -33,7 +33,7 @@ Optional matrix runner: `.\scripts\test-matrix.ps1 -Level t0|t1|t2|rc`.
 6. If gold data exists, run evaluation metrics and verify thresholds.
    Recommended when gold fixtures are changed: `uv run python scripts/validate-goldset.py`
 7. If any gate fails: fix -> rerun failed gate -> rerun full gate.
-8. Verify release artifacts for release lanes: `release/run-metadata.json`, `release/canary-result.json`, `release/release-trace.json`.
+8. Verify release artifacts for release lanes: `cross-audit.jsonl`, `ingest/entity-pool.json`, `release/run-metadata.json`, `release/canary-result.json`, `release/release-trace.json`.
 9. Prepare handoff summary.
 
 ## Handoff Template

@@ -47,7 +47,13 @@ def iter_txt_blocks(path: Path, doc_id: str) -> Iterator[Block]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     for chunk in split_text_blocks(text):
         index += 1
-        yield Block(doc_id=doc_id, text=chunk, location=Location(block_index=index))
+        yield Block(
+            doc_id=doc_id,
+            text=chunk,
+            location=Location(block_index=index),
+            block_type="text",
+            section_hint="txt",
+        )
 
 
 def iter_docx_blocks(path: Path, doc_id: str) -> Iterator[Block]:
@@ -77,6 +83,8 @@ def iter_docx_blocks(path: Path, doc_id: str) -> Iterator[Block]:
                         doc_id=doc_id,
                         text=chunk,
                         location=Location(block_index=index, section=section),
+                        block_type="text",
+                        section_hint=section,
                     )
 
 
@@ -106,6 +114,8 @@ def iter_pdf_blocks(path: Path, doc_id: str, page_range: tuple[int, int] | None)
                 doc_id=doc_id,
                 text=chunk,
                 location=Location(block_index=index, page=page_no),
+                block_type="text",
+                section_hint="pdf_page_text",
             )
 
 
@@ -125,4 +135,3 @@ def iter_document_blocks(
         yield from iter_pdf_blocks(path, doc_id, page_range)
         return
     raise ValueError(f"unsupported file type: {path.suffix}")
-

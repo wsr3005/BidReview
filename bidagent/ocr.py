@@ -343,6 +343,8 @@ def iter_docx_ocr_blocks(
                                 doc_id=doc_id,
                                 text=chunk,
                                 location=Location(block_index=current_index, section="OCR_MEDIA"),
+                                block_type="ocr",
+                                section_hint="OCR_MEDIA",
                             )
                     next_seq += 1
 
@@ -362,6 +364,8 @@ def iter_docx_ocr_blocks(
                             doc_id=doc_id,
                             text=chunk,
                             location=Location(block_index=current_index, section="OCR_MEDIA"),
+                            block_type="ocr",
+                            section_hint="OCR_MEDIA",
                         )
                 next_seq += 1
 
@@ -485,6 +489,8 @@ def iter_pdf_ocr_blocks(
                                 doc_id=doc_id,
                                 text=chunk,
                                 location=Location(block_index=current_index, page=page_for_text, section="OCR_MEDIA"),
+                                block_type="ocr",
+                                section_hint="OCR_MEDIA",
                             )
                     next_seq += 1
 
@@ -503,6 +509,8 @@ def iter_pdf_ocr_blocks(
                         doc_id=doc_id,
                         text=chunk,
                         location=Location(block_index=current_index, page=page_for_text, section="OCR_MEDIA"),
+                        block_type="ocr",
+                        section_hint="OCR_MEDIA",
                     )
             next_seq += 1
 

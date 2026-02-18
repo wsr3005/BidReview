@@ -13,13 +13,95 @@ from bidagent.review import (
 
 
 class ReviewTests(unittest.TestCase):
+    def test_extract_requirements_with_llm_routes_profile_and_skips_irrelevant_appendix(self) -> None:
+        class _ProfileExtractor:
+            provider = "mock"
+            model = "mock-model"
+            prompt_version = "mock-v1"
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def extract_requirements(self, *, block_text: str, focus: str, profile: str = "biz") -> list[dict[str, Any]]:
+                self.calls.append(profile)
+                if profile == "hf":
+                    return [
+                        {
+                            "text": "投标人必须满足资格条件，否则将被否决。",
+                            "category": "资质与证照",
+                            "mandatory": True,
+                            "rule_tier": "hard_fail",
+                            "keywords": ["资格条件", "否决"],
+                            "confidence": 0.9,
+                        }
+                    ]
+                if profile == "tech":
+                    return [
+                        {
+                            "text": "投标人必须在商务偏离表中说明关键技术偏离并提交。",
+                            "category": "有效期与响应",
+                            "mandatory": True,
+                            "rule_tier": "general",
+                            "keywords": ["技术偏离", "商务偏离表"],
+                            "confidence": 0.88,
+                        }
+                    ]
+                return [
+                    {
+                        "text": "投标人必须提供营业执照复印件。",
+                        "category": "资质与证照",
+                        "mandatory": True,
+                        "rule_tier": "hard_fail",
+                        "keywords": ["营业执照"],
+                        "confidence": 0.92,
+                    }
+                ]
+
+        extractor = _ProfileExtractor()
+        blocks = [
+            Block(
+                doc_id="tender",
+                text="不满足资格条件将被否决。",
+                location=Location(block_index=1, section_tag="evaluation_risk"),
+            ),
+            Block(
+                doc_id="tender",
+                text="投标人必须提供营业执照复印件。",
+                location=Location(block_index=2, section_tag="business_contract"),
+            ),
+            Block(
+                doc_id="tender",
+                text="技术偏离需在商务偏离表中明确说明并提交。",
+                location=Location(block_index=3, section_tag="technical_spec"),
+            ),
+            Block(
+                doc_id="tender",
+                text="附件格式模板（空白页）",
+                location=Location(block_index=4, section_tag="format_appendix"),
+            ),
+        ]
+
+        requirements, stats = extract_requirements_with_llm(blocks, focus="business", extractor=extractor)
+        self.assertGreaterEqual(len(requirements), 3)
+        self.assertIn("hf", extractor.calls)
+        self.assertIn("biz", extractor.calls)
+        self.assertIn("tech", extractor.calls)
+        self.assertNotIn("appendix", extractor.calls)
+        self.assertEqual(int(stats.get("appendix_skipped_batches") or 0), 1)
+        extraction_profiles = {
+            str((item.source.get("extraction") or {}).get("profile") or "")
+            for item in requirements
+            if isinstance(item.source, dict)
+        }
+        self.assertTrue({"hf", "biz", "tech"}.issubset(extraction_profiles))
+
     def test_extract_requirements_with_llm_validates_schema(self) -> None:
         class _FakeExtractor:
             provider = "mock"
             model = "mock-model"
             prompt_version = "mock-v1"
 
-            def extract_requirements(self, *, block_text: str, focus: str) -> list[dict[str, Any]]:
+            def extract_requirements(self, *, block_text: str, focus: str, profile: str = "biz") -> list[dict[str, Any]]:
                 return [
                     {
                         "text": "投标人必须提供有效营业执照复印件。",
@@ -65,7 +147,7 @@ class ReviewTests(unittest.TestCase):
             model = "mock-model"
             prompt_version = "mock-v1"
 
-            def extract_requirements(self, *, block_text: str, focus: str) -> list[dict[str, Any]]:
+            def extract_requirements(self, *, block_text: str, focus: str, profile: str = "biz") -> list[dict[str, Any]]:
                 raise RuntimeError("request timeout")
 
         blocks = [

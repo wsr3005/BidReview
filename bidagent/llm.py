@@ -264,9 +264,19 @@ class DeepSeekRequirementExtractor:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, int(max_retries))
 
-    def _build_messages(self, *, block_text: str, focus: str) -> list[dict[str, str]]:
+    def _build_messages(self, *, block_text: str, focus: str, profile: str) -> list[dict[str, str]]:
+        profile_token = str(profile or "biz").strip().lower()
+        if profile_token not in {"hf", "biz", "tech", "appendix"}:
+            profile_token = "biz"
+        profile_guidance = {
+            "hf": "优先提取否决/废标/资格性强约束条款。",
+            "biz": "优先提取商务、资质、合同、付款、保证金等可核验条款。",
+            "tech": "仅提取会影响商务合规结论的关键技术偏离条款，忽略纯技术细节。",
+            "appendix": "默认忽略附录模板内容，只有出现明确强制义务时才提取。",
+        }[profile_token]
         payload = {
             "focus": focus,
+            "profile": profile_token,
             "task": "从招标文本中提取可核验的商务条款，必须输出JSON。",
             "schema": {
                 "items": [
@@ -284,6 +294,7 @@ class DeepSeekRequirementExtractor:
                 "只提取投标人义务条款，不提取评标流程描述",
                 "不要输出目录、模板说明、章节标题",
                 "不能编造原文不存在的金额、期限、资质",
+                profile_guidance,
             ],
             "text": block_text[:2400],
         }
@@ -301,11 +312,11 @@ class DeepSeekRequirementExtractor:
             },
         ]
 
-    def extract_requirements(self, *, block_text: str, focus: str) -> list[dict[str, Any]]:
+    def extract_requirements(self, *, block_text: str, focus: str, profile: str = "biz") -> list[dict[str, Any]]:
         payload = {
             "model": self.model,
             "temperature": 0.1,
-            "messages": self._build_messages(block_text=block_text, focus=focus),
+            "messages": self._build_messages(block_text=block_text, focus=focus, profile=profile),
         }
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(

@@ -247,6 +247,8 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertEqual(rows[-1]["location"]["section"], "OCR_MEDIA")
             self.assertEqual((result.get("doc_map") or {}).get("docs"), 2)
             self.assertTrue((out_dir / "ingest" / "doc-map.json").exists())
+            self.assertTrue((out_dir / "ingest" / "entity-pool.json").exists())
+            self.assertIn("entity_pool", result)
 
     def test_plan_tasks_uses_requirement_decomposition(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -833,6 +835,80 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertIn(second_pass.get("conflict_level"), {"strong", "weak", "none", None})
             self.assertEqual((trace.get("decision") or {}).get("status"), "risk")
 
+    def test_verdict_cross_audit_downgrades_single_channel_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "text": "投标人必须提供营业执照复印件。",
+                        "mandatory": True,
+                        "rule_tier": "hard_fail",
+                        "keywords": ["营业执照"],
+                    }
+                ],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "block_id": "B-bid-1",
+                        "block_type": "text",
+                        "section_hint": "body",
+                        "text": "我司已提供营业执照复印件，符合要求。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "pass",
+                        "score": 3,
+                        "severity": "none",
+                        "reason": "匹配到证据",
+                        "evidence": [
+                            {
+                                "evidence_id": "E-B-bid-1",
+                                "block_id": "B-bid-1",
+                                "doc_id": "bid",
+                                "source_type": "text",
+                                "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                                "excerpt": "我司已提供营业执照复印件，符合要求。",
+                                "score": 3,
+                            }
+                        ],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+
+            result = verdict(out_dir=out_dir, resume=False)
+            self.assertEqual(result["verdicts"], 1)
+            self.assertEqual(result.get("cross_audit"), 1)
+            self.assertEqual(result.get("cross_audit_required"), 1)
+            self.assertEqual(result.get("cross_audit_verified"), 0)
+
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(rows[0]["status"], "risk")
+            trace = rows[0].get("decision_trace") or {}
+            cross = trace.get("cross_audit") or {}
+            self.assertTrue(cross.get("required"))
+            self.assertFalse(cross.get("cross_verified"))
+            self.assertEqual(cross.get("action"), "downgrade_pass_to_risk_cross_verification")
+
+            audit_rows = list(read_jsonl(out_dir / "cross-audit.jsonl"))
+            self.assertEqual(len(audit_rows), 1)
+            self.assertEqual(audit_rows[0].get("status_after"), "risk")
+
     def test_run_pipeline_writes_release_hardening_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -858,8 +934,10 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertTrue((out_dir / "review-tasks.jsonl").exists())
             self.assertTrue((out_dir / "requirements.atomic.jsonl").exists())
             self.assertTrue((out_dir / "evidence-packs.jsonl").exists())
+            self.assertTrue((out_dir / "cross-audit.jsonl").exists())
             self.assertTrue((out_dir / "verdicts.jsonl").exists())
             self.assertTrue((out_dir / "gate-result.json").exists())
+            self.assertTrue((out_dir / "ingest" / "entity-pool.json").exists())
             self.assertTrue((out_dir / "release" / "run-metadata.json").exists())
             self.assertTrue((out_dir / "release" / "canary-result.json").exists())
             self.assertTrue((out_dir / "release" / "release-trace.json").exists())

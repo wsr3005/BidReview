@@ -453,7 +453,7 @@ class RequirementExtractor(Protocol):
     model: str
     prompt_version: str
 
-    def extract_requirements(self, *, block_text: str, focus: str) -> list[dict[str, Any]]:
+    def extract_requirements(self, *, block_text: str, focus: str, profile: str = "biz") -> list[dict[str, Any]]:
         ...
 
 
@@ -464,6 +464,7 @@ def _build_validated_requirement_from_llm(
     focus: str,
     extractor: RequirementExtractor,
     min_confidence: float,
+    profile: str,
 ) -> Requirement | None:
     text = str(raw_item.get("text") or "").strip()
     if not text:
@@ -525,6 +526,7 @@ def _build_validated_requirement_from_llm(
                 "provider": extractor.provider,
                 "model": extractor.model,
                 "prompt_version": extractor.prompt_version,
+                "profile": profile,
                 "confidence": round(confidence_value, 4),
             },
         },
@@ -579,25 +581,45 @@ def _iter_extraction_batches(
     *,
     batch_size: int,
     batch_max_chars: int,
-) -> Iterable[list[Block]]:
+) -> Iterable[tuple[str, list[Block]]]:
+    def _profile_for_block(block: Block) -> str:
+        section_tag = str(getattr(block.location, "section_tag", "") or "").strip().lower()
+        section_hint = str(getattr(block, "section_hint", "") or "").strip().lower()
+        section = str(getattr(block.location, "section", "") or "").strip().lower()
+        probe = " ".join((section_tag, section_hint, section))
+        if "evaluation_risk" in probe or any(token in probe for token in ("评标", "评审", "否决", "废标")):
+            return "hf"
+        if "technical_spec" in probe or any(token in probe for token in ("技术", "参数", "规格", "性能", "方案")):
+            return "tech"
+        if "format_appendix" in probe or any(token in probe for token in ("附件", "附表", "格式", "模板")):
+            return "appendix"
+        return "biz"
+
     current_batch: list[Block] = []
     current_chars = 0
+    current_profile: str | None = None
     for block in tender_blocks:
         text = str(block.text or "").strip()
         if not text:
             continue
+        profile = _profile_for_block(block)
         block_chars = len(text)
         should_flush = bool(current_batch) and (
-            len(current_batch) >= batch_size or current_chars + block_chars > batch_max_chars
+            len(current_batch) >= batch_size
+            or current_chars + block_chars > batch_max_chars
+            or (current_profile is not None and current_profile != profile)
         )
         if should_flush:
-            yield current_batch
+            yield current_profile or "biz", current_batch
             current_batch = []
             current_chars = 0
+            current_profile = None
+        if current_profile is None:
+            current_profile = profile
         current_batch.append(block)
         current_chars += block_chars
     if current_batch:
-        yield current_batch
+        yield current_profile or "biz", current_batch
 
 
 def _merge_batch_text(batch: list[Block]) -> str:
@@ -638,8 +660,11 @@ def extract_requirements_with_llm(
         "items_accepted": 0,
         "items_rejected": 0,
         "errors": 0,
+        "profile_batches": {},
+        "profile_blocks": {},
+        "appendix_skipped_batches": 0,
     }
-    for batch in _iter_extraction_batches(
+    for profile, batch in _iter_extraction_batches(
         tender_blocks,
         batch_size=resolved_batch_size,
         batch_max_chars=resolved_batch_max_chars,
@@ -647,10 +672,19 @@ def extract_requirements_with_llm(
         merged_text = _merge_batch_text(batch)
         if not merged_text:
             continue
+        profile_batches = stats.setdefault("profile_batches", {})
+        profile_batches[profile] = int(profile_batches.get(profile, 0)) + 1
+        profile_blocks = stats.setdefault("profile_blocks", {})
+        profile_blocks[profile] = int(profile_blocks.get(profile, 0)) + len(batch)
         stats["batches_total"] = int(stats["batches_total"]) + 1
         stats["blocks_total"] = int(stats["blocks_total"]) + len(batch)
+        if profile == "appendix" and not any(
+            token in merged_text for token in ("必须", "应", "须", "不得", "提供", "提交", "满足", "符合")
+        ):
+            stats["appendix_skipped_batches"] = int(stats["appendix_skipped_batches"]) + 1
+            continue
         try:
-            raw_items = extractor.extract_requirements(block_text=merged_text, focus=focus)
+            raw_items = extractor.extract_requirements(block_text=merged_text, focus=focus, profile=profile)
         except Exception as exc:  # noqa: BLE001
             stats["errors"] = int(stats["errors"]) + 1
             stats["fallback_batches"] = int(stats["fallback_batches"]) + 1
@@ -675,6 +709,7 @@ def extract_requirements_with_llm(
                 focus=focus,
                 extractor=extractor,
                 min_confidence=min_confidence,
+                profile=profile,
             )
             if candidate is None:
                 stats["items_rejected"] = int(stats["items_rejected"]) + 1

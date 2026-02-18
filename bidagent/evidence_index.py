@@ -121,7 +121,7 @@ def _looks_like_table_text(text: str) -> bool:
 
 
 def infer_source_type(row: dict[str, Any]) -> str:
-    explicit = _normalize_source_type(row.get("source_type"))
+    explicit = _normalize_source_type(row.get("source_type")) or _normalize_source_type(row.get("block_type"))
     if explicit:
         return explicit
 
@@ -162,7 +162,16 @@ def _sanitize_doc_id(value: Any) -> str:
     return cleaned or "bid"
 
 
-def _build_base_evidence_id(*, doc_id: str, page: int | None, block_index: int | None, source_type: str) -> str:
+def _build_base_evidence_id(
+    *,
+    doc_id: str,
+    page: int | None,
+    block_index: int | None,
+    source_type: str,
+    block_id: str | None = None,
+) -> str:
+    if block_id:
+        return f"E-{block_id}-{source_type}"
     page_token = page if page is not None else 0
     block_token = block_index if block_index is not None else 0
     return f"E-{doc_id}-p{page_token}-b{block_token}-{source_type}"
@@ -192,12 +201,14 @@ def build_unified_evidence_index(rows: Iterable[dict[str, Any]]) -> list[dict[st
         )
 
         doc_id = _sanitize_doc_id(row.get("doc_id"))
+        block_id = str(row.get("block_id") or "").strip() or None
         source_type = infer_source_type(row)
         base_id = _build_base_evidence_id(
             doc_id=doc_id,
             page=page,
             block_index=block_index,
             source_type=source_type,
+            block_id=block_id,
         )
         seen_ids[base_id] = seen_ids.get(base_id, 0) + 1
         evidence_id = base_id if seen_ids[base_id] == 1 else f"{base_id}-n{seen_ids[base_id]}"
@@ -213,6 +224,7 @@ def build_unified_evidence_index(rows: Iterable[dict[str, Any]]) -> list[dict[st
         index_rows.append(
             {
                 "evidence_id": evidence_id,
+                "block_id": block_id,
                 "doc_id": doc_id,
                 "source_type": source_type,
                 "section_tag": section_tag,

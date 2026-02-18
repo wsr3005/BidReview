@@ -22,6 +22,7 @@ from bidagent.evidence_harvester import (
     write_evidence_packs_jsonl,
 )
 from bidagent.evidence_index import build_unified_evidence_index, retrieve_evidence_candidates
+from bidagent.entity_pool import build_entity_pool
 from bidagent.eval import evaluate_run
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm_judge import judge_tasks_with_llm, write_verdicts_jsonl
@@ -61,6 +62,7 @@ RELEASE_TRACE_SCHEMA_VERSION = "release-trace-v1"
 AUTO_FINAL_GUARD_POLICY_VERSION = "auto-final-guard-v1"
 AUTO_FINAL_HISTORY_FILENAME = "auto-final-history.jsonl"
 DEFAULT_CANARY_MIN_STREAK = 3
+CROSS_AUDIT_SCHEMA_VERSION = "cross-audit-v1"
 BLOCKING_FINDING_STATUSES = {"fail", "needs_ocr", "missing", "risk", "insufficient_evidence"}
 STATUS_PRIORITY = ("fail", "needs_ocr", "missing", "risk", "pass")
 STATUS_PRIORITY_INDEX = {name: index for index, name in enumerate(STATUS_PRIORITY)}
@@ -110,15 +112,22 @@ STRONG_CONFLICT_HINTS = (
 
 
 def _row_to_block(row: dict[str, Any]) -> Block:
-    location = row.get("location", {})
+    location = row.get("location") if isinstance(row.get("location"), dict) else {}
+    section_hint = row.get("section_hint") or location.get("section")
+    section_tag = row.get("section_tag") or location.get("section_tag")
+    text = str(row.get("text") or row.get("content") or "")
     return Block(
         doc_id=row["doc_id"],
-        text=row["text"],
+        text=text,
         location=Location(
             block_index=location.get("block_index", 0),
             page=location.get("page"),
             section=location.get("section"),
+            section_tag=section_tag,
         ),
+        block_id=row.get("block_id"),
+        block_type=str(row.get("block_type") or "text"),
+        section_hint=section_hint,
     )
 
 
@@ -399,6 +408,7 @@ def _collect_release_artifacts(out_dir: Path) -> list[dict[str, Any]]:
         "requirements.atomic.jsonl",
         "review-tasks.jsonl",
         "evidence-packs.jsonl",
+        "cross-audit.jsonl",
         "findings.jsonl",
         "verdicts.jsonl",
         "gate-result.json",
@@ -407,6 +417,8 @@ def _collect_release_artifacts(out_dir: Path) -> list[dict[str, Any]]:
         "consistency-findings.jsonl",
         "review-report.md",
         "eval/metrics.json",
+        "ingest/doc-map.json",
+        "ingest/entity-pool.json",
     ]
     rows: list[dict[str, Any]] = []
     for rel in files:
@@ -528,6 +540,7 @@ def _run_canary(
             out_dir / "requirements.atomic.jsonl",
             out_dir / "review-tasks.jsonl",
             out_dir / "evidence-packs.jsonl",
+            out_dir / "cross-audit.jsonl",
             out_dir / "findings.jsonl",
             out_dir / "verdicts.jsonl",
             out_dir / "gate-result.json",
@@ -684,6 +697,7 @@ def ingest(
     tender_out = ingest_dir / "tender_blocks.jsonl"
     bid_out = ingest_dir / "bid_blocks.jsonl"
     doc_map_path = ingest_dir / "doc-map.json"
+    entity_pool_path = ingest_dir / "entity-pool.json"
     manifest_path = ingest_dir / "manifest.json"
 
     tender_meta = _count_doc_media(tender_path, page_range)
@@ -779,6 +793,28 @@ def ingest(
         "docs": len(doc_entries) if isinstance(doc_entries, list) else 0,
     }
 
+    entity_pool_can_resume = path_ready(entity_pool_path, resume) and page_range_matches and ocr_mode_matches
+    if not entity_pool_can_resume:
+        entity_pool = build_entity_pool(
+            [*read_jsonl(tender_out), *read_jsonl(bid_out)],
+        )
+        entity_pool_path.write_text(json.dumps(entity_pool, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        try:
+            entity_pool = json.loads(entity_pool_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            entity_pool = build_entity_pool(
+                [*read_jsonl(tender_out), *read_jsonl(bid_out)],
+            )
+            entity_pool_path.write_text(json.dumps(entity_pool, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    entities = entity_pool.get("entities") if isinstance(entity_pool, dict) else []
+    summary["entity_pool"] = {
+        "path": str(entity_pool_path),
+        "schema_version": str((entity_pool or {}).get("schema_version") or "entity-pool-v1"),
+        "entities": len(entities) if isinstance(entities, list) else 0,
+    }
+
     manifest = {
         "tender_path": str(tender_path.resolve()),
         "bid_path": str(bid_path.resolve()),
@@ -791,6 +827,8 @@ def ingest(
         "ocr": summary.get("ocr", ocr_selfcheck(ocr_mode)),
         "doc_map_path": str(doc_map_path),
         "doc_map_schema_version": str((doc_map or {}).get("schema_version") or "doc-map-v1"),
+        "entity_pool_path": str(entity_pool_path),
+        "entity_pool_schema_version": str((entity_pool or {}).get("schema_version") or "entity-pool-v1"),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -829,9 +867,26 @@ def extract_req(
             "atomic_classification_counts": dict(classification_counts),
         }
 
-    tender_blocks = list(_iter_blocks_from_jsonl(tender_path))
+    tender_rows = list(read_jsonl(tender_path))
+    doc_map_data: dict[str, Any] = {}
+    doc_map_path = ingest_dir / "doc-map.json"
+    if doc_map_path.exists():
+        try:
+            doc_map_data = json.loads(doc_map_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            doc_map_data = {}
+    tagged_tender_rows = _attach_semantic_section_tags(tender_rows, doc_map=doc_map_data, doc_id="tender")
+    tender_blocks = [_row_to_block(row) for row in tagged_tender_rows]
+    section_tag_counts = Counter(
+        str((row.get("location") or {}).get("section_tag") or row.get("section_tag") or "other")
+        for row in tagged_tender_rows
+        if isinstance(row, dict)
+    )
     requirements = extract_requirements(tender_blocks, focus=focus)
-    summary: dict[str, Any] = {"extract_engine": "rule"}
+    summary: dict[str, Any] = {
+        "extract_engine": "rule",
+        "section_tag_counts": dict(section_tag_counts),
+    }
     if ai_provider == "deepseek":
         try:
             api_key = _load_api_key(ai_provider, ai_api_key_file)
@@ -1517,6 +1572,9 @@ def _extract_query_terms(values: list[Any], *, limit: int = 16) -> list[str]:
 
 
 def _build_evidence_id_from_row(row: dict[str, Any]) -> str:
+    block_id = str(row.get("block_id") or "").strip()
+    if block_id:
+        return f"E-{block_id}"
     location = row.get("location") if isinstance(row.get("location"), dict) else {}
     page = location.get("page") if isinstance(location, dict) else None
     page_no = page if isinstance(page, int) else 0
@@ -1530,14 +1588,31 @@ def _build_evidence_id_from_row(row: dict[str, Any]) -> str:
 
 def _to_evidence_ref(item: dict[str, Any], *, source: str, harvest_score: int | None = None) -> dict[str, Any]:
     location = item.get("location") if isinstance(item.get("location"), dict) else None
+    if isinstance(location, dict):
+        location = dict(location)
     evidence_id = str(item.get("evidence_id") or "").strip() or _build_evidence_id_from_row(item)
+    source_type = str(item.get("source_type") or "").strip().lower() or None
+    if source_type is None and isinstance(location, dict):
+        section = str(location.get("section") or "").lower()
+        if "ocr" in section:
+            source_type = "ocr"
+        elif "table" in section:
+            source_type = "table"
+        else:
+            source_type = "text"
+    section_tag = item.get("section_tag")
+    if section_tag is None and isinstance(location, dict):
+        section_tag = location.get("section_tag")
     score = _safe_float(item.get("score"))
     if harvest_score is not None:
         score = float(harvest_score)
     return {
         "evidence_id": evidence_id,
+        "block_id": item.get("block_id"),
         "doc_id": item.get("doc_id") or "bid",
         "location": location,
+        "source_type": source_type,
+        "section_tag": section_tag,
         "score": score,
         "excerpt": item.get("excerpt"),
         "source": source,
@@ -1584,8 +1659,11 @@ def _load_evidence_index(path: Path) -> dict[str, Any]:
         terms = _extract_query_terms([text], limit=64)
         record = {
             "evidence_id": evidence_id,
+            "block_id": row.get("block_id"),
             "doc_id": row.get("doc_id") or "bid",
             "location": row.get("location"),
+            "source_type": row.get("source_type"),
+            "section_tag": row.get("section_tag"),
             "excerpt": text[:240],
             "normalized_text": _normalize_search_text(text),
             "terms": terms,
@@ -2176,6 +2254,106 @@ def _counter_conflict_second_pass(
     }
 
 
+def _normalize_source_channel(value: Any) -> str | None:
+    token = str(value or "").strip().lower().replace(" ", "_")
+    if not token:
+        return None
+    if token in {"ocr", "ocr_image", "ocr_media", "image_ocr"}:
+        return "attachment_ocr"
+    if token in {"table", "tabular", "spreadsheet"}:
+        return "deviation_table"
+    if token in {"text", "plain_text", "paragraph"}:
+        return "text_clause"
+    return token
+
+
+def _evidence_channel_from_ref(ref: dict[str, Any]) -> str:
+    source_type = _normalize_source_channel(ref.get("source_type"))
+    if source_type:
+        return source_type
+
+    evidence_id = str(ref.get("evidence_id") or "").lower()
+    if evidence_id.endswith("-ocr") or "-ocr-" in evidence_id:
+        return "attachment_ocr"
+    if evidence_id.endswith("-table") or "-table-" in evidence_id:
+        return "deviation_table"
+
+    location = ref.get("location") if isinstance(ref.get("location"), dict) else {}
+    section = str(location.get("section") or "")
+    excerpt = str(ref.get("excerpt") or "")
+    compact = f"{section} {excerpt}"
+    if any(token in compact for token in ("承诺", "声明", "授权", "委托书", "承诺函")):
+        return "commitment_letter"
+    if any(token in compact for token in ("附件", "扫描件", "复印件", "影印件")):
+        return "attachment_text"
+    return "text_clause"
+
+
+def _requirement_needs_cross_verification(requirement: dict[str, Any]) -> bool:
+    if not isinstance(requirement, dict):
+        return False
+    if bool(requirement.get("mandatory", False)):
+        return True
+    tier = str(requirement.get("rule_tier") or "general")
+    if tier == "hard_fail":
+        return True
+    text = str(requirement.get("text") or "")
+    keywords = " ".join(str(item or "") for item in (requirement.get("keywords") or []))
+    probe = f"{text} {keywords}"
+    return any(
+        token in probe
+        for token in ("承诺", "偏离", "保证金", "资质", "营业执照", "授权", "报价", "附件", "证明")
+    )
+
+
+def _apply_cross_audit(
+    *,
+    requirement_id: str,
+    requirement: dict[str, Any],
+    support_refs: list[dict[str, Any]],
+    counter_refs: list[dict[str, Any]],
+    status: str,
+    reason: str,
+    confidence: float,
+) -> dict[str, Any]:
+    support_channels = sorted({_evidence_channel_from_ref(item) for item in support_refs if isinstance(item, dict)})
+    counter_channels = sorted({_evidence_channel_from_ref(item) for item in counter_refs if isinstance(item, dict)})
+    required = _requirement_needs_cross_verification(requirement)
+    applicable = required and bool(support_refs)
+    verified = len(support_channels) >= 2 if applicable else False
+
+    next_status = status
+    next_reason = reason
+    next_confidence = confidence
+    action = None
+    if applicable and not verified and status == "pass":
+        next_status = "risk"
+        next_reason = "跨渠道核验不足（仅单渠道支持证据），已降级为risk"
+        next_confidence = min(confidence, 0.58)
+        action = "downgrade_pass_to_risk_cross_verification"
+
+    row = {
+        "schema_version": CROSS_AUDIT_SCHEMA_VERSION,
+        "requirement_id": requirement_id,
+        "required": required,
+        "applicable": applicable,
+        "cross_verified": verified,
+        "support_channels": support_channels,
+        "counter_channels": counter_channels,
+        "support_refs": len(support_refs),
+        "counter_refs": len(counter_refs),
+        "status_before": status,
+        "status_after": next_status,
+        "action": action,
+    }
+    return {
+        "status": next_status,
+        "reason": next_reason,
+        "confidence": next_confidence,
+        "cross_audit": row,
+    }
+
+
 def verdict(
     out_dir: Path,
     resume: bool = False,
@@ -2191,6 +2369,7 @@ def verdict(
     tasks_path = out_dir / "review-tasks.jsonl"
     bid_blocks_path = out_dir / "ingest" / "bid_blocks.jsonl"
     evidence_packs_path = out_dir / "evidence-packs.jsonl"
+    cross_audit_path = out_dir / "cross-audit.jsonl"
     verdicts_path = out_dir / "verdicts.jsonl"
     if path_ready(verdicts_path, resume):
         rows = list(read_jsonl(verdicts_path))
@@ -2205,9 +2384,15 @@ def verdict(
             len(rows),
         )
         evidence_packs_total = sum(1 for _ in read_jsonl(evidence_packs_path)) if evidence_packs_path.exists() else 0
+        cross_audit_rows = list(read_jsonl(cross_audit_path)) if cross_audit_path.exists() else []
+        cross_required = sum(1 for row in cross_audit_rows if bool(row.get("required")))
+        cross_verified = sum(1 for row in cross_audit_rows if bool(row.get("cross_verified")))
         return {
             "verdicts": len(rows),
             "evidence_packs": evidence_packs_total,
+            "cross_audit": len(cross_audit_rows),
+            "cross_audit_required": cross_required,
+            "cross_audit_verified": cross_verified,
             "status_counts": dict(counts),
             "llm_coverage": llm_coverage,
         }
@@ -2293,6 +2478,7 @@ def verdict(
 
     verdict_rows: list[dict[str, Any]] = []
     evidence_pack_rows: list[dict[str, Any]] = []
+    cross_audit_rows: list[dict[str, Any]] = []
     for index, requirement_id in enumerate(requirement_order, start=1):
         finding = finding_by_requirement.get(requirement_id, {})
         task_rows = list(tasks_by_requirement.get(requirement_id, []))
@@ -2448,6 +2634,24 @@ def verdict(
                     f"已由{status_before_floor}收敛为{status}"
                 )
                 confidence = min(confidence, _status_confidence_hint(status))
+        status_after_floor = status
+
+        cross_audit = _apply_cross_audit(
+            requirement_id=requirement_id,
+            requirement=requirement_row,
+            support_refs=support_refs,
+            counter_refs=counter_refs,
+            status=status,
+            reason=reason,
+            confidence=confidence,
+        )
+        status = _normalize_status(cross_audit.get("status") or status)
+        reason = str(cross_audit.get("reason") or reason)
+        confidence = max(0.0, min(1.0, _safe_float(cross_audit.get("confidence")) or confidence))
+        cross_audit_row = cross_audit.get("cross_audit") if isinstance(cross_audit.get("cross_audit"), dict) else {}
+        cross_action = cross_audit_row.get("action") if isinstance(cross_audit_row, dict) else None
+        if cross_audit_row:
+            cross_audit_rows.append(cross_audit_row)
 
         model = {}
         provider = str((llm or {}).get("provider") or getattr(task_reviewer, "provider", "") or "")
@@ -2493,18 +2697,22 @@ def verdict(
             "enabled": bool(finding),
             "floor_status": _normalize_status(fallback_status),
             "status_before_floor": status_before_floor,
-            "status_after_floor": status,
-            "downgraded": bool(finding) and status != status_before_floor,
+            "status_after_floor": status_after_floor,
+            "downgraded": bool(finding) and status_after_floor != status_before_floor,
         }
+        decision_trace["cross_audit"] = cross_audit_row
         decision_trace["evidence_refs"] = support_refs
         decision_trace["counter_evidence_refs"] = counter_refs
         decision_trace.setdefault("decision", {})
         if isinstance(decision_trace.get("decision"), dict):
             decision_trace["decision"]["status"] = status
             decision_trace["decision"]["reason"] = reason
-            decision_trace["decision"]["source"] = (
-                "pipeline_counter_evidence_audit" if downgrade_action else "pipeline_findings_bridge"
-            )
+            if cross_action:
+                decision_trace["decision"]["source"] = "pipeline_cross_audit"
+            elif downgrade_action:
+                decision_trace["decision"]["source"] = "pipeline_counter_evidence_audit"
+            else:
+                decision_trace["decision"]["source"] = "pipeline_findings_bridge"
 
         verdict_rows.append(
             {
@@ -2521,8 +2729,11 @@ def verdict(
         )
 
     write_evidence_packs_jsonl(evidence_packs_path, evidence_pack_rows)
+    write_jsonl(cross_audit_path, cross_audit_rows)
     write_verdicts_jsonl(verdicts_path, verdict_rows)
     counts = Counter(_normalize_status(row.get("status")) for row in verdict_rows)
+    cross_required = sum(1 for row in cross_audit_rows if bool(row.get("required")))
+    cross_verified = sum(1 for row in cross_audit_rows if bool(row.get("cross_verified")))
     llm_coverage = _safe_ratio(
         sum(
             1
@@ -2535,6 +2746,9 @@ def verdict(
     return {
         "verdicts": len(verdict_rows),
         "evidence_packs": len(evidence_pack_rows),
+        "cross_audit": len(cross_audit_rows),
+        "cross_audit_required": cross_required,
+        "cross_audit_verified": cross_verified,
         "status_counts": dict(counts),
         "llm_coverage": llm_coverage,
     }
@@ -2576,9 +2790,12 @@ def _sync_findings_from_verdicts(out_dir: Path) -> dict[str, Any]:
             evidence.append(
                 {
                     "evidence_id": item.get("evidence_id"),
+                    "block_id": item.get("block_id"),
                     "excerpt_hash": item.get("excerpt_hash"),
                     "doc_id": item.get("doc_id"),
                     "location": item.get("location"),
+                    "source_type": item.get("source_type"),
+                    "section_tag": item.get("section_tag"),
                     "score": item.get("score"),
                     "excerpt": item.get("excerpt"),
                     "source": item.get("source"),

@@ -269,11 +269,14 @@ def _normalize_location(value: Any) -> dict[str, Any]:
             "block_index": value.get("block_index"),
             "page": value.get("page"),
             "section": value.get("section"),
+            "section_tag": value.get("section_tag"),
         }
-    return {"block_index": None, "page": None, "section": None}
+    return {"block_index": None, "page": None, "section": None, "section_tag": None}
 
 
-def _build_evidence_id(*, doc_id: str, location: dict[str, Any], index: int) -> str:
+def _build_evidence_id(*, doc_id: str, location: dict[str, Any], index: int, block_id: str | None = None) -> str:
+    if block_id:
+        return f"E-{block_id}"
     page = location.get("page") if isinstance(location.get("page"), int) else 0
     block = location.get("block_index") if isinstance(location.get("block_index"), int) else index
     return f"E-{doc_id}-p{page}-b{block}"
@@ -301,20 +304,27 @@ def _iter_block_rows(blocks: Iterable[Any]) -> Iterable[dict[str, Any]]:
             location = _normalize_location(item.get("location"))
             yield {
                 "doc_id": str(item.get("doc_id") or "bid"),
+                "block_id": item.get("block_id"),
+                "source_type": item.get("source_type"),
                 "text": str(item.get("text") or ""),
                 "location": location,
             }
             continue
         doc_id = getattr(item, "doc_id", "bid")
+        block_id = getattr(item, "block_id", None)
+        source_type = getattr(item, "block_type", None)
         text = getattr(item, "text", "")
         location_obj = getattr(item, "location", None)
         location = {
             "block_index": getattr(location_obj, "block_index", None),
             "page": getattr(location_obj, "page", None),
             "section": getattr(location_obj, "section", None),
+            "section_tag": getattr(location_obj, "section_tag", None),
         }
         yield {
             "doc_id": str(doc_id or "bid"),
+            "block_id": block_id,
+            "source_type": source_type,
             "text": str(text or ""),
             "location": location,
         }
@@ -330,11 +340,19 @@ def build_evidence_index(blocks: Iterable[Any]) -> list[dict[str, Any]]:
         section = location.get("section")
         index_rows.append(
             {
-                "evidence_id": _build_evidence_id(doc_id=str(row.get("doc_id") or "bid"), location=location, index=offset),
+                "evidence_id": _build_evidence_id(
+                    doc_id=str(row.get("doc_id") or "bid"),
+                    location=location,
+                    index=offset,
+                    block_id=str(row.get("block_id") or "").strip() or None,
+                ),
                 "excerpt_hash": _build_excerpt_hash(text),
                 "doc_id": str(row.get("doc_id") or "bid"),
+                "block_id": row.get("block_id"),
                 "location": location,
                 "block_type": _classify_block_type(section),
+                "source_type": str(row.get("source_type") or _classify_block_type(section)),
+                "section_tag": location.get("section_tag"),
                 "text": text,
                 "normalized_text": _normalize_text(text),
                 "terms": _extract_terms(text, limit=64),
@@ -447,11 +465,14 @@ def _to_pack_item(
 ) -> dict[str, Any]:
     return {
         "evidence_id": entry.get("evidence_id"),
+        "block_id": entry.get("block_id"),
         "excerpt_hash": entry.get("excerpt_hash"),
         "doc_id": entry.get("doc_id"),
         "location": entry.get("location"),
         "score": score,
         "block_type": entry.get("block_type"),
+        "source_type": entry.get("source_type"),
+        "section_tag": entry.get("section_tag"),
         "reference_only": bool(entry.get("reference_only")),
         "polarity": polarity,
         "matched_terms": matched_terms,
@@ -551,9 +572,12 @@ def harvest_task_evidence(
     evidence_refs = [
         {
             "evidence_id": item.get("evidence_id"),
+            "block_id": item.get("block_id"),
             "excerpt_hash": item.get("excerpt_hash"),
             "doc_id": item.get("doc_id"),
             "location": item.get("location"),
+            "source_type": item.get("source_type"),
+            "section_tag": item.get("section_tag"),
             "score": item.get("score"),
         }
         for item in support_pack
@@ -561,9 +585,12 @@ def harvest_task_evidence(
     counter_refs = [
         {
             "evidence_id": item.get("evidence_id"),
+            "block_id": item.get("block_id"),
             "excerpt_hash": item.get("excerpt_hash"),
             "doc_id": item.get("doc_id"),
             "location": item.get("location"),
+            "source_type": item.get("source_type"),
+            "section_tag": item.get("section_tag"),
             "score": item.get("score"),
         }
         for item in counter_pack

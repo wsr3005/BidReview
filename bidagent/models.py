@@ -9,6 +9,7 @@ class Location:
     block_index: int
     page: int | None = None
     section: str | None = None
+    section_tag: str | None = None
 
 
 @dataclass(slots=True)
@@ -16,12 +17,22 @@ class Block:
     doc_id: str
     text: str
     location: Location
+    block_id: str | None = None
+    block_type: str = "text"
+    section_hint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        location_dict = asdict(self.location)
+        block_id = self.block_id or f"B-{self.doc_id}-{self.location.block_index}"
+        section_hint = self.section_hint if self.section_hint is not None else self.location.section
         return {
+            "block_id": block_id,
             "doc_id": self.doc_id,
+            "block_type": self.block_type,
+            "section_hint": section_hint,
+            "content": self.text,
             "text": self.text,
-            "location": asdict(self.location),
+            "location": location_dict,
         }
 
 
