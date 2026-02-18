@@ -10,13 +10,14 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timezone
 from email.utils import parsedate_to_datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from bidagent.models import Finding, Requirement
 
 ALLOWED_STATUS = {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"}
 ALLOWED_SEVERITY = {"none", "low", "medium", "high"}
 DEEPSEEK_PROMPT_VERSION = "deepseek-review-v1"
+DEEPSEEK_REQUIREMENT_PROMPT_VERSION = "deepseek-requirement-schema-v1"
 
 
 class Reviewer(Protocol):
@@ -241,6 +242,117 @@ class DeepSeekReviewer:
             "reason": reason[:120],
             "confidence": confidence_value,
         }
+
+
+class DeepSeekRequirementExtractor:
+    provider = "deepseek"
+    prompt_version = DEEPSEEK_REQUIREMENT_PROMPT_VERSION
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "deepseek-chat",
+        base_url: str = "https://api.deepseek.com/v1",
+        timeout_seconds: int = 90,
+        max_retries: int = 3,
+    ) -> None:
+        self.api_key = api_key.strip()
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max(0, int(max_retries))
+
+    def _build_messages(self, *, block_text: str, focus: str) -> list[dict[str, str]]:
+        payload = {
+            "focus": focus,
+            "task": "从招标文本中提取可核验的商务条款，必须输出JSON。",
+            "schema": {
+                "items": [
+                    {
+                        "text": "string",
+                        "category": "string",
+                        "mandatory": "boolean",
+                        "rule_tier": "hard_fail|scored|general",
+                        "keywords": ["string"],
+                        "confidence": "number 0.0-1.0",
+                    }
+                ]
+            },
+            "rules": [
+                "只提取投标人义务条款，不提取评标流程描述",
+                "不要输出目录、模板说明、章节标题",
+                "不能编造原文不存在的金额、期限、资质",
+            ],
+            "text": block_text[:2400],
+        }
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "你是招投标商务条款提取器。"
+                    "输出必须是JSON对象，且顶层字段必须为items。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ]
+
+    def extract_requirements(self, *, block_text: str, focus: str) -> list[dict[str, Any]]:
+        payload = {
+            "model": self.model,
+            "temperature": 0.1,
+            "messages": self._build_messages(block_text=block_text, focus=focus),
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    body = response.read().decode("utf-8")
+                last_error = None
+                break
+            except urllib.error.HTTPError as exc:
+                code = int(getattr(exc, "code", 0) or 0)
+                if attempt < self.max_retries and (code == 429 or code == 408 or 500 <= code <= 599):
+                    time.sleep(min(20.0, 1.0 * (2**attempt)))
+                    last_error = RuntimeError(f"DeepSeek HTTP {code}")
+                    continue
+                raise RuntimeError(f"DeepSeek HTTP {code}") from exc
+            except urllib.error.URLError as exc:
+                if attempt < self.max_retries:
+                    time.sleep(min(20.0, 1.0 * (2**attempt)))
+                    last_error = RuntimeError(f"DeepSeek request failed: {exc.reason}")
+                    continue
+                raise RuntimeError(f"DeepSeek request failed: {exc.reason}") from exc
+
+        if last_error is not None:
+            raise last_error
+
+        data_obj = json.loads(body)
+        choices = data_obj.get("choices", [])
+        if not choices:
+            return []
+        message = choices[0].get("message", {})
+        content = str(message.get("content") or "").strip()
+        if not content:
+            return []
+        parsed = _extract_json_object(content)
+        rows = parsed.get("items")
+        if not isinstance(rows, list):
+            return []
+        return [item for item in rows if isinstance(item, dict)]
 
 
 def apply_llm_review(

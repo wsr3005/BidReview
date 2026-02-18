@@ -23,6 +23,7 @@ class ConsistencyFinding:
     reason: str
     values: list[dict[str, Any]]
     pairs: list[dict[str, Any]] = field(default_factory=list)
+    comparison: dict[str, Any] | None = None
     scope: str = "bid_internal"
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,14 +106,19 @@ def _severity_for(fact_type: str) -> str:
         "bidder_name",
         "legal_representative_company",
         "authorization_company",
+        "authorized_representative_name",
         "bidder_name_authorization_mismatch",
         "bidder_name_legal_representative_mismatch",
         "tender_no",
         "tender_no_cross_doc",
+        "account_bank",
+        "account_number",
         "account_bank_receipt_mismatch",
+        "account_number_receipt_mismatch",
         "account_bank_receipt_unreadable",
         "bid_total_price_fen",
         "uscc",
+        "legal_representative_name",
         "legal_representative_name_placeholder",
     }:
         return "high"
@@ -121,11 +127,18 @@ def _severity_for(fact_type: str) -> str:
 
 def _status_for(fact_type: str) -> str:
     if fact_type in {
+        "bidder_name",
+        "tender_no",
+        "legal_representative_name",
+        "authorized_representative_name",
+        "account_bank",
+        "account_number",
         "tender_no_cross_doc",
         "legal_representative_name_placeholder",
         "bidder_name_authorization_mismatch",
         "bidder_name_legal_representative_mismatch",
         "account_bank_receipt_mismatch",
+        "account_number_receipt_mismatch",
         "account_bank_receipt_unreadable",
     }:
         return "fail"
@@ -201,14 +214,17 @@ _NOISE_TOKENS = {"", "投标单位名称", "投标人名称", "单位名称", "�
 _FIELD_LABELS = {
     "bidder_name": "投标主体名称",
     "legal_representative_company": "法定代表人所属单位",
+    "authorized_representative_name": "授权人姓名",
     "authorization_company": "授权函投标单位名称",
     "bidder_name_authorization_mismatch": "投标函主体与投标主体",
     "bidder_name_legal_representative_mismatch": "法定代表人所属单位与投标主体",
     "tender_no": "招标编号",
     "tender_no_cross_doc": "招标编号（招投标对照）",
     "account_bank": "开户行",
+    "account_number": "账号",
     "account_name": "开户名",
     "account_bank_receipt_mismatch": "开户行与回单支行",
+    "account_number_receipt_mismatch": "账号与回单账号",
     "account_bank_receipt_unreadable": "银行回单识别质量",
     "legal_representative_name": "法定代表人姓名",
     "legal_representative_name_placeholder": "法定代表人姓名",
@@ -347,6 +363,31 @@ def _extract_legal_representative_names(
     return results
 
 
+def _extract_authorized_representative_names(
+    blocks: list[Block],
+) -> list[tuple[int, str, Block]]:
+    results: list[tuple[int, str, Block]] = []
+    for idx, block in enumerate(blocks):
+        text = block.text or ""
+        compact_text = _compact(text)
+        if not any(token in compact_text for token in ("授权委托书", "授权书", "委托代理人", "授权代表", "被授权人", "授权人")):
+            continue
+
+        for _, value in _extract_kv_text(text, ["委托代理人", "授权代表", "被授权人", "授权人", "受托人"]):
+            value = re.split(r"(?:性别|年龄|职务|身份证号|身份证号码)[:：]?", value)[0]
+            name = _normalize_person_name(value)
+            if not name or len(name) > 12:
+                continue
+            results.append((idx, name, block))
+
+        for match in re.finditer(r"(?:委托代理人|授权代表|被授权人|授权人|受托人)[:：]?([\u4e00-\u9fff]{2,4})", compact_text):
+            name = _normalize_person_name(match.group(1))
+            if not name or len(name) > 12:
+                continue
+            results.append((idx, name, block))
+    return results
+
+
 def _loc_text(value: dict[str, Any]) -> str:
     location = value.get("location") if isinstance(value, dict) else {}
     if not isinstance(location, dict):
@@ -400,15 +441,38 @@ def _build_pairs(values: list[dict[str, Any]], max_pairs: int) -> list[dict[str,
 
 def _conflict_reason(field_type: str, pairs: list[dict[str, Any]]) -> str:
     if not pairs:
-        return f"字段 `{field_type}` 出现多个不同取值，可能存在跨章节不一致"
+        return f"{_field_label(field_type)}存在多个取值，结论：不一致"
     first = pairs[0]
     left = first.get("left") or {}
     right = first.get("right") or {}
     return (
-        f"{_field_label(field_type)}不一致："
-        f"“{left.get('value', 'N/A')}”({_loc_text(left)}) 与 "
-        f"“{right.get('value', 'N/A')}”({_loc_text(right)}) 冲突"
+        f"{_field_label(field_type)}核验："
+        f"证据A=“{left.get('value', 'N/A')}”({_loc_text(left)})，"
+        f"证据B=“{right.get('value', 'N/A')}”({_loc_text(right)})，"
+        "结论：不一致"
     )
+
+
+def _comparison_from_pair(pair: dict[str, Any] | None, conclusion: str) -> dict[str, Any]:
+    left = (pair or {}).get("left") if isinstance(pair, dict) else {}
+    right = (pair or {}).get("right") if isinstance(pair, dict) else {}
+    left = left if isinstance(left, dict) else {}
+    right = right if isinstance(right, dict) else {}
+    return {
+        "evidence_a": {
+            "value": left.get("value"),
+            "doc_id": left.get("doc_id"),
+            "location": left.get("location"),
+            "excerpt": left.get("excerpt"),
+        },
+        "evidence_b": {
+            "value": right.get("value"),
+            "doc_id": right.get("doc_id"),
+            "location": right.get("location"),
+            "excerpt": right.get("excerpt"),
+        },
+        "conclusion": conclusion,
+    }
 
 
 def _init_bucket() -> dict[str, dict[str, dict[str, Any]]]:
@@ -547,6 +611,7 @@ def find_inconsistencies(
 
         for number in _extract_account_numbers(text):
             account_numbers.add(number)
+            _add_value(bucket, fact_type="account_number", value_norm=number, value_raw=number, occ=occ)
 
         for bank in _extract_account_banks(text):
             _add_value(bucket, fact_type="account_bank", value_norm=bank, value_raw=bank, occ=occ)
@@ -557,6 +622,15 @@ def find_inconsistencies(
         _add_value(
             bucket,
             fact_type="legal_representative_name",
+            value_norm=name,
+            value_raw=name,
+            occ=occ,
+        )
+    for _, name, block in _extract_authorized_representative_names(bid_list):
+        occ = _collect_occurrence(block)
+        _add_value(
+            bucket,
+            fact_type="authorized_representative_name",
             value_norm=name,
             value_raw=name,
             occ=occ,
@@ -577,6 +651,7 @@ def find_inconsistencies(
                 reason=reason,
                 values=values,
                 pairs=pairs,
+                comparison=_comparison_from_pair(pairs[0] if pairs else None, "不一致"),
                 scope="bid_internal",
             )
         )
@@ -610,9 +685,10 @@ def find_inconsistencies(
                 max_examples_per_value=max_examples_per_value,
             )
             reason = (
-                f"{_field_label(finding_type)}不一致："
-                f"“{left_value}”({_loc_text(pairs[0]['left'])}) 与 "
-                f"“{bidder_value}”({_loc_text(pairs[0]['right'])}) 冲突"
+                f"{_field_label(finding_type)}核验："
+                f"证据A=“{left_value}”({_loc_text(pairs[0]['left'])})，"
+                f"证据B=“{bidder_value}”({_loc_text(pairs[0]['right'])})，"
+                "结论：不一致"
             )
             findings.append(
                 ConsistencyFinding(
@@ -622,116 +698,167 @@ def find_inconsistencies(
                     reason=reason,
                     values=values,
                     pairs=pairs,
+                    comparison=_comparison_from_pair(pairs[0], "不一致"),
                     scope="bid_internal",
                 )
             )
 
+    receipt_blocks = [
+        block
+        for block in ocr_blocks
+        if _looks_like_bank_receipt_ocr(block.text or "", account_numbers)
+    ]
+
     # Cross-evidence: account bank in text vs bank receipt OCR.
     account_bank_map = bucket.get("account_bank") or {}
-    if account_bank_map:
-        receipt_blocks = [
-            block
-            for block in ocr_blocks
-            if _looks_like_bank_receipt_ocr(block.text or "", account_numbers)
-        ]
-        if receipt_blocks:
-            receipt_branch_map: dict[str, dict[str, Any]] = {}
-            for block in receipt_blocks:
-                occ = _collect_occurrence(block)
-                for branch in _extract_branch_candidates(block.text or ""):
-                    _add_value(
-                        {"receipt_branch": receipt_branch_map},
-                        fact_type="receipt_branch",
-                        value_norm=branch,
-                        value_raw=branch,
-                        occ=occ,
-                    )
+    if account_bank_map and receipt_blocks:
+        receipt_branch_map: dict[str, dict[str, Any]] = {}
+        for block in receipt_blocks:
+            occ = _collect_occurrence(block)
+            for branch in _extract_branch_candidates(block.text or ""):
+                _add_value(
+                    {"receipt_branch": receipt_branch_map},
+                    fact_type="receipt_branch",
+                    value_norm=branch,
+                    value_raw=branch,
+                    occ=occ,
+                )
 
-            if receipt_branch_map:
-                account_top = _top_value(account_bank_map)
-                receipt_top = _top_value(receipt_branch_map)
-                if account_top and receipt_top:
-                    account_value, account_data = account_top
-                    receipt_value, receipt_data = receipt_top
+        if receipt_branch_map:
+            account_top = _top_value(account_bank_map)
+            receipt_top = _top_value(receipt_branch_map)
+            if account_top and receipt_top:
+                account_value, account_data = account_top
+                receipt_value, receipt_data = receipt_top
 
-                    account_norm = _compact(account_value)
-                    receipt_norm = _compact(receipt_value)
-                    matched = bool(
-                        account_norm == receipt_norm
-                        or account_norm.endswith(receipt_norm)
-                        or receipt_norm.endswith(account_norm)
-                        or account_norm in receipt_norm
-                        or receipt_norm in account_norm
+                account_norm = _compact(account_value)
+                receipt_norm = _compact(receipt_value)
+                matched = bool(
+                    account_norm == receipt_norm
+                    or account_norm.endswith(receipt_norm)
+                    or receipt_norm.endswith(account_norm)
+                    or account_norm in receipt_norm
+                    or receipt_norm in account_norm
+                )
+                if not matched:
+                    pairs = [_make_pair(account_value, account_data, receipt_value, receipt_data)]
+                    values = _format_values(
+                        {
+                            account_value: account_data,
+                            receipt_value: receipt_data,
+                        },
+                        max_examples_per_value=max_examples_per_value,
                     )
-                    if not matched:
-                        pairs = [_make_pair(account_value, account_data, receipt_value, receipt_data)]
-                        values = _format_values(
-                            {
-                                account_value: account_data,
-                                receipt_value: receipt_data,
-                            },
-                            max_examples_per_value=max_examples_per_value,
+                    reason = (
+                        f"{_field_label('account_bank_receipt_mismatch')}核验："
+                        f"证据A=“{account_value}”({_loc_text(pairs[0]['left'])})，"
+                        f"证据B=“{receipt_value}”({_loc_text(pairs[0]['right'])})，"
+                        "结论：不一致"
+                    )
+                    findings.append(
+                        ConsistencyFinding(
+                            type="account_bank_receipt_mismatch",
+                            status=_status_for("account_bank_receipt_mismatch"),
+                            severity=_severity_for("account_bank_receipt_mismatch"),
+                            reason=reason,
+                            values=values,
+                            pairs=pairs,
+                            comparison=_comparison_from_pair(pairs[0], "不一致"),
+                            scope="cross_evidence",
                         )
-                        reason = (
-                            f"{_field_label('account_bank_receipt_mismatch')}不一致："
-                            f"文本为“{account_value}”({_loc_text(pairs[0]['left'])})，"
-                            f"回单识别为“{receipt_value}”({_loc_text(pairs[0]['right'])})"
-                        )
-                        findings.append(
-                            ConsistencyFinding(
-                                type="account_bank_receipt_mismatch",
-                                status=_status_for("account_bank_receipt_mismatch"),
-                                severity=_severity_for("account_bank_receipt_mismatch"),
-                                reason=reason,
-                                values=values,
-                                pairs=pairs,
-                                scope="cross_evidence",
-                            )
-                        )
+                    )
+        else:
+            account_top = _top_value(account_bank_map)
+            receipt_block = receipt_blocks[0]
+            occ = _collect_occurrence(receipt_block)
+            account_values = _format_values(account_bank_map, max_examples_per_value=max_examples_per_value)
+            if account_top:
+                account_value, account_data = account_top
+                pair = _make_pair(
+                    account_value,
+                    account_data,
+                    "回单图片（OCR未识别出支行）",
+                    {"count": 1, "examples": [asdict(occ)]},
+                )
+                reason = (
+                    f"{_field_label('account_bank_receipt_unreadable')}核验："
+                    f"证据A=“{account_value}”({_loc_text(pair['left'])})，"
+                    f"证据B=“回单图片（OCR未识别出支行）”({_loc_text(pair['right'])})，"
+                    "结论：需人工核验回单原图"
+                )
             else:
-                # OCR receipt exists but branch name is unreadable: block and escalate to manual verification.
-                account_top = _top_value(account_bank_map)
-                receipt_block = receipt_blocks[0]
-                occ = _collect_occurrence(receipt_block)
-                account_values = _format_values(account_bank_map, max_examples_per_value=max_examples_per_value)
-                if account_top:
-                    account_value, account_data = account_top
-                    pair = _make_pair(
-                        account_value,
-                        account_data,
-                        "回单图片（OCR未识别出支行）",
-                        {"count": 1, "examples": [asdict(occ)]},
+                pair = {}
+                reason = (
+                    f"{_field_label('account_bank_receipt_unreadable')}核验："
+                    "证据A=开户行文本，证据B=回单图片（OCR未识别出支行），结论：需人工核验回单原图"
+                )
+            account_values.append(
+                {
+                    "value_norm": "receipt_present_but_unreadable",
+                    "value_raw_examples": ["回单图片存在，但支行字段不可识别"],
+                    "count": len(receipt_blocks),
+                    "examples": [asdict(occ)],
+                }
+            )
+            findings.append(
+                ConsistencyFinding(
+                    type="account_bank_receipt_unreadable",
+                    status=_status_for("account_bank_receipt_unreadable"),
+                    severity=_severity_for("account_bank_receipt_unreadable"),
+                    reason=reason,
+                    values=account_values,
+                    pairs=[pair] if pair else [],
+                    comparison=_comparison_from_pair(pair if pair else None, "需人工核验"),
+                    scope="cross_evidence",
+                )
+            )
+
+    account_number_map = bucket.get("account_number") or {}
+    if account_number_map and receipt_blocks:
+        receipt_account_map: dict[str, dict[str, Any]] = {}
+        for block in receipt_blocks:
+            occ = _collect_occurrence(block)
+            for number in _extract_account_numbers(block.text or ""):
+                _add_value(
+                    {"receipt_account_number": receipt_account_map},
+                    fact_type="receipt_account_number",
+                    value_norm=number,
+                    value_raw=number,
+                    occ=occ,
+                )
+        if receipt_account_map:
+            account_top = _top_value(account_number_map)
+            receipt_top = _top_value(receipt_account_map)
+            if account_top and receipt_top:
+                account_value, account_data = account_top
+                receipt_value, receipt_data = receipt_top
+                if account_value != receipt_value:
+                    pairs = [_make_pair(account_value, account_data, receipt_value, receipt_data)]
+                    values = _format_values(
+                        {
+                            account_value: account_data,
+                            receipt_value: receipt_data,
+                        },
+                        max_examples_per_value=max_examples_per_value,
                     )
                     reason = (
-                        f"{_field_label('account_bank_receipt_unreadable')}不足："
-                        f"已识别到回单图片({ _loc_text(pair['right']) })，但未识别出支行名称，"
-                        f"当前文本开户行为“{account_value}”({_loc_text(pair['left'])})，需人工核验回单原图"
+                        f"{_field_label('account_number_receipt_mismatch')}核验："
+                        f"证据A=“{account_value}”({_loc_text(pairs[0]['left'])})，"
+                        f"证据B=“{receipt_value}”({_loc_text(pairs[0]['right'])})，"
+                        "结论：不一致"
                     )
-                else:
-                    pair = {}
-                    reason = (
-                        f"{_field_label('account_bank_receipt_unreadable')}不足："
-                        "已识别到回单图片，但未识别出可用于核对的支行名称，需人工核验回单原图"
+                    findings.append(
+                        ConsistencyFinding(
+                            type="account_number_receipt_mismatch",
+                            status=_status_for("account_number_receipt_mismatch"),
+                            severity=_severity_for("account_number_receipt_mismatch"),
+                            reason=reason,
+                            values=values,
+                            pairs=pairs,
+                            comparison=_comparison_from_pair(pairs[0], "不一致"),
+                            scope="cross_evidence",
+                        )
                     )
-                account_values.append(
-                    {
-                        "value_norm": "receipt_present_but_unreadable",
-                        "value_raw_examples": ["回单图片存在，但支行字段不可识别"],
-                        "count": len(receipt_blocks),
-                        "examples": [asdict(occ)],
-                    }
-                )
-                findings.append(
-                    ConsistencyFinding(
-                        type="account_bank_receipt_unreadable",
-                        status=_status_for("account_bank_receipt_unreadable"),
-                        severity=_severity_for("account_bank_receipt_unreadable"),
-                        reason=reason,
-                        values=account_values,
-                        pairs=[pair] if pair else [],
-                        scope="cross_evidence",
-                    )
-                )
 
     # High-signal placeholder check for legal representative name in fixed forms.
     legal_name_values = bucket.get("legal_representative_name") or {}
@@ -810,9 +937,10 @@ def find_inconsistencies(
                     }
                 )
                 reason = (
-                    f"{_field_label('tender_no_cross_doc')}不匹配："
-                    f"投标文件为“{pairs[0]['left']['value']}”({_loc_text(pairs[0]['left'])})，"
-                    f"招标文件为“{pairs[0]['right']['value']}”({_loc_text(pairs[0]['right'])})"
+                    f"{_field_label('tender_no_cross_doc')}核验："
+                    f"证据A=“{pairs[0]['left']['value']}”({_loc_text(pairs[0]['left'])})，"
+                    f"证据B=“{pairs[0]['right']['value']}”({_loc_text(pairs[0]['right'])})，"
+                    "结论：不一致"
                 )
                 findings.append(
                     ConsistencyFinding(
@@ -822,6 +950,7 @@ def find_inconsistencies(
                         reason=reason,
                         values=values,
                         pairs=pairs,
+                        comparison=_comparison_from_pair(pairs[0], "不一致"),
                         scope="cross_doc",
                     )
                 )

@@ -123,7 +123,29 @@ class ConsistencyTests(unittest.TestCase):
             ),
         ]
         findings = find_inconsistencies(blocks)
-        self.assertIn("tender_no", {item.type for item in findings})
+        by_type = {item.type: item for item in findings}
+        self.assertIn("tender_no", by_type)
+        tender_finding = by_type["tender_no"]
+        self.assertEqual(tender_finding.status, "fail")
+        self.assertEqual((tender_finding.comparison or {}).get("conclusion"), "不一致")
+
+    def test_detects_authorized_representative_name_conflict(self) -> None:
+        blocks = [
+            Block(
+                doc_id="bid",
+                text="授权委托书 委托代理人：王五",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="授权委托书 委托代理人：赵六",
+                location=Location(block_index=2, page=2, section="Normal"),
+            ),
+        ]
+        findings = find_inconsistencies(blocks)
+        by_type = {item.type: item for item in findings}
+        self.assertIn("authorized_representative_name", by_type)
+        self.assertEqual(by_type["authorized_representative_name"].status, "fail")
 
     def test_detects_placeholder_legal_representative_name(self) -> None:
         blocks = [
@@ -196,6 +218,25 @@ class ConsistencyTests(unittest.TestCase):
         ]
         findings = find_inconsistencies(blocks)
         self.assertIn("account_bank_receipt_unreadable", {item.type for item in findings})
+
+    def test_detects_account_number_conflict_inside_bid(self) -> None:
+        blocks = [
+            Block(
+                doc_id="bid",
+                text="开户账号：610820402",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="账号：610820499",
+                location=Location(block_index=2, page=2, section="Normal"),
+            ),
+        ]
+        findings = find_inconsistencies(blocks)
+        by_type = {item.type: item for item in findings}
+        self.assertIn("account_number", by_type)
+        self.assertEqual(by_type["account_number"].status, "fail")
+        self.assertEqual((by_type["account_number"].comparison or {}).get("conclusion"), "不一致")
 
 
 if __name__ == "__main__":

@@ -141,6 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_gate_options(gate_parser)
     annotate_parser = subparsers.add_parser("annotate", parents=[common], help="generate annotations sidecar")
     annotate_parser.add_argument("--bid-source", default=None, help="optional original bid file for annotated copy")
+    annotate_parser.add_argument(
+        "--blocking-only",
+        action="store_true",
+        help="only annotate blocking items (fail/needs_ocr) to reduce review noise",
+    )
     subparsers.add_parser("report", parents=[common], help="generate markdown report")
     subparsers.add_parser("checklist", parents=[common], help="generate manual review checklist")
     subparsers.add_parser("eval", parents=[common], help="evaluate run outputs with a gold set (runs/<x>/eval/gold.jsonl)")
@@ -184,7 +189,16 @@ def main(argv: list[str] | None = None) -> int:
                 ocr_mode=args.ocr_mode,
             )
         elif args.command == "extract-req":
-            result = extract_req(out_dir=out_dir, focus=args.focus, resume=args.resume)
+            result = extract_req(
+                out_dir=out_dir,
+                focus=args.focus,
+                resume=args.resume,
+                ai_provider=ai_provider,
+                ai_model=args.ai_model,
+                ai_api_key_file=ai_api_key_file,
+                ai_base_url=args.ai_base_url,
+                ai_min_confidence=args.ai_min_confidence,
+            )
         elif args.command == "plan-tasks":
             result = plan_tasks(out_dir=out_dir, resume=args.resume)
         elif args.command == "review":
@@ -218,7 +232,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "annotate":
             bid_source = Path(args.bid_source) if getattr(args, "bid_source", None) else None
-            result = annotate(out_dir=out_dir, resume=args.resume, bid_source=bid_source)
+            result = annotate(
+                out_dir=out_dir,
+                resume=args.resume,
+                bid_source=bid_source,
+                blocking_only=bool(getattr(args, "blocking_only", False)),
+            )
         elif args.command == "report":
             result = report(out_dir=out_dir)
         elif args.command == "checklist":

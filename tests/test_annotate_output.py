@@ -254,6 +254,42 @@ class AnnotateOutputTests(unittest.TestCase):
             row = next(read_jsonl(out_dir / "annotations.jsonl"))
             self.assertEqual((row.get("target") or {}).get("location", {}).get("block_index"), 1)
 
+    def test_annotate_prefers_readable_evidence_over_ocr_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "risk",
+                        "severity": "medium",
+                        "reason": "证据不足",
+                        "evidence": [
+                            {
+                                "doc_id": "bid",
+                                "location": {"block_index": 1, "page": 3},
+                                "excerpt": "202s0in8 er aT eT a oT Pet To 0g 7965. 8qf 2087.7 20053.5q",
+                                "score": 2,
+                                "reference_only": False,
+                            },
+                            {
+                                "doc_id": "bid",
+                                "location": {"block_index": 2, "page": 9},
+                                "excerpt": "我司已提供营业执照复印件并加盖公章，满足招标条款要求。",
+                                "score": 1,
+                                "reference_only": False,
+                                "has_action": True,
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            annotate(out_dir=out_dir, resume=False)
+            row = next(read_jsonl(out_dir / "annotations.jsonl"))
+            self.assertEqual((row.get("target") or {}).get("location", {}).get("block_index"), 2)
+
     def test_resolve_manifest_relative_path_after_cwd_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

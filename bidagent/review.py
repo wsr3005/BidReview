@@ -4,7 +4,7 @@ import hashlib
 import re
 from collections import Counter
 from dataclasses import asdict
-from typing import Iterable
+from typing import Any, Iterable, Protocol
 
 from bidagent.constraints import extract_constraints
 from bidagent.models import Block, Finding, Requirement
@@ -41,8 +41,8 @@ TECHNICAL_HINTS = [
     "源码",
 ]
 
-MANDATORY_HINTS = ["必须", "应", "须", "不得", "严禁", "需", "要求"]
-MANDATORY_STRONG_HINTS = ["必须", "应", "须", "不得", "严禁", "需"]
+MANDATORY_HINTS = ["必须", "应", "须", "不得", "严禁", "要求"]
+MANDATORY_STRONG_HINTS = ["必须", "应", "须", "不得", "严禁"]
 SCORE_HINTS = ["评分", "得分", "加分", "扣分", "分值", "评分标准"]
 
 TIER_ORDER = {"general": 0, "scored": 1, "hard_fail": 2}
@@ -84,6 +84,43 @@ STOP_WORDS = {
     "应当",
     "条款",
     "商务",
+    "提供",
+    "提交",
+    "满足",
+    "符合",
+    "承诺",
+    "声明",
+    "保证",
+    "单位",
+    "项目",
+    "工程",
+    "标段",
+    "本项目",
+    "本次",
+    "合同",
+    "有效期",
+    "招标人",
+    "投标方",
+}
+
+WEAK_MATCH_KEYWORDS = {
+    "提供",
+    "提交",
+    "满足",
+    "符合",
+    "承诺",
+    "声明",
+    "保证",
+    "要求",
+    "文件",
+    "资料",
+    "项目",
+    "工程",
+    "标段",
+    "投标",
+    "投标人",
+    "招标人",
+    "响应",
 }
 
 NON_CHECKABLE_HINTS = [
@@ -99,6 +136,15 @@ NON_CHECKABLE_HINTS = [
     "参见",
     "本表",
     "附表",
+]
+
+NON_BIDDER_PROCESS_HINTS = [
+    "评标委员会",
+    "推荐中标候选人",
+    "招标人",
+    "发包人",
+    "监理人",
+    "承包人",
 ]
 
 EVIDENCE_ACTION_HINTS = [
@@ -146,9 +192,28 @@ def normalize_requirement_text(text: str) -> str:
 
 
 def extract_keywords(text: str, limit: int = 8) -> list[str]:
+    def _noise_keyword(term: str) -> bool:
+        compact = normalize_compact(term)
+        if not compact:
+            return True
+        if term in STOP_WORDS:
+            return True
+        if normalize_text(term) in WEAK_MATCH_KEYWORDS:
+            return True
+        if re.fullmatch(r"\d+", compact):
+            return True
+        if re.fullmatch(r"[0-9a-z]+", compact) and not re.search(r"[a-z]{4,}", compact):
+            return True
+        return False
+
     terms = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", text)
-    ranked = Counter(term for term in terms if term not in STOP_WORDS)
-    return [item for item, _ in ranked.most_common(limit)]
+    ranked = Counter(term for term in terms if not _noise_keyword(term))
+    selected = [item for item, _ in ranked.most_common(limit)]
+    if selected:
+        return selected
+    # Fallback: keep at least some non-numeric terms to avoid empty keyword sets.
+    fallback = [term for term in terms if not re.fullmatch(r"\d+", normalize_compact(term))]
+    return fallback[:limit]
 
 
 def classify_category(text: str) -> str:
@@ -189,6 +254,10 @@ def is_catalog_or_heading(text: str) -> bool:
         return True
     if compact in {"目录", "投标文件目录", "招标文件目录"}:
         return True
+    if "目录" in compact[:16] and re.search(r"[\.·•…]{4,}", compact):
+        return True
+    if re.search(r"[\.·•…]{8,}", compact) and re.search(r"\d{1,4}", compact):
+        return True
     if re.search(r"[\.·•…]{2,}\d+$", compact):
         return True
     if re.match(r"^第[一二三四五六七八九十百零0-9]+[章节条]\S{0,18}$", compact):
@@ -207,6 +276,23 @@ def is_checkable_statement(text: str) -> bool:
     return True
 
 
+def is_bidder_obligation(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text.strip())
+    if not compact:
+        return False
+    if "评标委员会" in compact:
+        return False
+    if re.search(r"按本章第[0-9\.（）()]+.*(得分|评分|评审因素|分值)", compact):
+        return False
+    has_bidder_subject = bool(re.search(r"(投标人|我方|我公司|中标人)", compact))
+    if any(token in compact for token in NON_BIDDER_PROCESS_HINTS) and not has_bidder_subject:
+        return False
+    # Contract administration clauses are usually not direct bid file evidence obligations.
+    if "中标人" in compact and re.search(r"(签订合同|履约担保|放弃中标|赔偿)", compact):
+        return False
+    return True
+
+
 def is_substantive_bid_block(text: str, section: str | None) -> bool:
     compact = re.sub(r"\s+", "", text.strip())
     if not compact:
@@ -219,6 +305,8 @@ def is_substantive_bid_block(text: str, section: str | None) -> bool:
             return False
         return True
     if section and re.search(r"(toc|目录)", section, flags=re.IGNORECASE):
+        return False
+    if "目录" in compact[:16] and re.search(r"[\.·•…]{4,}", compact):
         return False
     if is_catalog_or_heading(compact):
         return False
@@ -352,6 +440,97 @@ def _merge_requirement(existing: Requirement, candidate: Requirement) -> None:
     existing.source["merged_count"] = len(merged_sources)
 
 
+def _append_or_merge_requirement(merged_requirements: list[Requirement], candidate: Requirement) -> None:
+    for existing in merged_requirements:
+        if _same_requirement(existing, candidate):
+            _merge_requirement(existing, candidate)
+            return
+    merged_requirements.append(candidate)
+
+
+class RequirementExtractor(Protocol):
+    provider: str
+    model: str
+    prompt_version: str
+
+    def extract_requirements(self, *, block_text: str, focus: str) -> list[dict[str, Any]]:
+        ...
+
+
+def _build_validated_requirement_from_llm(
+    *,
+    block: Block,
+    raw_item: dict[str, Any],
+    focus: str,
+    extractor: RequirementExtractor,
+    min_confidence: float,
+) -> Requirement | None:
+    text = str(raw_item.get("text") or "").strip()
+    if not text:
+        return None
+    if len(text) < 10:
+        return None
+    if focus == "business":
+        has_business = any(token in text for token in BUSINESS_KEYWORDS)
+        has_technical = any(token in text for token in TECHNICAL_HINTS)
+        # LLM may return concise clauses (e.g. "必须提供营业执照") without explicit "商务" prefix.
+        # Guardrail here should only exclude pure technical clauses.
+        if has_technical and not has_business:
+            return None
+    if not is_checkable_statement(text):
+        return None
+    if not is_bidder_obligation(text):
+        return None
+    if not is_requirement_sentence(text):
+        return None
+
+    confidence = raw_item.get("confidence")
+    try:
+        confidence_value = float(confidence) if confidence is not None else 1.0
+    except (TypeError, ValueError):
+        confidence_value = 0.0
+    if confidence_value < float(min_confidence):
+        return None
+
+    mandatory_raw = raw_item.get("mandatory")
+    if isinstance(mandatory_raw, bool):
+        mandatory = mandatory_raw
+    else:
+        mandatory = any(token in text for token in MANDATORY_STRONG_HINTS)
+
+    tier_raw = str(raw_item.get("rule_tier") or "").strip()
+    rule_tier = tier_raw if tier_raw in TIER_ORDER else infer_rule_tier(text, mandatory=mandatory)
+    category = str(raw_item.get("category") or "").strip() or classify_category(text)
+
+    llm_keywords = [str(item or "").strip() for item in (raw_item.get("keywords") or []) if str(item or "").strip()]
+    keywords = _merge_keywords(extract_keywords(text), llm_keywords, limit=10)
+
+    source = _new_source(block, text)
+    return Requirement(
+        requirement_id="",
+        text=text,
+        category=category,
+        mandatory=mandatory,
+        # Guardrail: constraints are deterministically re-extracted from text.
+        constraints=extract_constraints(text),
+        keywords=keywords,
+        rule_tier=rule_tier,
+        source={
+            "doc_id": source["doc_id"],
+            "location": source["location"],
+            "merged_count": 1,
+            "merged_sources": [source],
+            "extraction": {
+                "engine": "llm_schema_validated",
+                "provider": extractor.provider,
+                "model": extractor.model,
+                "prompt_version": extractor.prompt_version,
+                "confidence": round(confidence_value, 4),
+            },
+        },
+    )
+
+
 def extract_requirements(
     tender_blocks: Iterable[Block],
     focus: str,
@@ -365,6 +544,8 @@ def extract_requirements(
             if not is_business_requirement(text, focus):
                 continue
             if not is_checkable_statement(text):
+                continue
+            if not is_bidder_obligation(text):
                 continue
             if not is_requirement_sentence(text):
                 continue
@@ -386,18 +567,63 @@ def extract_requirements(
                     "merged_sources": [source],
                 },
             )
-            matched = False
-            for existing in merged_requirements:
-                if _same_requirement(existing, candidate):
-                    _merge_requirement(existing, candidate)
-                    matched = True
-                    break
-            if not matched:
-                merged_requirements.append(candidate)
+            _append_or_merge_requirement(merged_requirements, candidate)
 
     for index, requirement in enumerate(merged_requirements, start=1):
         requirement.requirement_id = f"R{index:04d}"
     return merged_requirements
+
+
+def extract_requirements_with_llm(
+    tender_blocks: Iterable[Block],
+    focus: str,
+    extractor: RequirementExtractor,
+    *,
+    min_confidence: float = 0.6,
+) -> tuple[list[Requirement], dict[str, Any]]:
+    merged_requirements: list[Requirement] = []
+    stats: dict[str, Any] = {
+        "provider": extractor.provider,
+        "model": extractor.model,
+        "prompt_version": extractor.prompt_version,
+        "blocks_total": 0,
+        "blocks_with_items": 0,
+        "items_raw": 0,
+        "items_accepted": 0,
+        "items_rejected": 0,
+        "errors": 0,
+    }
+    for block in tender_blocks:
+        text = str(block.text or "").strip()
+        if not text:
+            continue
+        stats["blocks_total"] = int(stats["blocks_total"]) + 1
+        try:
+            raw_items = extractor.extract_requirements(block_text=text, focus=focus)
+        except Exception:  # noqa: BLE001
+            stats["errors"] = int(stats["errors"]) + 1
+            continue
+        normalized_items = [item for item in raw_items if isinstance(item, dict)]
+        if normalized_items:
+            stats["blocks_with_items"] = int(stats["blocks_with_items"]) + 1
+        for raw_item in normalized_items:
+            stats["items_raw"] = int(stats["items_raw"]) + 1
+            candidate = _build_validated_requirement_from_llm(
+                block=block,
+                raw_item=raw_item,
+                focus=focus,
+                extractor=extractor,
+                min_confidence=min_confidence,
+            )
+            if candidate is None:
+                stats["items_rejected"] = int(stats["items_rejected"]) + 1
+                continue
+            stats["items_accepted"] = int(stats["items_accepted"]) + 1
+            _append_or_merge_requirement(merged_requirements, candidate)
+
+    for index, requirement in enumerate(merged_requirements, start=1):
+        requirement.requirement_id = f"R{index:04d}"
+    return merged_requirements, stats
 
 
 def _push_top_match(
@@ -471,12 +697,29 @@ def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterabl
         return []
 
     keyword_to_req_ids: dict[str, set[int]] = {}
+    indexed_requirements: set[int] = set()
+    effective_keyword_count: dict[int, int] = {}
     for index, requirement in enumerate(requirement_list):
         for keyword in requirement.keywords:
             normalized = normalize_text(keyword)
             if not normalized:
                 continue
+            if normalized in WEAK_MATCH_KEYWORDS:
+                continue
             keyword_to_req_ids.setdefault(normalized, set()).add(index)
+            indexed_requirements.add(index)
+            effective_keyword_count[index] = effective_keyword_count.get(index, 0) + 1
+
+    # If a requirement only has weak keywords, fall back to its original keyword set.
+    for index, requirement in enumerate(requirement_list):
+        if index in indexed_requirements:
+            continue
+        for keyword in requirement.keywords:
+            normalized = normalize_text(keyword)
+            if not normalized:
+                continue
+            keyword_to_req_ids.setdefault(normalized, set()).add(index)
+            effective_keyword_count[index] = effective_keyword_count.get(index, 0) + 1
 
     req_scores: dict[int, list[dict]] = {index: [] for index in range(len(requirement_list))}
     for block in bid_blocks:
@@ -497,12 +740,18 @@ def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterabl
     findings: list[Finding] = []
     for index, requirement in enumerate(requirement_list):
         top_matches = req_scores[index]
-        threshold = max(2, min(len(requirement.keywords), 4))
+        keyword_count = effective_keyword_count.get(index, len(requirement.keywords))
+        if keyword_count <= 1:
+            threshold = 1
+        else:
+            threshold = max(2, min(keyword_count, 4))
 
         if not top_matches:
-            status = "fail" if requirement.mandatory else "insufficient_evidence"
-            reason = "未检索到相关证据"
-            severity = "high" if requirement.mandatory else "medium"
+            # No evidence is not proof of non-compliance.
+            # Keep this as a "needs manual supplementation" state.
+            status = "insufficient_evidence"
+            reason = "未定位到可核验证据，建议补充材料页码后复核"
+            severity = "medium" if requirement.mandatory else "low"
             trace = _build_decision_trace(
                 requirement,
                 status=status,
@@ -563,15 +812,15 @@ def review_requirements(requirements: Iterable[Requirement], bid_blocks: Iterabl
             status = "risk"
             gap = threshold - top_score
             if requirement.mandatory and gap >= 2:
-                severity = "high"
-                reason = "仅匹配到弱证据，需人工重点复核"
+                severity = "medium"
+                reason = "证据不足以确认满足，需人工核对并补充定位信息"
             else:
                 severity = "medium" if requirement.mandatory else "low"
-                reason = "检索到部分证据，建议人工复核"
+                reason = "已检索到部分证据，建议补充关键证据后复核"
         else:
             status = "insufficient_evidence"
             severity = "medium"
-            reason = "证据强度不足"
+            reason = "证据不足以形成结论，建议人工补证复核"
 
         trace = _build_decision_trace(
             requirement,

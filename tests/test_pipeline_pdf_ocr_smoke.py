@@ -46,8 +46,8 @@ class PipelinePdfOcrSmokeTests(unittest.TestCase):
                     return_value={"mode": "auto", "engine": "mock", "engine_available": True},
                 ),
                 patch(
-                    "bidagent.ocr.load_ocr_engine",
-                    return_value=lambda _data: "我司已提供有效营业执照复印件。",
+                    "bidagent.ocr._load_ocr_engines",
+                    return_value=[("mock", lambda _data: "我司已提供有效营业执照复印件。")],
                 ),
             ):
                 result = run_pipeline(

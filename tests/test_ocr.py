@@ -60,7 +60,7 @@ class OcrPdfTests(unittest.TestCase):
             image.save(bid_pdf, "PDF")
 
             stats: dict[str, int] = {}
-            with patch("bidagent.ocr.load_ocr_engine", return_value=lambda _data: "营业执照扫描件"):
+            with patch("bidagent.ocr._load_ocr_engines", return_value=[("mock", lambda _data: "营业执照扫描件")]):
                 rows = list(
                     iter_pdf_ocr_blocks(
                         path=bid_pdf,
@@ -78,6 +78,42 @@ class OcrPdfTests(unittest.TestCase):
             self.assertGreaterEqual(int(stats.get("images_total", 0)), 1)
             self.assertGreaterEqual(int(stats.get("images_succeeded", 0)), 1)
             self.assertEqual(int(stats.get("images_failed", 0)), 0)
+
+    def test_iter_pdf_ocr_blocks_falls_back_to_secondary_engine(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            image_path = base / "evidence.png"
+            bid_pdf = base / "bid.pdf"
+
+            image = Image.new("RGB", (220, 80), "white")
+            image.save(image_path)
+            image.save(bid_pdf, "PDF")
+
+            def _primary(_data: bytes) -> str:
+                raise RuntimeError("primary failed")
+
+            def _secondary(_data: bytes) -> str:
+                return "营业执照扫描件"
+
+            stats: dict[str, int] = {}
+            with patch("bidagent.ocr._load_ocr_engines", return_value=[("paddle", _primary), ("tesseract", _secondary)]):
+                rows = list(
+                    iter_pdf_ocr_blocks(
+                        path=bid_pdf,
+                        doc_id="bid",
+                        start_index=0,
+                        ocr_mode="auto",
+                        stats=stats,
+                        max_workers=1,
+                    )
+                )
+
+            self.assertGreaterEqual(len(rows), 1)
+            self.assertGreaterEqual(int(stats.get("images_succeeded", 0)), 1)
+            self.assertEqual(int(stats.get("images_failed", 0)), 0)
+            self.assertIn("tesseract", (stats.get("backend_used_counts") or {}))
 
 
 if __name__ == "__main__":

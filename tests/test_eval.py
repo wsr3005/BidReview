@@ -39,9 +39,11 @@ class EvalTests(unittest.TestCase):
 
             metrics = payload["metrics"]
             self.assertEqual(metrics["hard_fail_total"], 2)
+            self.assertEqual(metrics["hard_fail_blocked"], 2)
+            self.assertEqual(metrics["hard_fail_passed"], 0)
             self.assertEqual(metrics["hard_fail_fail"], 1)
-            self.assertEqual(metrics["hard_fail_missed"], 1)
-            self.assertAlmostEqual(metrics["hard_fail_recall"], 0.5)
+            self.assertEqual(metrics["hard_fail_missed"], 0)
+            self.assertAlmostEqual(metrics["hard_fail_recall"], 1.0)
             self.assertEqual(metrics["false_positive_fail"], 1)
 
     def test_validate_gold_rows_rejects_unknown_labels(self) -> None:

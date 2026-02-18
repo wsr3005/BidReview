@@ -40,9 +40,14 @@ class ReportTests(unittest.TestCase):
                 [
                     {
                         "type": "bidder_name",
-                        "status": "risk",
+                        "status": "fail",
                         "severity": "high",
-                        "reason": "字段 `bidder_name` 出现多个不同取值",
+                        "reason": "投标主体名称核验：证据A=“公司A”，证据B=“公司B”，结论：不一致",
+                        "comparison": {
+                            "evidence_a": {"value": "公司A", "location": {"block_index": 10, "page": 2}},
+                            "evidence_b": {"value": "公司B", "location": {"block_index": 12, "page": 3}},
+                            "conclusion": "不一致",
+                        },
                         "values": [
                             {"value_raw_examples": ["公司A"], "count": 3},
                             {"value_raw_examples": ["公司B"], "count": 2},
@@ -57,6 +62,9 @@ class ReportTests(unittest.TestCase):
             self.assertIn("公司A(count=3)", content)
             self.assertIn("公司B(count=2)", content)
             self.assertIn("(+1 more)", content)
+            self.assertIn("证据A: 公司A@block=10 page=2", content)
+            self.assertIn("证据B: 公司B@block=12 page=3", content)
+            self.assertIn("结论: 不一致", content)
 
 
 if __name__ == "__main__":

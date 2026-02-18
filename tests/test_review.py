@@ -1,12 +1,64 @@
 from __future__ import annotations
 
 import unittest
+from typing import Any
 
 from bidagent.models import Block, Location, Requirement
-from bidagent.review import enforce_evidence_quality_gate, extract_requirements, review_requirements
+from bidagent.review import (
+    enforce_evidence_quality_gate,
+    extract_requirements,
+    extract_requirements_with_llm,
+    review_requirements,
+)
 
 
 class ReviewTests(unittest.TestCase):
+    def test_extract_requirements_with_llm_validates_schema(self) -> None:
+        class _FakeExtractor:
+            provider = "mock"
+            model = "mock-model"
+            prompt_version = "mock-v1"
+
+            def extract_requirements(self, *, block_text: str, focus: str) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "text": "投标人必须提供有效营业执照复印件。",
+                        "category": "资质与证照",
+                        "mandatory": True,
+                        "rule_tier": "hard_fail",
+                        "keywords": ["营业执照", "复印件"],
+                        "confidence": 0.91,
+                    },
+                    {
+                        "text": "目录",
+                        "category": "商务其他",
+                        "mandatory": False,
+                        "rule_tier": "general",
+                        "keywords": ["目录"],
+                        "confidence": 0.95,
+                    },
+                ]
+
+        blocks = [
+            Block(
+                doc_id="tender",
+                text="商务要求：投标人必须提供有效营业执照复印件。",
+                location=Location(block_index=1),
+            )
+        ]
+        requirements, stats = extract_requirements_with_llm(
+            blocks,
+            focus="business",
+            extractor=_FakeExtractor(),
+            min_confidence=0.6,
+        )
+        self.assertEqual(len(requirements), 1)
+        self.assertEqual(requirements[0].rule_tier, "hard_fail")
+        self.assertEqual((requirements[0].source.get("extraction") or {}).get("engine"), "llm_schema_validated")
+        self.assertEqual(stats.get("items_raw"), 2)
+        self.assertEqual(stats.get("items_accepted"), 1)
+        self.assertEqual(stats.get("items_rejected"), 1)
+
     def test_extract_business_requirements_filters_technical(self) -> None:
         blocks = [
             Block(
@@ -24,7 +76,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(requirements), 1)
         self.assertIn("营业执照", requirements[0].text)
 
-    def test_review_returns_fail_without_evidence(self) -> None:
+    def test_review_returns_insufficient_without_evidence(self) -> None:
         requirements = extract_requirements(
             [
                 Block(
@@ -44,7 +96,7 @@ class ReviewTests(unittest.TestCase):
         ]
         findings = review_requirements(requirements, bid_blocks)
         self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].status, "fail")
+        self.assertEqual(findings[0].status, "insufficient_evidence")
 
     def test_extract_requirements_merges_duplicate_requirements(self) -> None:
         blocks = [
@@ -63,7 +115,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(requirements), 1)
         self.assertEqual(requirements[0].source["merged_count"], 2)
 
-    def test_review_marks_high_risk_for_weak_mandatory_evidence(self) -> None:
+    def test_review_marks_medium_risk_for_weak_mandatory_evidence(self) -> None:
         requirements = extract_requirements(
             [
                 Block(
@@ -83,7 +135,7 @@ class ReviewTests(unittest.TestCase):
         ]
         findings = review_requirements(requirements, bid_blocks)
         self.assertEqual(findings[0].status, "risk")
-        self.assertEqual(findings[0].severity, "high")
+        self.assertEqual(findings[0].severity, "medium")
 
     def test_extract_requirements_skips_catalog_and_template_noise(self) -> None:
         blocks = [
@@ -124,6 +176,33 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(requirements), 1)
         self.assertIn("营业执照", requirements[0].text)
 
+    def test_extract_requirements_skips_non_bidder_process_clauses(self) -> None:
+        blocks = [
+            Block(
+                doc_id="tender",
+                text="评标委员会对满足招标文件要求的投标文件进行评分并推荐中标候选人。",
+                location=Location(block_index=1),
+            ),
+            Block(
+                doc_id="tender",
+                text="按本章第2.2.4（1）目规定的评审因素和分值对商务部分计算出得分A。",
+                location=Location(block_index=2),
+            ),
+            Block(
+                doc_id="tender",
+                text="中标人不能按要求提交履约担保的，视为放弃中标并承担赔偿责任。",
+                location=Location(block_index=3),
+            ),
+            Block(
+                doc_id="tender",
+                text="商务要求：投标人必须提供有效营业执照复印件。",
+                location=Location(block_index=4),
+            ),
+        ]
+        requirements = extract_requirements(blocks, focus="business")
+        self.assertEqual(len(requirements), 1)
+        self.assertIn("营业执照", requirements[0].text)
+
     def test_review_ignores_catalog_heading_as_evidence(self) -> None:
         requirements = [
             Requirement(
@@ -142,7 +221,7 @@ class ReviewTests(unittest.TestCase):
             )
         ]
         findings = review_requirements(requirements, bid_blocks)
-        self.assertEqual(findings[0].status, "fail")
+        self.assertEqual(findings[0].status, "insufficient_evidence")
 
     def test_review_accepts_real_content_not_heading(self) -> None:
         requirements = [
@@ -182,7 +261,7 @@ class ReviewTests(unittest.TestCase):
             )
         ]
         findings = review_requirements(requirements, bid_blocks)
-        self.assertEqual(findings[0].status, "fail")
+        self.assertEqual(findings[0].status, "insufficient_evidence")
 
     def test_review_marks_needs_ocr_for_reference_only_scan_evidence(self) -> None:
         requirements = [
@@ -380,7 +459,7 @@ class ReviewTests(unittest.TestCase):
         )
         findings = review_requirements(requirements, bid_blocks=[])
         finding = findings[0]
-        self.assertEqual(finding.status, "fail")
+        self.assertEqual(finding.status, "insufficient_evidence")
         self.assertIsNotNone(finding.decision_trace)
         self.assertEqual(finding.decision_trace["decision"]["top_score"], 0)
         self.assertEqual(finding.decision_trace["evidence_refs"], [])

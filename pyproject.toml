@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Codex" }]
 dependencies = [
+    "paddleocr>=3.4.0",
+    "paddlepaddle>=3.3.0",
     "pillow>=12.1.1",
     "pypdf>=6.7.0",
     "pytesseract>=0.3.13",

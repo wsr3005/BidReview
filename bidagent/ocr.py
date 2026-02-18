@@ -202,19 +202,25 @@ def _load_paddle_engine() -> Callable[[bytes], str] | None:
     return _extract
 
 
-def load_ocr_engine(mode: str) -> Callable[[bytes], str] | None:
+def _load_ocr_engines(mode: str) -> list[tuple[str, Callable[[bytes], str]]]:
     if mode == "off":
-        return None
+        return []
     if mode not in {"auto", "tesseract"}:
-        return None
+        return []
+    engines: list[tuple[str, Callable[[bytes], str]]] = []
     for backend in _backend_order(mode):
         if backend == "paddle":
             engine = _load_paddle_engine()
         else:
             engine = _load_tesseract_engine()
         if engine is not None:
-            return engine
-    return None
+            engines.append((backend, engine))
+    return engines
+
+
+def load_ocr_engine(mode: str) -> Callable[[bytes], str] | None:
+    engines = _load_ocr_engines(mode)
+    return engines[0][1] if engines else None
 
 
 def iter_docx_ocr_blocks(
@@ -225,21 +231,39 @@ def iter_docx_ocr_blocks(
     stats: dict[str, Any] | None = None,
     max_workers: int | None = None,
 ) -> Iterator[Block]:
-    engine = load_ocr_engine(ocr_mode)
-    if engine is None:
+    engines = _load_ocr_engines(ocr_mode)
+    if not engines:
         if isinstance(stats, dict):
             stats.setdefault("engine_available", False)
         return
+    backend_names = [name for name, _ in engines]
+    if isinstance(stats, dict):
+        stats["engine_available"] = True
+        stats["backend_order"] = backend_names
+        stats.setdefault("backend_used_counts", {})
+        stats.setdefault("backend_failures", {})
+        stats.setdefault("sample_errors", [])
 
     current_index = start_index
     if max_workers is None:
-        # Tesseract is CPU-heavy. Default to a conservative concurrency.
-        cpu = os.cpu_count() or 2
-        max_workers = max(1, min(4, cpu // 2))
+        # PaddleOCR object is not guaranteed thread-safe when shared.
+        # Use single-thread by default when paddle backend is enabled.
+        if "paddle" in backend_names:
+            max_workers = 1
+        else:
+            cpu = os.cpu_count() or 2
+            max_workers = max(1, min(4, cpu // 2))
     max_in_flight = max(2, int(max_workers) * 2)
 
-    def _ocr_bytes(image_bytes: bytes) -> str:
-        return engine(image_bytes) or ""
+    def _ocr_bytes(image_bytes: bytes) -> tuple[str, bool, str]:
+        errors: list[str] = []
+        for backend_name, engine in engines:
+            try:
+                text = engine(image_bytes) or ""
+                return text, True, backend_name
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{backend_name}:{exc.__class__.__name__}")
+        return "", False, "; ".join(errors)
 
     seen_hashes: set[str] = set()
     with zipfile.ZipFile(path, "r") as archive:
@@ -262,13 +286,28 @@ def iter_docx_ocr_blocks(
                 nonlocal in_flight
                 name, fut = in_flight.pop(expected_seq)
                 try:
-                    text = fut.result()
+                    text, ok, backend_or_error = fut.result()
                 except Exception:  # noqa: BLE001
                     if isinstance(stats, dict):
                         stats["images_failed"] = int(stats.get("images_failed", 0)) + 1
                     return iter(())
                 if isinstance(stats, dict):
-                    stats["images_succeeded"] = int(stats.get("images_succeeded", 0)) + 1
+                    if ok:
+                        stats["images_succeeded"] = int(stats.get("images_succeeded", 0)) + 1
+                        used_counts = stats.setdefault("backend_used_counts", {})
+                        used_counts[backend_or_error] = int(used_counts.get(backend_or_error, 0)) + 1
+                    else:
+                        stats["images_failed"] = int(stats.get("images_failed", 0)) + 1
+                        failure_counts = stats.setdefault("backend_failures", {})
+                        for token in str(backend_or_error or "").split(";"):
+                            token = token.strip()
+                            if not token:
+                                continue
+                            failure_counts[token] = int(failure_counts.get(token, 0)) + 1
+                        sample_errors = stats.setdefault("sample_errors", [])
+                        if isinstance(sample_errors, list) and len(sample_errors) < 5:
+                            sample_errors.append({"image": name, "error": backend_or_error})
+                        return iter(())
                 # Some images are logos/stamps with no useful text; filter noise.
                 if not normalize_compact(text):
                     return iter(())
@@ -336,11 +375,18 @@ def iter_pdf_ocr_blocks(
     stats: dict[str, Any] | None = None,
     max_workers: int | None = None,
 ) -> Iterator[Block]:
-    engine = load_ocr_engine(ocr_mode)
-    if engine is None:
+    engines = _load_ocr_engines(ocr_mode)
+    if not engines:
         if isinstance(stats, dict):
             stats.setdefault("engine_available", False)
         return
+    backend_names = [name for name, _ in engines]
+    if isinstance(stats, dict):
+        stats["engine_available"] = True
+        stats["backend_order"] = backend_names
+        stats.setdefault("backend_used_counts", {})
+        stats.setdefault("backend_failures", {})
+        stats.setdefault("sample_errors", [])
 
     try:
         from pypdf import PdfReader
@@ -348,12 +394,22 @@ def iter_pdf_ocr_blocks(
         return
 
     if max_workers is None:
-        cpu = os.cpu_count() or 2
-        max_workers = max(1, min(4, cpu // 2))
+        if "paddle" in backend_names:
+            max_workers = 1
+        else:
+            cpu = os.cpu_count() or 2
+            max_workers = max(1, min(4, cpu // 2))
     max_in_flight = max(2, int(max_workers) * 2)
 
-    def _ocr_bytes(image_bytes: bytes) -> str:
-        return engine(image_bytes) or ""
+    def _ocr_bytes(image_bytes: bytes) -> tuple[str, bool, str]:
+        errors: list[str] = []
+        for backend_name, engine in engines:
+            try:
+                text = engine(image_bytes) or ""
+                return text, True, backend_name
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{backend_name}:{exc.__class__.__name__}")
+        return "", False, "; ".join(errors)
 
     reader = PdfReader(str(path))
     total_pages = len(reader.pages)
@@ -375,13 +431,28 @@ def iter_pdf_ocr_blocks(
         def _drain_one(expected_seq: int) -> Iterator[tuple[int, str]]:
             page_no, fut = in_flight.pop(expected_seq)
             try:
-                text = fut.result()
+                text, ok, backend_or_error = fut.result()
             except Exception:  # noqa: BLE001
                 if isinstance(stats, dict):
                     stats["images_failed"] = int(stats.get("images_failed", 0)) + 1
                 return iter(())
             if isinstance(stats, dict):
-                stats["images_succeeded"] = int(stats.get("images_succeeded", 0)) + 1
+                if ok:
+                    stats["images_succeeded"] = int(stats.get("images_succeeded", 0)) + 1
+                    used_counts = stats.setdefault("backend_used_counts", {})
+                    used_counts[backend_or_error] = int(used_counts.get(backend_or_error, 0)) + 1
+                else:
+                    stats["images_failed"] = int(stats.get("images_failed", 0)) + 1
+                    failure_counts = stats.setdefault("backend_failures", {})
+                    for token in str(backend_or_error or "").split(";"):
+                        token = token.strip()
+                        if not token:
+                            continue
+                        failure_counts[token] = int(failure_counts.get(token, 0)) + 1
+                    sample_errors = stats.setdefault("sample_errors", [])
+                    if isinstance(sample_errors, list) and len(sample_errors) < 5:
+                        sample_errors.append({"page": page_no, "error": backend_or_error})
+                    return iter(())
             if not normalize_compact(text):
                 return iter(())
             return iter(((page_no, text),))

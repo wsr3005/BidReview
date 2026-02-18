@@ -105,6 +105,49 @@ _REFERENCE_HINTS = {
     "影印件",
 }
 
+_GENERIC_QUERY_TERMS = {
+    "核验",
+    "核对",
+    "核查",
+    "是否",
+    "存在",
+    "可定位",
+    "证据",
+    "支持",
+    "该要求",
+    "要求",
+    "提供",
+    "提交",
+    "满足",
+    "check",
+    "whether",
+    "requirement",
+}
+
+_FOCUS_SUFFIXES = (
+    "营业执照",
+    "执照",
+    "资质",
+    "证书",
+    "授权书",
+    "委托书",
+    "法定代表人",
+    "授权人",
+    "保证金",
+    "报价",
+    "金额",
+    "税率",
+    "账号",
+    "开户行",
+    "编号",
+    "名称",
+    "日期",
+    "期限",
+    "合同",
+    "发票",
+    "业绩",
+)
+
 
 def _normalize_text(text: Any) -> str:
     return _SPACE_PATTERN.sub("", str(text or "")).lower()
@@ -141,6 +184,74 @@ def _extract_terms(value: Any, *, limit: int = 24) -> list[str]:
         if len(terms) >= limit:
             break
     return terms
+
+
+def _extract_focus_phrases(value: Any, *, limit: int = 8) -> list[str]:
+    source = str(value or "")
+    phrases = re.findall(r"[\u4e00-\u9fff]{2,16}", source)
+    merged: list[str] = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        normalized = _normalize_text(phrase)
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        if not any(suffix in phrase for suffix in _FOCUS_SUFFIXES):
+            continue
+        seen.add(normalized)
+        merged.append(phrase)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _prune_positive_terms(terms: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        normalized = _normalize_text(term)
+        if not normalized:
+            continue
+        if normalized in _GENERIC_QUERY_TERMS:
+            continue
+        if normalized in _STOP_TERMS:
+            continue
+        if len(normalized) < 2:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(term)
+    return merged
+
+
+def _char_ngrams(text: str, *, n: int = 2) -> set[str]:
+    if len(text) <= n:
+        return {text} if text else set()
+    return {text[index : index + n] for index in range(0, len(text) - n + 1)}
+
+
+def _task_relevance(entry: dict[str, Any], positive_terms: list[str]) -> tuple[float, list[str]]:
+    normalized_text = str(entry.get("normalized_text") or "")
+    if not normalized_text:
+        return 0.0, []
+    anchors = [term for term in positive_terms if _normalize_text(term) not in _GENERIC_QUERY_TERMS]
+    matched = [term for term in anchors if _normalize_text(term) and _normalize_text(term) in normalized_text]
+    token_score = 0.0
+    if anchors:
+        token_score = len(matched) / max(1, min(len(anchors), 4))
+
+    anchor_phrase = "".join(_normalize_text(term) for term in anchors[:4])
+    phrase_score = 0.0
+    if anchor_phrase:
+        anchor_ngrams = _char_ngrams(anchor_phrase, n=2)
+        text_ngrams = _char_ngrams(normalized_text, n=2)
+        if anchor_ngrams and text_ngrams:
+            phrase_score = len(anchor_ngrams & text_ngrams) / max(1, len(anchor_ngrams))
+
+    relevance = max(0.0, min(1.0, token_score * 0.7 + phrase_score * 0.3))
+    return relevance, matched
 
 
 def _classify_block_type(section: Any) -> str:
@@ -239,10 +350,13 @@ def _collect_task_terms(task: dict[str, Any]) -> tuple[list[str], list[str]]:
 
     positive_terms: list[str] = []
     positive_terms.extend(_extract_terms(task.get("query"), limit=12))
+    positive_terms.extend(_extract_focus_phrases(task.get("query"), limit=6))
     positive_terms.extend(_extract_terms(task.get("keywords"), limit=8))
     positive_terms.extend(_extract_terms(logic.get("keywords"), limit=8))
+    positive_terms.extend(_extract_focus_phrases(logic.get("requirement_text"), limit=6))
     positive_terms.extend(_extract_terms(logic.get("requirement_text"), limit=8))
 
+    positive_terms = _prune_positive_terms(positive_terms)
     merged_positive: list[str] = []
     seen_positive: set[str] = set()
     for term in positive_terms:
@@ -251,7 +365,9 @@ def _collect_task_terms(task: dict[str, Any]) -> tuple[list[str], list[str]]:
         seen_positive.add(term)
         merged_positive.append(term)
     if not merged_positive:
-        merged_positive = _extract_terms(task.get("query"), limit=8)
+        fallback_terms = _extract_focus_phrases(task.get("query"), limit=6)
+        fallback_terms.extend(_extract_terms(task.get("query"), limit=8))
+        merged_positive = _prune_positive_terms(fallback_terms)
 
     counter_terms: list[str] = []
     counter_terms.extend(_extract_terms(logic.get("counter_keywords"), limit=12))
@@ -267,10 +383,18 @@ def _collect_task_terms(task: dict[str, Any]) -> tuple[list[str], list[str]]:
     return merged_positive, merged_counter
 
 
-def _support_score(entry: dict[str, Any], positive_terms: list[str]) -> tuple[int, list[str]]:
+def _support_score(
+    entry: dict[str, Any],
+    positive_terms: list[str],
+    *,
+    relevance_score: float,
+    relevance_terms: list[str],
+) -> tuple[int, list[str]]:
     normalized = str(entry.get("normalized_text") or "")
-    matched = [term for term in positive_terms if term and term in normalized]
+    matched = [term for term in positive_terms if _normalize_text(term) and _normalize_text(term) in normalized]
     if not matched:
+        return 0, []
+    if relevance_score < 0.2 and not relevance_terms:
         return 0, []
     score = len(matched) * 3
     has_counter_phrase = any(hint in normalized for hint in _COUNTER_HINTS)
@@ -278,6 +402,7 @@ def _support_score(entry: dict[str, Any], positive_terms: list[str]) -> tuple[in
         score += 2
     if entry.get("block_type") in {"ocr", "table"}:
         score += 1
+    score += int(round(relevance_score * 3))
     if bool(entry.get("reference_only")):
         score = 0
     return score, matched
@@ -287,22 +412,27 @@ def _counter_score(
     entry: dict[str, Any],
     positive_terms: list[str],
     counter_terms: list[str],
+    *,
+    relevance_score: float,
+    relevance_terms: list[str],
 ) -> tuple[int, list[str], list[str]]:
     normalized = str(entry.get("normalized_text") or "")
-    relevance_terms = [term for term in positive_terms if term and term in normalized]
-    if not relevance_terms and not bool(entry.get("reference_only")):
+    if not relevance_terms:
+        relevance_terms = [term for term in positive_terms if _normalize_text(term) and _normalize_text(term) in normalized]
+    if not relevance_terms:
+        return 0, [], []
+    if relevance_score < 0.25:
         return 0, [], []
 
-    matched_counter = [term for term in counter_terms if term and term in normalized]
-    score = len(matched_counter) * 4
+    matched_counter = [term for term in counter_terms if _normalize_text(term) and _normalize_text(term) in normalized]
+    if not matched_counter:
+        return 0, [], []
+    score = len(matched_counter) * 3
     strong_hits = [term for term in matched_counter if term in _STRONG_COUNTER_HINTS]
     if strong_hits:
-        score += 20
-    if bool(entry.get("reference_only")):
-        matched_counter.append("reference_only")
-        score += 3
-    if relevance_terms and matched_counter:
-        score += len(relevance_terms)
+        score += 12
+    score += int(round(relevance_score * 6))
+    score += len(relevance_terms)
     deduped_counter = list(dict.fromkeys(matched_counter))
     return score, deduped_counter, relevance_terms
 
@@ -313,6 +443,7 @@ def _to_pack_item(
     polarity: str,
     score: int,
     matched_terms: list[str],
+    relevance_score: float,
 ) -> dict[str, Any]:
     return {
         "evidence_id": entry.get("evidence_id"),
@@ -324,6 +455,7 @@ def _to_pack_item(
         "reference_only": bool(entry.get("reference_only")),
         "polarity": polarity,
         "matched_terms": matched_terms,
+        "relevance_score": round(float(relevance_score), 4),
         "excerpt": str(entry.get("text") or "")[:240],
     }
 
@@ -349,6 +481,8 @@ def harvest_task_evidence(
     counter_pack: list[dict[str, Any]] = []
     candidate_blocks = 0
     reference_only_hits = 0
+    relevant_blocks = 0
+    relevance_threshold = 0.18
 
     for entry in evidence_index:
         if not isinstance(entry, dict):
@@ -359,11 +493,22 @@ def harvest_task_evidence(
         if bool(entry.get("reference_only")):
             reference_only_hits += 1
 
-        support_score, support_terms = _support_score(entry, positive_terms)
+        relevance_score, relevance_terms = _task_relevance(entry, positive_terms)
+        if relevance_score >= relevance_threshold:
+            relevant_blocks += 1
+
+        support_score, support_terms = _support_score(
+            entry,
+            positive_terms,
+            relevance_score=relevance_score,
+            relevance_terms=relevance_terms,
+        )
         counter_score, counter_terms_hit, counter_relevance = _counter_score(
             entry,
             positive_terms,
             counter_terms,
+            relevance_score=relevance_score,
+            relevance_terms=relevance_terms,
         )
 
         if counter_score >= min_counter_score and counter_score >= support_score:
@@ -373,6 +518,7 @@ def harvest_task_evidence(
                     polarity="counter",
                     score=counter_score,
                     matched_terms=list(dict.fromkeys(counter_terms_hit + counter_relevance)),
+                    relevance_score=relevance_score,
                 )
             )
             continue
@@ -384,6 +530,7 @@ def harvest_task_evidence(
                     polarity="support",
                     score=support_score,
                     matched_terms=support_terms,
+                    relevance_score=relevance_score,
                 )
             )
             continue
@@ -395,6 +542,7 @@ def harvest_task_evidence(
                     polarity="counter",
                     score=counter_score,
                     matched_terms=list(dict.fromkeys(counter_terms_hit + counter_relevance)),
+                    relevance_score=relevance_score,
                 )
             )
 
@@ -434,6 +582,8 @@ def harvest_task_evidence(
             "positive_terms": positive_terms,
             "counter_terms": counter_terms,
             "reference_only_hits": reference_only_hits,
+            "relevant_blocks": relevant_blocks,
+            "relevance_threshold": relevance_threshold,
             "top_k": support_limit,
             "counter_k": counter_limit,
             "min_support_score": min_support_score,

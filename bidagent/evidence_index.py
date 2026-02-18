@@ -41,6 +41,25 @@ _OCR_QUERY_HINTS = {
     "ocr",
 }
 
+_QUERY_STOP_TERMS = {
+    "核验",
+    "核对",
+    "是否",
+    "存在",
+    "可定位",
+    "证据",
+    "支持",
+    "要求",
+    "该要求",
+    "检查",
+    "请",
+    "task",
+    "requirement",
+    "evidence",
+    "check",
+    "whether",
+}
+
 
 def _normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
@@ -175,7 +194,54 @@ def build_unified_evidence_index(rows: Iterable[dict[str, Any]]) -> list[dict[st
 
 
 def _extract_query_terms(text: str) -> list[str]:
-    return re.findall(r"[0-9A-Za-z\u4e00-\u9fff]{2,}", text or "")
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[0-9A-Za-z\u4e00-\u9fff]{2,}", text or ""):
+        normalized = _normalize_compact(token)
+        if not normalized:
+            continue
+        if normalized in _QUERY_STOP_TERMS:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        terms.append(token)
+    return terms
+
+
+def _token_set(text: str) -> set[str]:
+    return {
+        token
+        for token in (_normalize_compact(item) for item in re.findall(r"[0-9A-Za-z\u4e00-\u9fff]{2,}", text or ""))
+        if token and token not in _QUERY_STOP_TERMS
+    }
+
+
+def _char_ngrams(text: str, n: int = 2) -> set[str]:
+    compact = _normalize_compact(text)
+    if len(compact) <= n:
+        return {compact} if compact else set()
+    return {compact[index : index + n] for index in range(0, len(compact) - n + 1)}
+
+
+def _semantic_similarity(query: str, text: str, terms: list[str]) -> float:
+    query_tokens = _token_set(query)
+    text_tokens = _token_set(text)
+    token_overlap = 0.0
+    if query_tokens and text_tokens:
+        token_overlap = len(query_tokens & text_tokens) / max(1, len(query_tokens))
+
+    key_phrase = "".join(_normalize_compact(term) for term in terms[:4])
+    if not key_phrase:
+        key_phrase = _normalize_compact(query)
+    phrase_overlap = 0.0
+    if key_phrase:
+        query_grams = _char_ngrams(key_phrase, n=2)
+        text_grams = _char_ngrams(text, n=2)
+        if query_grams and text_grams:
+            phrase_overlap = len(query_grams & text_grams) / max(1, len(query_grams))
+
+    return max(0.0, min(1.0, token_overlap * 0.6 + phrase_overlap * 0.4))
 
 
 def _score_candidate(candidate: dict[str, Any], *, query: str, terms: list[str]) -> float:
@@ -200,7 +266,8 @@ def _score_candidate(candidate: dict[str, Any], *, query: str, terms: list[str])
         source_bonus = 0.3
 
     length_bonus = min(len(text), 300) / 1000.0
-    return float(overlap) + phrase_bonus + source_bonus + length_bonus
+    semantic_bonus = _semantic_similarity(query, text, terms) * 2.5
+    return float(overlap) + phrase_bonus + source_bonus + length_bonus + semantic_bonus
 
 
 def retrieve_evidence_candidates(

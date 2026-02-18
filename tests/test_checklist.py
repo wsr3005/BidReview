@@ -9,7 +9,7 @@ from bidagent.pipeline import checklist
 
 
 class ChecklistTests(unittest.TestCase):
-    def test_checklist_exports_fail_and_high_risk(self) -> None:
+    def test_checklist_exports_blocking_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)
             write_jsonl(
@@ -56,9 +56,9 @@ class ChecklistTests(unittest.TestCase):
             result = checklist(out_dir)
             rows = list(read_jsonl(out_dir / "manual-review.jsonl"))
 
-            self.assertEqual(result["manual_review"], 3)
-            self.assertEqual(len(rows), 3)
-            self.assertEqual({row["requirement_id"] for row in rows}, {"R0001", "R0002", "R0004"})
+            self.assertEqual(result["manual_review"], 4)
+            self.assertEqual(len(rows), 4)
+            self.assertEqual({row["requirement_id"] for row in rows}, {"R0001", "R0002", "R0003", "R0004"})
             self.assertTrue((out_dir / "manual-review.md").exists())
 
 

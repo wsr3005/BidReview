@@ -83,6 +83,25 @@ class EvidenceIndexTests(unittest.TestCase):
         )
         self.assertEqual(retrieve_evidence_candidates(indexed, "   ", top_k=3), [])
 
+    def test_retrieve_evidence_candidates_hybrid_semantic_boost(self) -> None:
+        indexed = build_unified_evidence_index(
+            [
+                {
+                    "doc_id": "bid",
+                    "text": "法定代表人身份证明文件已提交并加盖公章。",
+                    "location": {"block_index": 1, "page": 2},
+                },
+                {
+                    "doc_id": "bid",
+                    "text": "项目付款方式详见合同条款。",
+                    "location": {"block_index": 2, "page": 3},
+                },
+            ]
+        )
+        ranked = retrieve_evidence_candidates(indexed, "法人身份证明", top_k=1)
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0]["location"]["block_index"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

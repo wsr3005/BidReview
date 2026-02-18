@@ -10,14 +10,17 @@ from bidagent.io_utils import ensure_dir, read_jsonl
 
 VALID_GOLD_STATUSES = {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"}
 VALID_GOLD_TIERS = {"hard_fail", "scored", "general"}
+HARD_FAIL_BLOCKING_STATUSES = {"fail", "risk", "needs_ocr", "insufficient_evidence"}
 
 
 @dataclass(slots=True)
 class EvalMetrics:
     total: int
     hard_fail_total: int
+    hard_fail_blocked: int  # hard_fail rows that are blocked by non-pass result
+    hard_fail_passed: int  # hard_fail rows that slipped to pass
     hard_fail_fail: int
-    hard_fail_missed: int  # expected hard_fail but got not-fail
+    hard_fail_missed: int  # alias of hard_fail_passed for compatibility
     hard_fail_recall: float
     non_fail_total: int
     false_positive_fail: int
@@ -157,6 +160,8 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
 
     total = 0
     hard_fail_total = 0
+    hard_fail_blocked = 0
+    hard_fail_passed = 0
     hard_fail_fail = 0
     hard_fail_missed = 0
     non_fail_total = 0
@@ -172,10 +177,13 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
 
         if tier == "hard_fail":
             hard_fail_total += 1
+            if got in HARD_FAIL_BLOCKING_STATUSES:
+                hard_fail_blocked += 1
+            else:
+                hard_fail_passed += 1
             if got == "fail":
                 hard_fail_fail += 1
-            else:
-                hard_fail_missed += 1
+            hard_fail_missed = hard_fail_passed
 
         if expected != "fail" and got == "fail":
             non_fail_total += 1
@@ -193,11 +201,15 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
             }
         )
 
-    recall = (hard_fail_fail / hard_fail_total) if hard_fail_total else 0.0
+    # Recall is defined as "hard-fail blocking recall":
+    # any non-pass result blocks release and is counted as intercepted.
+    recall = (hard_fail_blocked / hard_fail_total) if hard_fail_total else 0.0
     false_positive_fail_rate = (false_positive_fail / non_fail_total) if non_fail_total else 0.0
     metrics = EvalMetrics(
         total=total,
         hard_fail_total=hard_fail_total,
+        hard_fail_blocked=hard_fail_blocked,
+        hard_fail_passed=hard_fail_passed,
         hard_fail_fail=hard_fail_fail,
         hard_fail_missed=hard_fail_missed,
         hard_fail_recall=recall,
