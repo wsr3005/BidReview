@@ -23,6 +23,7 @@ Use this checklist for each task lane.
 Run `.\scripts\verify.ps1` first, then fill gaps manually if needed.
 Optional discipline check: `.\scripts\check-task-cards.ps1` (use `-FailOnUntracked` to enforce).
 Use `docs/l3-test-matrix.md` as the canonical L3 test dimensions and thresholds.
+Optional matrix runner: `.\scripts\test-matrix.ps1 -Level t0|t1|t2|rc`.
 
 1. Run lint or static checks.
 2. Run relevant unit tests.
@@ -81,6 +82,7 @@ Required checks per lane
 
 Source of truth: `docs/l3-task-board.md`
 Lane briefs: `docs/l3-lane-cards.md`
+Architecture blueprint: `docs/bid-review-architecture-blueprint.md`
 
 Prepared phase bundles:
 1. Phase 2: evidence indexing, active evidence harvesting, counter-evidence auditing

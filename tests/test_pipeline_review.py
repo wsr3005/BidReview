@@ -8,8 +8,8 @@ from unittest.mock import patch
 import json
 
 from bidagent.io_utils import read_jsonl, write_jsonl
-from bidagent.models import Block, Finding, Location
-from bidagent.pipeline import gate, ingest, plan_tasks, review, run_pipeline, verdict
+from bidagent.models import Block, Finding, Location, Requirement
+from bidagent.pipeline import extract_req, gate, ingest, plan_tasks, review, run_pipeline, verdict
 
 
 class _DummyReviewer:
@@ -21,6 +21,90 @@ class _DummyReviewer:
 
 
 class PipelineReviewTests(unittest.TestCase):
+    def test_extract_req_uses_llm_schema_when_coverage_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+            write_jsonl(
+                ingest_dir / "tender_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "tender",
+                        "text": "商务要求：投标人必须提供有效营业执照复印件。",
+                        "location": {"block_index": 1, "page": 1, "section": "Normal"},
+                    }
+                ],
+            )
+
+            rule_reqs = [
+                Requirement("R0001", "规则条款A", "商务其他", True, ["规则"], []),
+                Requirement("R0002", "规则条款B", "商务其他", True, ["规则"], []),
+            ]
+            llm_reqs = [
+                Requirement("R0001", "投标人必须提供有效营业执照复印件。", "资质与证照", True, ["营业执照"], [])
+            ]
+            with (
+                patch("bidagent.pipeline._load_api_key", return_value="sk-test"),
+                patch("bidagent.pipeline.extract_requirements", return_value=rule_reqs),
+                patch(
+                    "bidagent.pipeline.extract_requirements_with_llm",
+                    return_value=(llm_reqs, {"items_accepted": 1}),
+                ),
+            ):
+                result = extract_req(
+                    out_dir=out_dir,
+                    focus="business",
+                    resume=False,
+                    ai_provider="deepseek",
+                )
+
+            rows = list(read_jsonl(out_dir / "requirements.jsonl"))
+            self.assertEqual(result.get("extract_engine"), "llm_schema_validated")
+            self.assertEqual(len(rows), 1)
+            self.assertIn("营业执照", rows[0]["text"])
+
+    def test_extract_req_falls_back_when_llm_coverage_low(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+            write_jsonl(
+                ingest_dir / "tender_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "tender",
+                        "text": "商务要求：投标人必须提供营业执照。商务要求：投标人必须提供授权书。",
+                        "location": {"block_index": 1, "page": 1, "section": "Normal"},
+                    }
+                ],
+            )
+
+            rule_reqs = [
+                Requirement("R0001", "投标人必须提供营业执照。", "资质与证照", True, ["营业执照"], []),
+                Requirement("R0002", "投标人必须提供授权书。", "有效期与响应", True, ["授权书"], []),
+                Requirement("R0003", "投标人必须提供承诺函。", "有效期与响应", True, ["承诺函"], []),
+                Requirement("R0004", "投标人必须提供报价单。", "报价与税费", True, ["报价单"], []),
+            ]
+            with (
+                patch("bidagent.pipeline._load_api_key", return_value="sk-test"),
+                patch("bidagent.pipeline.extract_requirements", return_value=rule_reqs),
+                patch(
+                    "bidagent.pipeline.extract_requirements_with_llm",
+                    return_value=([], {"items_accepted": 0}),
+                ),
+            ):
+                result = extract_req(
+                    out_dir=out_dir,
+                    focus="business",
+                    resume=False,
+                    ai_provider="deepseek",
+                )
+
+            rows = list(read_jsonl(out_dir / "requirements.jsonl"))
+            self.assertEqual(result.get("extract_engine"), "rule_fallback")
+            self.assertEqual(len(rows), 4)
+
     def test_resume_ai_partial_llm_triggers_refill(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)
@@ -152,10 +236,13 @@ class PipelineReviewTests(unittest.TestCase):
             manifest = json.loads((out_dir / "ingest" / "manifest.json").read_text(encoding="utf-8"))
             self.assertIn("ocr", manifest)
             self.assertEqual((manifest.get("ocr") or {}).get("mode"), "auto")
+            self.assertEqual(str(manifest.get("doc_map_schema_version")), "doc-map-v1")
             self.assertEqual(result["bid_blocks"], 2)
             rows = list(read_jsonl(out_dir / "ingest" / "bid_blocks.jsonl"))
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[-1]["location"]["section"], "OCR_MEDIA")
+            self.assertEqual((result.get("doc_map") or {}).get("docs"), 2)
+            self.assertTrue((out_dir / "ingest" / "doc-map.json").exists())
 
     def test_plan_tasks_uses_requirement_decomposition(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -390,6 +477,72 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertTrue(skipped)
             self.assertTrue(any(item.get("name") == "false_positive_fail_rate" for item in skipped))
 
+    def test_gate_evidence_traceability_requires_bid_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            (out_dir / "eval").mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [{"requirement_id": "R0001", "text": "必须提供营业执照", "rule_tier": "hard_fail", "mandatory": True}],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "risk",
+                        "score": 1,
+                        "severity": "medium",
+                        "reason": "仅命中弱证据，建议复核",
+                        "decision_trace": {
+                            "clause_source": {
+                                "doc_id": "tender",
+                                "location": {"block_index": 3, "page": 1, "section": "BODY"},
+                            },
+                            "evidence_refs": [],
+                        },
+                        "evidence": [],
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "verdicts.jsonl",
+                [
+                    {
+                        "task_id": "task-r1",
+                        "requirement_id": "R0001",
+                        "status": "risk",
+                        "confidence": 0.72,
+                        "reason": "证据不足",
+                        "evidence_refs": [],
+                        "counter_evidence_refs": [],
+                        "model": {"provider": "rule_fallback", "name": "rule-only"},
+                        "decision_trace": {"decision": {"status": "risk"}},
+                    }
+                ],
+            )
+            (out_dir / "eval" / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "hard_fail_recall": 1.0,
+                            "false_positive_fail_rate": 0.0,
+                            "false_positive_fail": 0,
+                            "non_fail_total": 1,
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = gate(out_dir=out_dir, requested_release_mode="auto_final")
+            self.assertEqual(result["release_mode"], "assist_only")
+            self.assertAlmostEqual((result.get("metrics") or {}).get("evidence_traceability"), 0.0)
+            self.assertAlmostEqual((result.get("metrics") or {}).get("llm_coverage"), 0.0)
+
     def test_verdict_harvests_evidence_refs_from_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)
@@ -431,10 +584,14 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertGreaterEqual(result.get("evidence_packs", 0), 1)
             rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
             self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "risk")
             self.assertTrue(rows[0]["evidence_refs"])
             self.assertEqual(rows[0]["counter_evidence_refs"], [])
             self.assertTrue((out_dir / "evidence-packs.jsonl").exists())
             trace = rows[0].get("decision_trace") or {}
+            floor = trace.get("status_floor") or {}
+            self.assertTrue(floor.get("enabled"))
+            self.assertEqual(floor.get("floor_status"), "risk")
             self.assertEqual((trace.get("evidence_index") or {}).get("unified_blocks_indexed"), 1)
             self.assertIsInstance((trace.get("evidence_harvest") or {}).get("query_terms"), list)
 

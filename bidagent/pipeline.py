@@ -14,6 +14,7 @@ from bidagent import __version__
 from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
 from bidagent.consistency import find_inconsistencies
 from bidagent.document import iter_document_blocks
+from bidagent.doc_map import build_ingest_doc_map
 from bidagent.evidence_harvester import (
     build_evidence_index as build_task_evidence_index,
     harvest_task_evidence,
@@ -23,7 +24,12 @@ from bidagent.evidence_index import build_unified_evidence_index, retrieve_evide
 from bidagent.eval import evaluate_run
 from bidagent.io_utils import append_jsonl, ensure_dir, path_ready, read_jsonl, write_jsonl
 from bidagent.llm_judge import judge_tasks_with_llm, write_verdicts_jsonl
-from bidagent.llm import DEEPSEEK_PROMPT_VERSION, DeepSeekReviewer, apply_llm_review
+from bidagent.llm import (
+    DEEPSEEK_PROMPT_VERSION,
+    DeepSeekRequirementExtractor,
+    DeepSeekReviewer,
+    apply_llm_review,
+)
 from bidagent.models import Block, Finding, Location, Requirement
 from bidagent.ocr import iter_document_ocr_blocks, ocr_selfcheck
 from bidagent.review import (
@@ -31,18 +37,19 @@ from bidagent.review import (
     REVIEW_RULE_VERSION,
     enforce_evidence_quality_gate,
     extract_requirements,
+    extract_requirements_with_llm,
     review_requirements,
 )
 from bidagent.task_planner import ensure_review_tasks
 
 VALID_RELEASE_MODES = {"assist_only", "auto_final"}
 VALID_GATE_FAIL_FAST_MODES = {"off", "critical", "all"}
-CRITICAL_GATE_CHECKS = {"hard_fail_recall", "false_positive_fail_rate"}
+CRITICAL_GATE_CHECKS = {"hard_fail_recall", "false_positive_fail_rate", "evidence_traceability"}
 DEFAULT_GATE_THRESHOLDS = {
     "auto_review_coverage": 0.95,
     "hard_fail_recall": 0.98,
     "false_positive_fail_rate": 0.01,
-    "evidence_traceability": 0.99,
+    "evidence_traceability": 1.0,
     "llm_coverage": 1.0,
 }
 VERDICT_STRATEGY_VERSION = "verdict-harvest-v1"
@@ -52,6 +59,9 @@ RELEASE_TRACE_SCHEMA_VERSION = "release-trace-v1"
 AUTO_FINAL_GUARD_POLICY_VERSION = "auto-final-guard-v1"
 AUTO_FINAL_HISTORY_FILENAME = "auto-final-history.jsonl"
 DEFAULT_CANARY_MIN_STREAK = 3
+BLOCKING_FINDING_STATUSES = {"fail", "needs_ocr", "risk", "insufficient_evidence"}
+STATUS_PRIORITY = ("fail", "needs_ocr", "risk", "insufficient_evidence", "pass")
+STATUS_PRIORITY_INDEX = {name: index for index, name in enumerate(STATUS_PRIORITY)}
 EVIDENCE_TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{2,}")
 POSITIVE_EVIDENCE_HINTS = (
     "已提供",
@@ -663,6 +673,7 @@ def ingest(
     ensure_dir(ingest_dir)
     tender_out = ingest_dir / "tender_blocks.jsonl"
     bid_out = ingest_dir / "bid_blocks.jsonl"
+    doc_map_path = ingest_dir / "doc-map.json"
     manifest_path = ingest_dir / "manifest.json"
 
     tender_meta = _count_doc_media(tender_path, page_range)
@@ -734,6 +745,30 @@ def ingest(
         if isinstance(previous_manifest.get("ocr"), dict):
             summary["ocr"] = previous_manifest.get("ocr")
 
+    doc_map_can_resume = path_ready(doc_map_path, resume) and page_range_matches and ocr_mode_matches
+    if not doc_map_can_resume:
+        doc_map = build_ingest_doc_map(
+            tender_rows=read_jsonl(tender_out),
+            bid_rows=read_jsonl(bid_out),
+        )
+        doc_map_path.write_text(json.dumps(doc_map, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        try:
+            doc_map = json.loads(doc_map_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            doc_map = build_ingest_doc_map(
+                tender_rows=read_jsonl(tender_out),
+                bid_rows=read_jsonl(bid_out),
+            )
+            doc_map_path.write_text(json.dumps(doc_map, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    doc_entries = doc_map.get("docs") if isinstance(doc_map, dict) else []
+    summary["doc_map"] = {
+        "path": str(doc_map_path),
+        "schema_version": str((doc_map or {}).get("schema_version") or "doc-map-v1"),
+        "docs": len(doc_entries) if isinstance(doc_entries, list) else 0,
+    }
+
     manifest = {
         "tender_path": str(tender_path.resolve()),
         "bid_path": str(bid_path.resolve()),
@@ -744,13 +779,24 @@ def ingest(
         "tender_meta": tender_meta,
         "bid_meta": bid_meta,
         "ocr": summary.get("ocr", ocr_selfcheck(ocr_mode)),
+        "doc_map_path": str(doc_map_path),
+        "doc_map_schema_version": str((doc_map or {}).get("schema_version") or "doc-map-v1"),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return summary
 
 
-def extract_req(out_dir: Path, focus: str, resume: bool = False) -> dict[str, Any]:
+def extract_req(
+    out_dir: Path,
+    focus: str,
+    resume: bool = False,
+    ai_provider: str | None = None,
+    ai_model: str = "deepseek-chat",
+    ai_api_key_file: Path | None = None,
+    ai_base_url: str = "https://api.deepseek.com/v1",
+    ai_min_confidence: float = 0.65,
+) -> dict[str, Any]:
     ingest_dir = out_dir / "ingest"
     tender_path = ingest_dir / "tender_blocks.jsonl"
     req_path = out_dir / "requirements.jsonl"
@@ -758,10 +804,40 @@ def extract_req(out_dir: Path, focus: str, resume: bool = False) -> dict[str, An
         total = sum(1 for _ in read_jsonl(req_path))
         return {"requirements": total}
 
-    tender_blocks = _iter_blocks_from_jsonl(tender_path)
+    tender_blocks = list(_iter_blocks_from_jsonl(tender_path))
     requirements = extract_requirements(tender_blocks, focus=focus)
+    summary: dict[str, Any] = {"extract_engine": "rule"}
+    if ai_provider == "deepseek":
+        try:
+            api_key = _load_api_key(ai_provider, ai_api_key_file)
+            extractor = DeepSeekRequirementExtractor(
+                api_key=api_key or "",
+                model=ai_model,
+                base_url=ai_base_url,
+            )
+            llm_requirements, llm_stats = extract_requirements_with_llm(
+                tender_blocks=tender_blocks,
+                focus=focus,
+                extractor=extractor,
+                min_confidence=max(0.5, float(ai_min_confidence) - 0.1),
+            )
+            summary["extract_llm"] = llm_stats
+            rule_total = len(requirements)
+            llm_total = len(llm_requirements)
+            acceptance_ratio = llm_total / max(1, rule_total)
+            if llm_total > 0 and acceptance_ratio >= 0.3:
+                requirements = llm_requirements
+                summary["extract_engine"] = "llm_schema_validated"
+            else:
+                summary["extract_engine"] = "rule_fallback"
+                summary["extract_fallback_reason"] = "llm_low_coverage_or_empty"
+        except Exception as exc:  # noqa: BLE001
+            summary["extract_engine"] = "rule_fallback"
+            summary["extract_fallback_reason"] = str(exc)
+
     total = write_jsonl(req_path, (item.to_dict() for item in requirements))
-    return {"requirements": total}
+    summary["requirements"] = total
+    return summary
 
 
 def review(
@@ -848,10 +924,25 @@ def _resolve_bid_source(out_dir: Path, bid_source: Path | None) -> Path | None:
     return None
 
 
+def _is_blocking_finding_status(status: str) -> bool:
+    return str(status or "").strip() in BLOCKING_FINDING_STATUSES
+
+
+def _review_action_for_status(status: str) -> str:
+    if status == "fail":
+        return "请优先核查该条款是否确实不满足；如已满足，请补充对应证据页码。"
+    if status == "needs_ocr":
+        return "请人工核读扫描件/附件图片内容，确认是否满足该条款。"
+    if status == "risk":
+        return "请补充关键证明材料并重新复核。"
+    return "请补充可定位证据后复核。"
+
+
 def annotate(
     out_dir: Path,
     resume: bool = False,
     bid_source: Path | None = None,
+    blocking_only: bool = False,
 ) -> dict[str, Any]:
     annotations_path = out_dir / "annotations.jsonl"
     markdown_path = out_dir / "annotations.md"
@@ -898,6 +989,8 @@ def annotate(
     for row in findings:
         if row["status"] == "pass":
             continue
+        if blocking_only and not _is_blocking_finding_status(str(row.get("status") or "")):
+            continue
         evidence = row.get("evidence", [])
         primary = _choose_primary_evidence(evidence, status=str(row.get("status") or ""))
         if not primary:
@@ -923,6 +1016,7 @@ def annotate(
                 "status": row["status"],
                 "severity": row["severity"],
                 "reason": row["reason"],
+                "review_action": _review_action_for_status(str(row.get("status") or "")),
                 "target": {
                     "doc_id": primary.get("doc_id", "bid"),
                     "location": primary.get("location"),
@@ -932,7 +1026,7 @@ def annotate(
                 "alternate_targets": alternates,
                 "note": (
                     f"[{row['severity']}] {row['requirement_id']} {row['status']}: "
-                    f"{row['reason']}"
+                    f"{row['reason']} | 复核动作：{_review_action_for_status(str(row.get('status') or ''))}"
                 ),
             }
         )
@@ -953,6 +1047,11 @@ def annotate(
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     result = {"annotations": len(issue_rows)}
+    if not issue_rows:
+        result["annotated_copy"] = None
+        result["annotation_note"] = "未发现阻断问题，未生成批注副本。"
+        return result
+
     if source_path is None or not source_path.exists():
         result["annotated_copy"] = None
         result["annotation_warning"] = "Bid source file not found. Sidecar annotation files were generated."
@@ -1023,11 +1122,7 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     for finding in read_jsonl(findings_path):
         requirement = req_map.get(finding["requirement_id"], {})
         tier = str(requirement.get("rule_tier") or "general")
-        is_manual = (
-            finding["status"] in {"fail", "needs_ocr"}
-            or finding.get("severity") == "high"
-            or (tier == "hard_fail" and finding.get("status") != "pass")
-        )
+        is_manual = finding.get("status") != "pass"
         if not is_manual:
             continue
         evidence = finding.get("evidence", [])
@@ -1089,8 +1184,10 @@ def consistency(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         return {"consistency_findings": total}
 
     bid_path = out_dir / "ingest" / "bid_blocks.jsonl"
+    tender_path = out_dir / "ingest" / "tender_blocks.jsonl"
     bid_blocks = _iter_blocks_from_jsonl(bid_path)
-    findings = find_inconsistencies(bid_blocks)
+    tender_blocks = _iter_blocks_from_jsonl(tender_path) if tender_path.exists() else None
+    findings = find_inconsistencies(bid_blocks, tender_blocks=tender_blocks)
     total = write_jsonl(out_path, (item.to_dict() for item in findings))
     return {"consistency_findings": total}
 
@@ -1141,6 +1238,27 @@ def _choose_primary_evidence(evidence: Any, *, status: str | None = None) -> dic
                 score += 1
         return score
 
+    def _excerpt_readability_score(excerpt: str) -> int:
+        compact = re.sub(r"\s+", "", excerpt or "")
+        if not compact:
+            return 0
+        total = len(compact)
+        cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", compact))
+        latin_runs = len(re.findall(r"[A-Za-z]{3,}", compact))
+        ratio = cjk_chars / max(1, total)
+        if ratio >= 0.45 and cjk_chars >= 10:
+            score = 3
+        elif ratio >= 0.25 and cjk_chars >= 6:
+            score = 2
+        elif ratio >= 0.10 and cjk_chars >= 4:
+            score = 1
+        else:
+            score = 0
+        # De-prioritize OCR noise strings (long latin garbage mixed with sparse CJK).
+        if latin_runs >= 8 and ratio < 0.20:
+            score = max(0, score - 1)
+        return score
+
     best: dict[str, Any] = {}
     best_key: tuple[int, int, int, int, int] = (-1, -1, -1, -1, -1)
     for item in candidates:
@@ -1151,14 +1269,15 @@ def _choose_primary_evidence(evidence: Any, *, status: str | None = None) -> dic
         has_action = 1 if item.get("has_action") else 0
         excerpt = str(item.get("excerpt") or "").strip()
         excerpt_len = len(excerpt)
+        readable = _excerpt_readability_score(excerpt)
         try:
             score = int(item.get("score") or 0)
         except (TypeError, ValueError):
             score = 0
         if status == "needs_ocr":
-            key = (mappable, _ocr_hint_score(excerpt), excerpt_len, score, has_action)
+            key = (mappable, _ocr_hint_score(excerpt), score, excerpt_len, has_action)
         else:
-            key = (mappable, score, has_action, excerpt_len, 0)
+            key = (mappable, readable, score, has_action, excerpt_len)
         if key > best_key:
             best_key = key
             best = item
@@ -1300,6 +1419,25 @@ def _status_confidence_hint(status: str) -> float:
     if status == "needs_ocr":
         return 0.35
     return 0.30
+
+
+def _normalize_status(value: Any, *, default: str = "insufficient_evidence") -> str:
+    status = str(value or "").strip()
+    if status in STATUS_PRIORITY_INDEX:
+        return status
+    return default
+
+
+def _status_not_looser_than(current: str, floor: str) -> str:
+    current_normalized = _normalize_status(current)
+    floor_normalized = _normalize_status(floor)
+    if STATUS_PRIORITY_INDEX[floor_normalized] < STATUS_PRIORITY_INDEX[current_normalized]:
+        return floor_normalized
+    return current_normalized
+
+
+def _is_real_llm_provider(provider: Any) -> bool:
+    return str(provider or "").strip().lower() in {"deepseek"}
 
 
 def _normalize_search_text(value: Any) -> str:
@@ -1869,7 +2007,12 @@ def verdict(
         rows = list(read_jsonl(verdicts_path))
         counts = Counter(str(row.get("status") or "") for row in rows)
         llm_coverage = _safe_ratio(
-            sum(1 for row in rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
+            sum(
+                1
+                for row in rows
+                if isinstance(row.get("model"), dict)
+                and _is_real_llm_provider(row.get("model", {}).get("provider"))
+            ),
             len(rows),
         )
         evidence_packs_total = sum(1 for _ in read_jsonl(evidence_packs_path)) if evidence_packs_path.exists() else 0
@@ -2083,6 +2226,15 @@ def verdict(
         confidence = max(0.0, min(1.0, _safe_float(second_pass.get("confidence")) or confidence))
         second_pass_audit = second_pass.get("audit") if isinstance(second_pass.get("audit"), dict) else {}
         downgrade_action = second_pass_audit.get("action") if second_pass_audit else None
+        status_before_floor = status
+        if finding:
+            status = _status_not_looser_than(status, fallback_status)
+            if status != status_before_floor:
+                reason = (
+                    f"最终结论不得优于预审结论({fallback_status})，"
+                    f"已由{status_before_floor}收敛为{status}"
+                )
+                confidence = min(confidence, _status_confidence_hint(status))
 
         model = {}
         provider = str((llm or {}).get("provider") or getattr(task_reviewer, "provider", "") or "")
@@ -2124,6 +2276,13 @@ def verdict(
             "action": downgrade_action,
             "second_pass": second_pass_audit,
         }
+        decision_trace["status_floor"] = {
+            "enabled": bool(finding),
+            "floor_status": _normalize_status(fallback_status),
+            "status_before_floor": status_before_floor,
+            "status_after_floor": status,
+            "downgraded": bool(finding) and status != status_before_floor,
+        }
         decision_trace["evidence_refs"] = support_refs
         decision_trace["counter_evidence_refs"] = counter_refs
         decision_trace.setdefault("decision", {})
@@ -2152,7 +2311,12 @@ def verdict(
     write_verdicts_jsonl(verdicts_path, verdict_rows)
     counts = Counter(str(row.get("status") or "") for row in verdict_rows)
     llm_coverage = _safe_ratio(
-        sum(1 for row in verdict_rows if isinstance(row.get("model"), dict) and row.get("model", {}).get("provider")),
+        sum(
+            1
+            for row in verdict_rows
+            if isinstance(row.get("model"), dict)
+            and _is_real_llm_provider(row.get("model", {}).get("provider"))
+        ),
         len(verdict_rows),
     )
     return {
@@ -2161,6 +2325,93 @@ def verdict(
         "status_counts": dict(counts),
         "llm_coverage": llm_coverage,
     }
+
+
+def _sync_findings_from_verdicts(out_dir: Path) -> dict[str, Any]:
+    """Materialize downstream findings from verdict results.
+
+    Business intent:
+    - Use the task-aggregated verdict as the final requirement-level status.
+    - Carry forward traceable evidence refs so annotation/report/checklist align with
+      the latest review strategy rather than stale pre-verdict findings.
+    """
+    verdicts_path = out_dir / "verdicts.jsonl"
+    findings_path = out_dir / "findings.jsonl"
+    if not verdicts_path.exists():
+        return {"synced": False, "reason": "verdicts_missing"}
+
+    existing_rows = list(read_jsonl(findings_path)) if findings_path.exists() else []
+    existing_by_requirement = {
+        str(row.get("requirement_id") or "").strip(): row
+        for row in existing_rows
+        if str(row.get("requirement_id") or "").strip()
+    }
+
+    synced_rows: list[dict[str, Any]] = []
+    for row in read_jsonl(verdicts_path):
+        requirement_id = str(row.get("requirement_id") or "").strip()
+        if not requirement_id:
+            continue
+        base = existing_by_requirement.get(requirement_id, {})
+        status = str(row.get("status") or base.get("status") or "insufficient_evidence")
+        decision_trace = row.get("decision_trace") if isinstance(row.get("decision_trace"), dict) else {}
+
+        evidence: list[dict[str, Any]] = []
+        for item in (decision_trace.get("evidence_refs") if isinstance(decision_trace, dict) else []) or []:
+            if not isinstance(item, dict):
+                continue
+            evidence.append(
+                {
+                    "evidence_id": item.get("evidence_id"),
+                    "excerpt_hash": item.get("excerpt_hash"),
+                    "doc_id": item.get("doc_id"),
+                    "location": item.get("location"),
+                    "score": item.get("score"),
+                    "excerpt": item.get("excerpt"),
+                    "source": item.get("source"),
+                    "reference_only": item.get("reference_only"),
+                    "has_action": item.get("has_action"),
+                }
+            )
+        if not evidence:
+            for item in base.get("evidence") or []:
+                if isinstance(item, dict):
+                    evidence.append(item)
+
+        score = 0
+        for item in evidence:
+            try:
+                item_score = int(item.get("score") or 0)
+            except (TypeError, ValueError):
+                item_score = 0
+            score = max(score, item_score)
+
+        model = row.get("model") if isinstance(row.get("model"), dict) else {}
+        confidence = _safe_float(row.get("confidence"))
+        llm_payload = {
+            "provider": model.get("provider"),
+            "model": model.get("name"),
+            "prompt_version": model.get("prompt_version"),
+            "confidence": confidence,
+        }
+
+        synced_rows.append(
+            {
+                "requirement_id": requirement_id,
+                "clause_id": str(base.get("clause_id") or requirement_id),
+                "status": status,
+                "score": score,
+                "severity": _status_to_severity(status),
+                "reason": str(row.get("reason") or base.get("reason") or "任务聚合结论"),
+                "decision_trace": decision_trace or base.get("decision_trace"),
+                "evidence": evidence,
+                "llm": llm_payload,
+            }
+        )
+
+    write_jsonl(findings_path, synced_rows)
+    counts = Counter(str(item.get("status") or "") for item in synced_rows)
+    return {"synced": True, "findings": len(synced_rows), "status_counts": dict(counts)}
 
 
 def _load_eval_metrics(out_dir: Path) -> dict[str, Any] | None:
@@ -2193,6 +2444,17 @@ def _finding_has_traceable_evidence(finding: dict[str, Any]) -> bool:
             continue
         if _is_mappable_location(evidence.get("location")):
             return True
+
+    trace = finding.get("decision_trace")
+    if not isinstance(trace, dict):
+        return False
+
+    for evidence_ref in trace.get("evidence_refs") or []:
+        if not isinstance(evidence_ref, dict):
+            continue
+        if _is_mappable_location(evidence_ref.get("location")):
+            return True
+
     return False
 
 
@@ -2231,12 +2493,13 @@ def gate(
         for row in verdict_rows
         if str(row.get("requirement_id") or "").strip()
         and isinstance(row.get("model"), dict)
-        and row.get("model", {}).get("provider")
+        and _is_real_llm_provider(row.get("model", {}).get("provider"))
     }
 
     auto_review_coverage = _safe_ratio(len(verdict_requirement_ids), requirements_total)
+    findings_with_traceable_evidence = sum(1 for row in finding_rows if _finding_has_traceable_evidence(row))
     evidence_traceability = _safe_ratio(
-        sum(1 for row in finding_rows if _finding_has_traceable_evidence(row)),
+        findings_with_traceable_evidence,
         len(finding_rows),
     )
     llm_coverage = _safe_ratio(len(llm_requirement_ids), requirements_total)
@@ -2330,6 +2593,8 @@ def gate(
             "verdict_requirement_covered": len(verdict_requirement_ids),
             "llm_requirement_covered": len(llm_requirement_ids),
             "findings_total": len(finding_rows),
+            "requirements_with_evidence": findings_with_traceable_evidence,
+            "requirements_without_evidence": max(0, len(finding_rows) - findings_with_traceable_evidence),
             "auto_review_coverage": auto_review_coverage,
             "hard_fail_recall": hard_fail_recall,
             "false_positive_fail_rate": false_positive_fail_rate,
@@ -2356,6 +2621,7 @@ def report(out_dir: Path) -> dict[str, Any]:
     if manual_review_path.exists():
         manual_review_total = sum(1 for _ in read_jsonl(manual_review_path))
     counts = Counter(item["status"] for item in findings)
+    blocking_findings = [item for item in findings if _is_blocking_finding_status(str(item.get("status") or ""))]
     tier_counts = Counter(str(item.get("rule_tier") or "general") for item in requirements)
     req_tier_map = {item.get("requirement_id"): str(item.get("rule_tier") or "general") for item in requirements}
     hard_fail_status = Counter(
@@ -2375,6 +2641,7 @@ def report(out_dir: Path) -> dict[str, Any]:
         f"- scored_requirements: {tier_counts.get('scored', 0)}",
         f"- general_requirements: {tier_counts.get('general', 0)}",
         f"- pass: {counts.get('pass', 0)}",
+        f"- blocking_items(non-pass): {len(blocking_findings)}",
         f"- fail: {counts.get('fail', 0)}",
         f"- risk: {counts.get('risk', 0)}",
         f"- needs_ocr: {counts.get('needs_ocr', 0)}",
@@ -2387,26 +2654,30 @@ def report(out_dir: Path) -> dict[str, Any]:
         f"- consistency_findings: {len(consistency_findings)}",
         f"- manual_review_items: {manual_review_total}",
         "",
-        "## Findings",
+        "## Blocking Findings (Need Action, Non-Pass)",
         "",
     ]
 
     req_map = {item["requirement_id"]: item for item in requirements}
-    for item in findings:
+    if not blocking_findings:
+        lines.append("- none")
+    for item in blocking_findings:
         requirement = req_map.get(item["requirement_id"], {})
         trace_text = _format_finding_trace(item)
         evidence_text = _format_primary_evidence(item)
         tier = str(requirement.get("rule_tier") or "general")
         lines.append(
             "- "
-            + f"[{item['status']}/{item['severity']}] {item['requirement_id']} "
-            + f"({tier}/{requirement.get('category', 'N/A')}): {item['reason']} | {evidence_text} | trace: {trace_text}"
+                + f"[{item['status']}/{item['severity']}] {item['requirement_id']} "
+                + f"({tier}/{requirement.get('category', 'N/A')}): {item['reason']} | {evidence_text} | trace: {trace_text}"
         )
 
     if consistency_findings:
         lines.extend(["", "## Consistency Findings", ""])
         for item in consistency_findings:
             values = item.get("values") or []
+            pairs = item.get("pairs") or []
+            comparison = item.get("comparison") if isinstance(item.get("comparison"), dict) else {}
             # Keep the report readable; include top 2 values only.
             top_values = []
             for value_row in values[:2]:
@@ -2420,11 +2691,39 @@ def report(out_dir: Path) -> dict[str, Any]:
                     values_text = f"{values_text} (+{more_count} more)"
                 else:
                     values_text = f"(+{more_count} more)"
+            pair_text = ""
+            if comparison:
+                left = comparison.get("evidence_a") if isinstance(comparison.get("evidence_a"), dict) else {}
+                right = comparison.get("evidence_b") if isinstance(comparison.get("evidence_b"), dict) else {}
+                left_loc = _format_trace_location(left.get("location")) if left else "block=N/A page=N/A"
+                right_loc = _format_trace_location(right.get("location")) if right else "block=N/A page=N/A"
+                conclusion = _sanitize_md_text(comparison.get("conclusion"), limit=30)
+                pair_text = (
+                    " | 证据A: "
+                    + f"{_sanitize_md_text(left.get('value'), limit=40)}@{left_loc}"
+                    + " | 证据B: "
+                    + f"{_sanitize_md_text(right.get('value'), limit=40)}@{right_loc}"
+                    + f" | 结论: {conclusion}"
+                )
+            elif pairs:
+                first_pair = pairs[0] if isinstance(pairs[0], dict) else {}
+                left = first_pair.get("left") if isinstance(first_pair.get("left"), dict) else {}
+                right = first_pair.get("right") if isinstance(first_pair.get("right"), dict) else {}
+                left_loc = _format_trace_location(left.get("location"))
+                right_loc = _format_trace_location(right.get("location"))
+                pair_text = (
+                    " | 证据A: "
+                    + f"{_sanitize_md_text(left.get('value'), limit=40)}@{left_loc}"
+                    + " | 证据B: "
+                    + f"{_sanitize_md_text(right.get('value'), limit=40)}@{right_loc}"
+                    + " | 结论: 不一致"
+                )
             lines.append(
                 "- "
                 + f"[{item.get('status', 'risk')}/{item.get('severity', 'medium')}] "
                 + f"{item.get('type')}: {item.get('reason')} "
                 + f"| values: {values_text}"
+                + pair_text
             )
 
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2462,7 +2761,16 @@ def run_pipeline(
         page_range=page_range,
         ocr_mode=ocr_mode,
     )
-    summary["extract_req"] = extract_req(out_dir=out_dir, focus=focus, resume=resume)
+    summary["extract_req"] = extract_req(
+        out_dir=out_dir,
+        focus=focus,
+        resume=resume,
+        ai_provider=ai_provider,
+        ai_model=ai_model,
+        ai_api_key_file=ai_api_key_file,
+        ai_base_url=ai_base_url,
+        ai_min_confidence=ai_min_confidence,
+    )
     summary["plan_tasks"] = plan_tasks(out_dir=out_dir, resume=resume)
     summary["review"] = review(
         out_dir=out_dir,
@@ -2484,6 +2792,7 @@ def run_pipeline(
         ai_workers=ai_workers,
         ai_min_confidence=ai_min_confidence,
     )
+    summary["sync_findings"] = _sync_findings_from_verdicts(out_dir=out_dir)
     # Even when resuming expensive upstream stages, keep downstream deliverables fresh.
     # This also guarantees a new timestamped annotated copy after each `run`.
     downstream_resume = False
@@ -2491,6 +2800,7 @@ def run_pipeline(
         out_dir=out_dir,
         resume=downstream_resume,
         bid_source=bid_path,
+        blocking_only=True,
     )
     summary["checklist"] = checklist(out_dir=out_dir, resume=downstream_resume)
     summary["consistency"] = consistency(out_dir=out_dir, resume=downstream_resume)
