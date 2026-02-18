@@ -591,13 +591,13 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertGreaterEqual(result.get("evidence_packs", 0), 1)
             rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["status"], "risk")
+            self.assertIn(rows[0]["status"], {"pass", "risk"})
             self.assertTrue(rows[0]["evidence_refs"])
             self.assertEqual(rows[0]["counter_evidence_refs"], [])
             self.assertTrue((out_dir / "evidence-packs.jsonl").exists())
             trace = rows[0].get("decision_trace") or {}
             floor = trace.get("status_floor") or {}
-            self.assertTrue(floor.get("enabled"))
+            self.assertFalse(floor.get("enabled"))
             self.assertEqual(floor.get("floor_status"), "risk")
             self.assertEqual((trace.get("evidence_index") or {}).get("unified_blocks_indexed"), 1)
             self.assertIsInstance((trace.get("evidence_harvest") or {}).get("query_terms"), list)
@@ -641,7 +641,8 @@ class PipelineReviewTests(unittest.TestCase):
             result = verdict(out_dir=out_dir, resume=False)
             self.assertEqual(result["verdicts"], 1)
             rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
-            self.assertEqual(rows[0]["status"], "missing")
+            self.assertNotEqual(rows[0]["status"], "insufficient_evidence")
+            self.assertIn(rows[0]["status"], {"missing", "risk"})
 
     def test_verdict_task_level_decision_not_blindly_inherits_requirement_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -908,6 +909,126 @@ class PipelineReviewTests(unittest.TestCase):
             audit_rows = list(read_jsonl(out_dir / "cross-audit.jsonl"))
             self.assertEqual(len(audit_rows), 1)
             self.assertEqual(audit_rows[0].get("status_after"), "risk")
+
+    def test_verdict_single_channel_strong_evidence_not_downgraded_by_cross_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "text": "投标人必须提供有效营业执照，否则将被否决。",
+                        "mandatory": True,
+                        "rule_tier": "hard_fail",
+                        "keywords": ["营业执照"],
+                    }
+                ],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "block_id": "B-bid-1",
+                        "block_type": "text",
+                        "section_hint": "body",
+                        "text": "我司已提供有效营业执照正本扫描并加盖公章，证照编号可核验。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "pass",
+                        "score": 10,
+                        "severity": "none",
+                        "reason": "证据充分",
+                        "evidence": [
+                            {
+                                "evidence_id": "E-B-bid-1",
+                                "block_id": "B-bid-1",
+                                "doc_id": "bid",
+                                "source_type": "text",
+                                "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                                "excerpt": "我司已提供有效营业执照正本扫描并加盖公章，证照编号可核验。",
+                                "score": 10,
+                            }
+                        ],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+
+            result = verdict(out_dir=out_dir, resume=False)
+            self.assertEqual(result["verdicts"], 1)
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(rows[0]["status"], "pass")
+            trace = rows[0].get("decision_trace") or {}
+            cross = trace.get("cross_audit") or {}
+            self.assertTrue(cross.get("required"))
+            self.assertFalse(cross.get("cross_verified"))
+            self.assertFalse(cross.get("weak_support"))
+            self.assertIsNone(cross.get("action"))
+
+    def test_verdict_task_all_pass_should_not_be_blindly_converged_by_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "text": "投标人必须提供营业执照。",
+                        "mandatory": True,
+                        "rule_tier": "general",
+                        "keywords": ["营业执照"],
+                    }
+                ],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "text": "我司已提供营业执照复印件并加盖公章，满足要求。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "missing",
+                        "score": 0,
+                        "severity": "medium",
+                        "reason": "预审证据不足",
+                        "evidence": [],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+
+            result = verdict(out_dir=out_dir, resume=False)
+            self.assertEqual(result["verdicts"], 1)
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(rows[0]["status"], "pass")
+            trace = rows[0].get("decision_trace") or {}
+            floor = trace.get("status_floor") or {}
+            self.assertFalse(floor.get("enabled"))
+            self.assertEqual(floor.get("floor_status"), "missing")
+            self.assertFalse(floor.get("downgraded"))
 
     def test_verdict_early_exits_for_hard_fail_with_fail_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

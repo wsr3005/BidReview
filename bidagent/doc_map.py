@@ -10,6 +10,8 @@ _HEADING_STYLE_PATTERN = re.compile(r"(heading|title|标题)", flags=re.IGNORECA
 _CHAPTER_HEADING_PATTERN = re.compile(
     r"^(第[一二三四五六七八九十百零0-9]+[章节编部分篇卷]\s*.*|[0-9]{1,2}(?:\.[0-9]{1,3}){1,4}\s*.+)$"
 )
+_CHAPTER_IN_TEXT_PATTERN = re.compile(r"第[一二三四五六七八九十百零0-9]+[章节编部分篇卷]")
+_LONG_ANCHOR_HINT_PATTERN = re.compile(r"(投标人须知|评标办法|合同条款|技术规范|商务条款|资格审查)")
 _TOC_LINE_PATTERN = re.compile(r"^(?P<title>.+?)(?:[\.·•…\-—]{2,}|\s{2,})(?P<page>\d{1,4})$")
 _SPACE_PATTERN = re.compile(r"\s+")
 
@@ -96,7 +98,9 @@ def _build_anchor_candidates(rows: list[dict[str, Any]]) -> list[_Anchor]:
         location = row.get("location") if isinstance(row.get("location"), dict) else {}
         section = _normalize_space(location.get("section")) or None
         compact = re.sub(r"\s+", "", text)
-        if len(compact) > 72:
+        prefix = compact[:140]
+        long_heading_hint = bool(_CHAPTER_IN_TEXT_PATTERN.search(prefix) or _LONG_ANCHOR_HINT_PATTERN.search(prefix))
+        if len(compact) > 220 and not long_heading_hint:
             continue
         if _TOC_LINE_PATTERN.match(compact):
             # TOC lines are hints, not physical heading anchors.
@@ -107,10 +111,14 @@ def _build_anchor_candidates(rows: list[dict[str, Any]]) -> list[_Anchor]:
             score += 4
         if _CHAPTER_HEADING_PATTERN.match(compact):
             score += 4
+        if long_heading_hint:
+            score += 3
         if compact.startswith("第") and any(token in compact[:8] for token in ("章", "节", "篇", "编")):
             score += 2
         if compact.startswith("目录"):
             score += 1
+        if len(compact) > 120 and score < 3:
+            continue
         if score <= 0:
             continue
 

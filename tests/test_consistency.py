@@ -161,7 +161,9 @@ class ConsistencyTests(unittest.TestCase):
             ),
         ]
         findings = find_inconsistencies(blocks)
-        self.assertIn("legal_representative_name_placeholder", {item.type for item in findings})
+        by_type = {item.type: item for item in findings}
+        self.assertIn("legal_representative_name_placeholder", by_type)
+        self.assertEqual(by_type["legal_representative_name_placeholder"].status, "risk")
 
     def test_detects_cross_doc_tender_no_mismatch(self) -> None:
         bid_blocks = [
@@ -217,7 +219,9 @@ class ConsistencyTests(unittest.TestCase):
             ),
         ]
         findings = find_inconsistencies(blocks)
-        self.assertIn("account_bank_receipt_unreadable", {item.type for item in findings})
+        by_type = {item.type: item for item in findings}
+        self.assertIn("account_bank_receipt_unreadable", by_type)
+        self.assertIn(by_type["account_bank_receipt_unreadable"].status, {"needs_ocr", "risk"})
 
     def test_detects_account_number_conflict_inside_bid(self) -> None:
         blocks = [

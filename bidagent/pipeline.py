@@ -109,6 +109,12 @@ STRONG_CONFLICT_HINTS = (
     "作废",
     "驳回",
 )
+DUAL_EVIDENCE_HINT_PATTERNS = (
+    r"(至少|需|应|必须).{0,6}(两|二|2).{0,8}(证据|证明|材料|来源|渠道)",
+    r"(双证|双重证据|交叉核验|交叉验证|相互印证)",
+    r"(同时|分别).{0,12}(提供|提交).{0,18}(与|和|及).{0,12}(提供|提交|证明)",
+    r"(承诺函|偏离表|附件|证明).{0,10}(与|和|及).{0,10}(承诺函|偏离表|附件|证明)",
+)
 
 
 def _row_to_block(row: dict[str, Any]) -> Block:
@@ -2253,11 +2259,13 @@ def _counter_conflict_second_pass(
     next_confidence = confidence
 
     if status == "pass" and counter_top > 0:
-        if strong_hits > 0 or counter_top >= support_top:
+        # Conservative but not over-sensitive: downgrade only when strong counter
+        # evidence clearly dominates support evidence.
+        if strong_hits > 0 and counter_top >= max(8, support_top + 3):
             conflict_level = "strong"
             downgraded = True
             next_status = "risk"
-            next_reason = "命中强反证/冲突证据，pass结论不稳定，已降级为risk"
+            next_reason = "命中强反证且分值显著高于支持证据，pass结论不稳定，已降级为risk"
             next_confidence = min(confidence, 0.55)
         else:
             conflict_level = "weak"
@@ -2315,18 +2323,49 @@ def _evidence_channel_from_ref(ref: dict[str, Any]) -> str:
 def _requirement_needs_cross_verification(requirement: dict[str, Any]) -> bool:
     if not isinstance(requirement, dict):
         return False
-    if bool(requirement.get("mandatory", False)):
-        return True
+    tier = str(requirement.get("rule_tier") or "general")
+    text = str(requirement.get("text") or "")
+    keywords = " ".join(str(item or "") for item in (requirement.get("keywords") or []))
+    probe = f"{text} {keywords}"
+    hard_clause = tier == "hard_fail" or bool(
+        re.search(r"(将被否决|废标|无效投标|资格审查不通过|不得投标|不予通过)", probe)
+    )
+    explicit_dual_evidence = any(
+        re.search(pattern, probe, flags=re.IGNORECASE) for pattern in DUAL_EVIDENCE_HINT_PATTERNS
+    )
+    return bool(hard_clause or explicit_dual_evidence)
+
+
+def _is_high_risk_requirement(requirement: dict[str, Any]) -> bool:
+    if not isinstance(requirement, dict):
+        return False
     tier = str(requirement.get("rule_tier") or "general")
     if tier == "hard_fail":
         return True
     text = str(requirement.get("text") or "")
-    keywords = " ".join(str(item or "") for item in (requirement.get("keywords") or []))
-    probe = f"{text} {keywords}"
-    return any(
-        token in probe
-        for token in ("承诺", "偏离", "保证金", "资质", "营业执照", "授权", "报价", "附件", "证明")
-    )
+    return bool(re.search(r"(将被否决|废标|无效投标|资格审查不通过|不得投标|不予通过)", text))
+
+
+def _support_evidence_is_weak(support_refs: list[dict[str, Any]]) -> bool:
+    if not support_refs:
+        return True
+    scores: list[float] = []
+    reference_only_hits = 0
+    for item in support_refs:
+        if not isinstance(item, dict):
+            continue
+        score = _safe_float(item.get("score"))
+        if score is not None:
+            scores.append(score)
+        if bool(item.get("reference_only")):
+            reference_only_hits += 1
+    max_score = max(scores) if scores else 0.0
+    avg_score = (sum(scores) / len(scores)) if scores else 0.0
+    if max_score >= 8 and avg_score >= 6.5 and len(support_refs) >= 2 and reference_only_hits == 0:
+        return False
+    if max_score >= 9 and reference_only_hits == 0:
+        return False
+    return True
 
 
 def _apply_cross_audit(
@@ -2344,14 +2383,16 @@ def _apply_cross_audit(
     required = _requirement_needs_cross_verification(requirement)
     applicable = required and bool(support_refs)
     verified = len(support_channels) >= 2 if applicable else False
+    high_risk = _is_high_risk_requirement(requirement)
+    weak_support = _support_evidence_is_weak(support_refs)
 
     next_status = status
     next_reason = reason
     next_confidence = confidence
     action = None
-    if applicable and not verified and status == "pass":
+    if applicable and not verified and status == "pass" and high_risk and weak_support:
         next_status = "risk"
-        next_reason = "跨渠道核验不足（仅单渠道支持证据），已降级为risk"
+        next_reason = "高风险条款跨渠道核验不足且支持证据偏弱，已降级为risk"
         next_confidence = min(confidence, 0.58)
         action = "downgrade_pass_to_risk_cross_verification"
 
@@ -2363,6 +2404,8 @@ def _apply_cross_audit(
         "cross_verified": verified,
         "support_channels": support_channels,
         "counter_channels": counter_channels,
+        "high_risk": high_risk,
+        "weak_support": weak_support,
         "support_refs": len(support_refs),
         "counter_refs": len(counter_refs),
         "status_before": status,
@@ -2662,7 +2705,8 @@ def verdict(
         second_pass_audit = second_pass.get("audit") if isinstance(second_pass.get("audit"), dict) else {}
         downgrade_action = second_pass_audit.get("action") if second_pass_audit else None
         status_before_floor = status
-        if finding:
+        floor_enforced = bool(finding) and _normalize_status(fallback_status) in {"fail", "needs_ocr"}
+        if floor_enforced:
             status = _status_not_looser_than(status, fallback_status)
             if status != status_before_floor:
                 reason = (
@@ -2731,11 +2775,11 @@ def verdict(
             "second_pass": second_pass_audit,
         }
         decision_trace["status_floor"] = {
-            "enabled": bool(finding),
+            "enabled": floor_enforced,
             "floor_status": _normalize_status(fallback_status),
             "status_before_floor": status_before_floor,
             "status_after_floor": status_after_floor,
-            "downgraded": bool(finding) and status_after_floor != status_before_floor,
+            "downgraded": floor_enforced and status_after_floor != status_before_floor,
         }
         decision_trace["cross_audit"] = cross_audit_row
         decision_trace["evidence_refs"] = support_refs

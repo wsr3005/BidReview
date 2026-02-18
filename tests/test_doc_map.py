@@ -58,7 +58,32 @@ class DocMapTests(unittest.TestCase):
         self.assertEqual((sections[0].get("range") or {}).get("start_block"), 1)
         self.assertEqual((sections[0].get("range") or {}).get("end_block"), 2)
 
+    def test_build_ingest_doc_map_extracts_anchor_from_long_paragraph_heading(self) -> None:
+        tender_rows = [
+            {
+                "doc_id": "tender",
+                "text": (
+                    "本章对评标流程进行说明。根据项目安排，第七章 评标办法与定标原则将明确"
+                    "资格审查、否决条款与评分细则，投标人须严格遵循。"
+                ),
+                "location": {"block_index": 20, "page": 6, "section": "Normal"},
+            },
+            {
+                "doc_id": "tender",
+                "text": "评标委员会根据评标办法进行评分与否决项核验。",
+                "location": {"block_index": 21, "page": 6, "section": "Normal"},
+            },
+        ]
+        bid_rows = [{"doc_id": "bid", "text": "投标文件正文", "location": {"block_index": 1, "page": 1}}]
+
+        payload = build_ingest_doc_map(tender_rows=tender_rows, bid_rows=bid_rows)
+        tender = next(item for item in (payload.get("docs") or []) if item.get("doc_id") == "tender")
+        anchors = tender.get("anchors") or []
+        self.assertGreaterEqual(len(anchors), 1)
+        sections = tender.get("sections") or []
+        tags = {str(item.get("semantic_tag") or "") for item in sections}
+        self.assertIn("evaluation_risk", tags)
+
 
 if __name__ == "__main__":
     unittest.main()
-

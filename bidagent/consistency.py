@@ -126,6 +126,10 @@ def _severity_for(fact_type: str) -> str:
 
 
 def _status_for(fact_type: str) -> str:
+    if fact_type == "account_bank_receipt_unreadable":
+        return "needs_ocr"
+    if fact_type == "legal_representative_name_placeholder":
+        return "risk"
     if fact_type in {
         "bidder_name",
         "tender_no",
@@ -134,12 +138,10 @@ def _status_for(fact_type: str) -> str:
         "account_bank",
         "account_number",
         "tender_no_cross_doc",
-        "legal_representative_name_placeholder",
         "bidder_name_authorization_mismatch",
         "bidder_name_legal_representative_mismatch",
         "account_bank_receipt_mismatch",
         "account_number_receipt_mismatch",
-        "account_bank_receipt_unreadable",
     }:
         return "fail"
     return "risk"
