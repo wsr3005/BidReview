@@ -141,6 +141,57 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(stats.get("items_accepted"), 1)
         self.assertEqual(stats.get("items_rejected"), 1)
 
+    def test_extract_requirements_with_llm_uses_semantic_cache(self) -> None:
+        class _CacheExtractor:
+            provider = "mock"
+            model = "mock-model"
+            prompt_version = "mock-v1"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def extract_requirements(self, *, block_text: str, focus: str, profile: str = "biz") -> list[dict[str, Any]]:
+                self.calls += 1
+                return [
+                    {
+                        "text": "投标人必须提供有效营业执照。",
+                        "category": "资质与证照",
+                        "mandatory": True,
+                        "rule_tier": "hard_fail",
+                        "keywords": ["营业执照"],
+                        "confidence": 0.91,
+                    }
+                ]
+
+        blocks = [
+            Block(
+                doc_id="tender",
+                text="商务要求：投标人必须提供有效营业执照。",
+                location=Location(block_index=1, section_tag="business_contract"),
+            )
+        ]
+        extractor = _CacheExtractor()
+        semantic_cache: dict[str, list[dict[str, Any]]] = {}
+
+        first_requirements, first_stats = extract_requirements_with_llm(
+            blocks,
+            focus="business",
+            extractor=extractor,
+            semantic_cache=semantic_cache,
+        )
+        second_requirements, second_stats = extract_requirements_with_llm(
+            blocks,
+            focus="business",
+            extractor=extractor,
+            semantic_cache=semantic_cache,
+        )
+
+        self.assertEqual(extractor.calls, 1)
+        self.assertEqual(len(first_requirements), 1)
+        self.assertEqual(len(second_requirements), 1)
+        self.assertEqual(int(first_stats.get("cache_misses") or 0), 1)
+        self.assertEqual(int(second_stats.get("cache_hits") or 0), 1)
+
     def test_extract_requirements_with_llm_timeout_batch_falls_back_to_rule(self) -> None:
         class _TimeoutExtractor:
             provider = "mock"

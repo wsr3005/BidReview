@@ -888,6 +888,20 @@ def extract_req(
         "section_tag_counts": dict(section_tag_counts),
     }
     if ai_provider == "deepseek":
+        cache_dir = out_dir / "cache"
+        cache_path = cache_dir / "extract-semantic-cache.json"
+        semantic_cache: dict[str, list[dict[str, Any]]] = {}
+        if cache_path.exists():
+            try:
+                raw_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                raw_cache = {}
+            if isinstance(raw_cache, dict):
+                for key, value in raw_cache.items():
+                    if not isinstance(key, str):
+                        continue
+                    if isinstance(value, list):
+                        semantic_cache[key] = [item for item in value if isinstance(item, dict)]
         try:
             api_key = _load_api_key(ai_provider, ai_api_key_file)
             extractor = DeepSeekRequirementExtractor(
@@ -903,8 +917,17 @@ def extract_req(
                 min_confidence=max(0.5, float(ai_min_confidence) - 0.1),
                 batch_size=max(1, int(extract_batch_size)),
                 batch_max_chars=max(2000, int(extract_batch_max_chars)),
+                semantic_cache=semantic_cache,
             )
             summary["extract_llm"] = llm_stats
+            ensure_dir(cache_dir)
+            cache_path.write_text(json.dumps(semantic_cache, ensure_ascii=False, indent=2), encoding="utf-8")
+            summary["extract_semantic_cache"] = {
+                "path": str(cache_path),
+                "hits": int((llm_stats or {}).get("cache_hits") or 0),
+                "misses": int((llm_stats or {}).get("cache_misses") or 0),
+                "entries": int((llm_stats or {}).get("cache_entries") or len(semantic_cache)),
+            }
             rule_total = len(requirements)
             llm_total = len(llm_requirements)
             acceptance_ratio = llm_total / max(1, rule_total)
@@ -2551,39 +2574,52 @@ def verdict(
                 default_reason=base_reason,
                 default_confidence=llm_confidence,
             )
-        task_inputs: list[dict[str, Any]] = []
-        for task, task_pack in zip(task_rows, task_pack_rows, strict=False):
-            task_rule = _derive_task_rule_decision(
-                task=task,
-                pack=task_pack,
-                mandatory=mandatory,
-                default_status=fallback_status,
-                default_reason=base_reason,
-                default_confidence=llm_confidence,
-            )
-            task_row = dict(task)
-            task_row["rule_status"] = task_rule["status"]
-            task_row["rule_reason"] = task_rule["reason"]
-            task_row["rule_confidence"] = task_rule["confidence"]
-            task_row["evidence_refs"] = _merge_evidence_refs(
-                existing_refs,
-                [item for item in (task_pack.get("evidence_refs") or []) if isinstance(item, dict)],
-            )
-            trace = task_row.get("decision_trace")
-            if not isinstance(trace, dict):
-                trace = {}
-            trace.setdefault("source", "pipeline_task_bridge")
-            trace.setdefault("requirement_id", requirement_id)
-            trace["task_rule"] = task_rule.get("trace")
-            task_row["decision_trace"] = trace
-            task_inputs.append(task_row)
-        task_verdict_rows = judge_tasks_with_llm(
-            task_inputs,
-            task_reviewer,
-            min_confidence=ai_min_confidence,
-            max_workers=task_llm_workers,
+        early_exit_hard_fail = (
+            _normalize_status(fallback_status) == "fail"
+            and str((requirement_row or {}).get("rule_tier") or "") == "hard_fail"
         )
-        aggregated = _aggregate_task_verdicts(task_verdict_rows)
+        task_verdict_rows: list[dict[str, Any]] = []
+        if early_exit_hard_fail:
+            aggregated = {
+                "status": "fail",
+                "reason": "硬否决条款预审已判定fail，触发提前终止策略",
+                "confidence": _status_confidence_hint("fail"),
+                "status_counts": {"fail": len(task_rows)},
+            }
+        else:
+            task_inputs: list[dict[str, Any]] = []
+            for task, task_pack in zip(task_rows, task_pack_rows, strict=False):
+                task_rule = _derive_task_rule_decision(
+                    task=task,
+                    pack=task_pack,
+                    mandatory=mandatory,
+                    default_status=fallback_status,
+                    default_reason=base_reason,
+                    default_confidence=llm_confidence,
+                )
+                task_row = dict(task)
+                task_row["rule_status"] = task_rule["status"]
+                task_row["rule_reason"] = task_rule["reason"]
+                task_row["rule_confidence"] = task_rule["confidence"]
+                task_row["evidence_refs"] = _merge_evidence_refs(
+                    existing_refs,
+                    [item for item in (task_pack.get("evidence_refs") or []) if isinstance(item, dict)],
+                )
+                trace = task_row.get("decision_trace")
+                if not isinstance(trace, dict):
+                    trace = {}
+                trace.setdefault("source", "pipeline_task_bridge")
+                trace.setdefault("requirement_id", requirement_id)
+                trace["task_rule"] = task_rule.get("trace")
+                task_row["decision_trace"] = trace
+                task_inputs.append(task_row)
+            task_verdict_rows = judge_tasks_with_llm(
+                task_inputs,
+                task_reviewer,
+                min_confidence=ai_min_confidence,
+                max_workers=task_llm_workers,
+            )
+            aggregated = _aggregate_task_verdicts(task_verdict_rows)
         status = _normalize_status(aggregated.get("status") or "missing")
         confidence = max(0.0, min(1.0, _safe_float(aggregated.get("confidence")) or _status_confidence_hint(status)))
 
@@ -2669,6 +2705,7 @@ def verdict(
             "total": len(task_verdict_rows),
             "status_counts": aggregated.get("status_counts", {}),
             "llm_rate_limit": dict(task_llm_rate_limit),
+            "early_exit_hard_fail": early_exit_hard_fail,
             "sample": [
                 {
                     "task_id": row.get("task_id"),

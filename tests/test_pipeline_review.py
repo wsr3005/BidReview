@@ -909,6 +909,65 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertEqual(len(audit_rows), 1)
             self.assertEqual(audit_rows[0].get("status_after"), "risk")
 
+    def test_verdict_early_exits_for_hard_fail_with_fail_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "text": "投标人必须提供有效营业执照，否则将被否决。",
+                        "mandatory": True,
+                        "rule_tier": "hard_fail",
+                        "keywords": ["营业执照", "否决"],
+                    }
+                ],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "text": "材料清单显示营业执照未提供，存在缺失。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "fail",
+                        "score": 0,
+                        "severity": "high",
+                        "reason": "命中明确反证",
+                        "evidence": [
+                            {
+                                "evidence_id": "E-bid-p1-b1-sBODY",
+                                "doc_id": "bid",
+                                "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                                "excerpt": "材料清单显示营业执照未提供，存在缺失。",
+                                "score": 9,
+                            }
+                        ],
+                    }
+                ],
+            )
+            plan_tasks(out_dir=out_dir, resume=False)
+
+            result = verdict(out_dir=out_dir, resume=False)
+            self.assertEqual(result["verdicts"], 1)
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(rows[0]["status"], "fail")
+            trace = rows[0].get("decision_trace") or {}
+            task_verdicts = trace.get("task_verdicts") or {}
+            self.assertTrue(task_verdicts.get("early_exit_hard_fail"))
+
     def test_run_pipeline_writes_release_hardening_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

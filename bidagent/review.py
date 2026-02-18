@@ -631,6 +631,12 @@ def _merge_batch_text(batch: list[Block]) -> str:
     return "\n\n".join(rows)
 
 
+def _extraction_cache_key(*, profile: str, focus: str, batch_text: str) -> str:
+    normalized = normalize_compact(batch_text)[:8000]
+    digest = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()
+    return f"{focus}:{profile}:{digest[:20]}"
+
+
 def extract_requirements_with_llm(
     tender_blocks: Iterable[Block],
     focus: str,
@@ -639,6 +645,7 @@ def extract_requirements_with_llm(
     min_confidence: float = 0.6,
     batch_size: int = 8,
     batch_max_chars: int = 8000,
+    semantic_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[list[Requirement], dict[str, Any]]:
     merged_requirements: list[Requirement] = []
     resolved_batch_size = max(1, int(batch_size))
@@ -663,6 +670,9 @@ def extract_requirements_with_llm(
         "profile_batches": {},
         "profile_blocks": {},
         "appendix_skipped_batches": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_entries": len(semantic_cache) if isinstance(semantic_cache, dict) else 0,
     }
     for profile, batch in _iter_extraction_batches(
         tender_blocks,
@@ -683,19 +693,29 @@ def extract_requirements_with_llm(
         ):
             stats["appendix_skipped_batches"] = int(stats["appendix_skipped_batches"]) + 1
             continue
-        try:
-            raw_items = extractor.extract_requirements(block_text=merged_text, focus=focus, profile=profile)
-        except Exception as exc:  # noqa: BLE001
-            stats["errors"] = int(stats["errors"]) + 1
-            stats["fallback_batches"] = int(stats["fallback_batches"]) + 1
-            message = str(exc).lower()
-            if "timeout" in message or "timed out" in message:
-                stats["timeout_fallback_batches"] = int(stats["timeout_fallback_batches"]) + 1
-            fallback_requirements = extract_requirements(batch, focus=focus)
-            stats["fallback_items"] = int(stats["fallback_items"]) + len(fallback_requirements)
-            for requirement in fallback_requirements:
-                _append_or_merge_requirement(merged_requirements, requirement)
-            continue
+        cache_key = _extraction_cache_key(profile=profile, focus=focus, batch_text=merged_text)
+        if isinstance(semantic_cache, dict) and cache_key in semantic_cache:
+            raw_items = semantic_cache.get(cache_key) or []
+            stats["cache_hits"] = int(stats["cache_hits"]) + 1
+        else:
+            stats["cache_misses"] = int(stats["cache_misses"]) + 1
+            try:
+                raw_items = extractor.extract_requirements(block_text=merged_text, focus=focus, profile=profile)
+            except Exception as exc:  # noqa: BLE001
+                stats["errors"] = int(stats["errors"]) + 1
+                stats["fallback_batches"] = int(stats["fallback_batches"]) + 1
+                message = str(exc).lower()
+                if "timeout" in message or "timed out" in message:
+                    stats["timeout_fallback_batches"] = int(stats["timeout_fallback_batches"]) + 1
+                fallback_requirements = extract_requirements(batch, focus=focus)
+                stats["fallback_items"] = int(stats["fallback_items"]) + len(fallback_requirements)
+                for requirement in fallback_requirements:
+                    _append_or_merge_requirement(merged_requirements, requirement)
+                continue
+            normalized_cache = [item for item in raw_items if isinstance(item, dict)]
+            if isinstance(semantic_cache, dict):
+                semantic_cache[cache_key] = normalized_cache
+                stats["cache_entries"] = len(semantic_cache)
         normalized_items = [item for item in raw_items if isinstance(item, dict)]
         if normalized_items:
             stats["batches_with_items"] = int(stats["batches_with_items"]) + 1
