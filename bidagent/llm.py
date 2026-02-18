@@ -14,7 +14,7 @@ from typing import Any, Protocol
 
 from bidagent.models import Finding, Requirement
 
-ALLOWED_STATUS = {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"}
+ALLOWED_STATUS = {"pass", "risk", "fail", "needs_ocr", "missing", "insufficient_evidence"}
 ALLOWED_SEVERITY = {"none", "low", "medium", "high"}
 DEEPSEEK_PROMPT_VERSION = "deepseek-review-v1"
 DEEPSEEK_REQUIREMENT_PROMPT_VERSION = "deepseek-requirement-schema-v1"
@@ -130,7 +130,7 @@ class DeepSeekReviewer:
             "evidence": evidence_rows,
             "task": "仅审查商务合规，不审查技术方案。基于证据作结论，禁止臆测。",
             "output_schema": {
-                "status": "pass|risk|fail|needs_ocr|insufficient_evidence",
+                "status": "pass|risk|fail|needs_ocr|missing|insufficient_evidence",
                 "severity": "none|low|medium|high",
                 "reason": "string(<=80 chars)",
                 "confidence": "number 0.0-1.0",
@@ -226,6 +226,8 @@ class DeepSeekReviewer:
         reason = str(parsed.get("reason", "")).strip()
         confidence = parsed.get("confidence")
 
+        if status == "insufficient_evidence":
+            status = "missing"
         if status not in ALLOWED_STATUS:
             raise RuntimeError(f"Invalid LLM status: {status}")
         if severity not in ALLOWED_SEVERITY:

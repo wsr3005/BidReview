@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from bidagent.io_utils import write_jsonl
 
-ALLOWED_STATUS = {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"}
+ALLOWED_STATUS = {"pass", "risk", "fail", "needs_ocr", "missing", "insufficient_evidence"}
 
 
 class TaskReviewer(Protocol):
@@ -30,11 +30,13 @@ def _review_task(reviewer: TaskReviewer, task: dict[str, Any]) -> dict[str, Any]
 def _base_status(task: dict[str, Any]) -> str:
     for key in ("rule_status", "status"):
         status = str(task.get(key) or "").strip()
+        if status == "insufficient_evidence":
+            return "missing"
         if status in ALLOWED_STATUS:
             return status
     if bool(task.get("needs_ocr")):
         return "needs_ocr"
-    return "insufficient_evidence"
+    return "missing"
 
 
 def _base_reason(task: dict[str, Any], status: str) -> str:
@@ -48,6 +50,8 @@ def _base_reason(task: dict[str, Any], status: str) -> str:
         return "Rule fallback indicates failed requirement."
     if status == "risk":
         return "Rule fallback indicates manual review risk."
+    if status == "missing":
+        return "Required proof is missing for final verdict."
     return "Insufficient evidence for final verdict."
 
 
@@ -105,7 +109,7 @@ def _apply_final_decision(
     source: str,
     confidence: float | None,
 ) -> dict[str, Any]:
-    final_status = status if status in ALLOWED_STATUS else "insufficient_evidence"
+    final_status = status if status in ALLOWED_STATUS else "missing"
     if final_status != status:
         trace["fallback"] = {
             "type": "invalid_final_status",

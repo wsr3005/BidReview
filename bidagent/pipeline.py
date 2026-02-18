@@ -51,6 +51,7 @@ DEFAULT_GATE_THRESHOLDS = {
     "false_positive_fail_rate": 0.01,
     "evidence_traceability": 1.0,
     "llm_coverage": 1.0,
+    "missing_rate": 1.0,
 }
 VERDICT_STRATEGY_VERSION = "verdict-harvest-v1"
 CANARY_POLICY_VERSION = "release-canary-v1"
@@ -59,8 +60,8 @@ RELEASE_TRACE_SCHEMA_VERSION = "release-trace-v1"
 AUTO_FINAL_GUARD_POLICY_VERSION = "auto-final-guard-v1"
 AUTO_FINAL_HISTORY_FILENAME = "auto-final-history.jsonl"
 DEFAULT_CANARY_MIN_STREAK = 3
-BLOCKING_FINDING_STATUSES = {"fail", "needs_ocr", "risk", "insufficient_evidence"}
-STATUS_PRIORITY = ("fail", "needs_ocr", "risk", "insufficient_evidence", "pass")
+BLOCKING_FINDING_STATUSES = {"fail", "needs_ocr", "missing", "risk", "insufficient_evidence"}
+STATUS_PRIORITY = ("fail", "needs_ocr", "missing", "risk", "pass")
 STATUS_PRIORITY_INDEX = {name: index for index, name in enumerate(STATUS_PRIORITY)}
 EVIDENCE_TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{2,}")
 POSITIVE_EVIDENCE_HINTS = (
@@ -322,6 +323,9 @@ def _build_run_metadata(
     ai_base_url: str,
     ai_workers: int,
     ai_min_confidence: float,
+    extract_batch_size: int,
+    extract_batch_max_chars: int,
+    extract_timeout_seconds: int,
     requested_release_mode: str,
     canary_min_streak: int,
 ) -> dict[str, Any]:
@@ -368,6 +372,9 @@ def _build_run_metadata(
             "release_mode_requested": requested_release_mode,
             "ai_workers": int(ai_workers),
             "ai_min_confidence": float(ai_min_confidence),
+            "extract_batch_size": int(extract_batch_size),
+            "extract_batch_max_chars": int(extract_batch_max_chars),
+            "extract_timeout_seconds": int(extract_timeout_seconds),
             "canary_min_streak": int(canary_min_streak),
         },
     }
@@ -796,6 +803,9 @@ def extract_req(
     ai_api_key_file: Path | None = None,
     ai_base_url: str = "https://api.deepseek.com/v1",
     ai_min_confidence: float = 0.65,
+    extract_batch_size: int = 8,
+    extract_batch_max_chars: int = 8000,
+    extract_timeout_seconds: int = 45,
 ) -> dict[str, Any]:
     ingest_dir = out_dir / "ingest"
     tender_path = ingest_dir / "tender_blocks.jsonl"
@@ -814,12 +824,15 @@ def extract_req(
                 api_key=api_key or "",
                 model=ai_model,
                 base_url=ai_base_url,
+                timeout_seconds=max(10, int(extract_timeout_seconds)),
             )
             llm_requirements, llm_stats = extract_requirements_with_llm(
                 tender_blocks=tender_blocks,
                 focus=focus,
                 extractor=extractor,
                 min_confidence=max(0.5, float(ai_min_confidence) - 0.1),
+                batch_size=max(1, int(extract_batch_size)),
+                batch_max_chars=max(2000, int(extract_batch_max_chars)),
             )
             summary["extract_llm"] = llm_stats
             rule_total = len(requirements)
@@ -933,6 +946,8 @@ def _review_action_for_status(status: str) -> str:
         return "请优先核查该条款是否确实不满足；如已满足，请补充对应证据页码。"
     if status == "needs_ocr":
         return "请人工核读扫描件/附件图片内容，确认是否满足该条款。"
+    if status == "missing":
+        return "请补充必需证明材料或页码定位后复核。"
     if status == "risk":
         return "请补充关键证明材料并重新复核。"
     return "请补充可定位证据后复核。"
@@ -1126,14 +1141,15 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
         if not is_manual:
             continue
         evidence = finding.get("evidence", [])
-        primary = _choose_primary_evidence(evidence, status=str(finding.get("status") or ""))
+        normalized_status = _normalize_status(finding.get("status") or "missing")
+        primary = _choose_primary_evidence(evidence, status=normalized_status)
         if not primary:
             primary = {}
         review_rows.append(
             {
                 "requirement_id": finding["requirement_id"],
                 "tier": tier,
-                "status": finding["status"],
+                "status": normalized_status,
                 "severity": finding.get("severity", "medium"),
                 "reason": finding.get("reason", ""),
                 "category": requirement.get("category", "N/A"),
@@ -1151,7 +1167,7 @@ def checklist(out_dir: Path, resume: bool = False) -> dict[str, Any]:
     review_rows.sort(
         key=lambda row: (
             tier_rank.get(str(row.get("tier") or "general"), 9),
-            0 if str(row.get("status")) in {"fail"} else 1,
+            0 if str(row.get("status")) in {"fail"} else 1 if str(row.get("status")) in {"missing"} else 2,
             severity_rank.get(str(row.get("severity") or "medium"), 9),
             str(row.get("requirement_id") or ""),
         )
@@ -1410,19 +1426,24 @@ def _resolve_gate_thresholds(threshold_overrides: dict[str, Any] | None) -> dict
 
 
 def _status_confidence_hint(status: str) -> float:
-    if status == "pass":
+    normalized = _normalize_status(status)
+    if normalized == "pass":
         return 0.70
-    if status == "fail":
+    if normalized == "fail":
         return 0.80
-    if status == "risk":
+    if normalized == "risk":
         return 0.50
-    if status == "needs_ocr":
+    if normalized == "missing":
+        return 0.40
+    if normalized == "needs_ocr":
         return 0.35
     return 0.30
 
 
-def _normalize_status(value: Any, *, default: str = "insufficient_evidence") -> str:
+def _normalize_status(value: Any, *, default: str = "missing") -> str:
     status = str(value or "").strip()
+    if status == "insufficient_evidence":
+        return "missing"
     if status in STATUS_PRIORITY_INDEX:
         return status
     return default
@@ -1592,6 +1613,147 @@ def _collect_query_terms_for_requirement(
     return _extract_query_terms(inputs, limit=120)
 
 
+def _normalize_section_tag(value: Any) -> str | None:
+    compact = _normalize_search_text(value)
+    if not compact:
+        return None
+    if compact in {"evaluationrisk"}:
+        return "evaluation_risk"
+    if compact in {"businesscontract"}:
+        return "business_contract"
+    if compact in {"technicalspec"}:
+        return "technical_spec"
+    if compact in {"bidderinstruction"}:
+        return "bidder_instruction"
+    if compact in {"formatappendix"}:
+        return "format_appendix"
+    if compact in {"other"}:
+        return "other"
+    if any(token in compact for token in ("评标", "评审", "评分", "否决", "废标", "资格审查")):
+        return "evaluation_risk"
+    if any(token in compact for token in ("合同", "付款", "结算", "违约", "质保", "交货", "履约", "商务")):
+        return "business_contract"
+    if any(token in compact for token in ("技术", "参数", "规格", "性能", "接口", "配置", "方案")):
+        return "technical_spec"
+    if any(token in compact for token in ("投标人须知", "须知前附表", "投标须知", "须知")):
+        return "bidder_instruction"
+    if any(token in compact for token in ("格式", "附件", "附表", "模板", "封面")):
+        return "format_appendix"
+    return "other"
+
+
+def _safe_block_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _doc_section_ranges(doc_map: dict[str, Any], *, doc_id: str) -> list[dict[str, Any]]:
+    docs = doc_map.get("docs") if isinstance(doc_map, dict) else []
+    if not isinstance(docs, list):
+        return []
+    for entry in docs:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("doc_id") or "") != doc_id:
+            continue
+        sections = entry.get("sections")
+        if not isinstance(sections, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            range_row = section.get("range") if isinstance(section.get("range"), dict) else {}
+            start_block = _safe_block_int(range_row.get("start_block"))
+            end_block = _safe_block_int(range_row.get("end_block"))
+            if start_block is None or end_block is None:
+                continue
+            if end_block < start_block:
+                end_block = start_block
+            rows.append(
+                {
+                    "start_block": start_block,
+                    "end_block": end_block,
+                    "semantic_tag": _normalize_section_tag(section.get("semantic_tag")) or "other",
+                }
+            )
+        rows.sort(key=lambda item: int(item.get("start_block") or 0))
+        return rows
+    return []
+
+
+def _lookup_section_tag(block_index: Any, ranges: list[dict[str, Any]]) -> str | None:
+    block = _safe_block_int(block_index)
+    if block is None:
+        return None
+    for row in ranges:
+        start_block = _safe_block_int(row.get("start_block"))
+        end_block = _safe_block_int(row.get("end_block"))
+        if start_block is None or end_block is None:
+            continue
+        if start_block <= block <= end_block:
+            return _normalize_section_tag(row.get("semantic_tag")) or "other"
+    return None
+
+
+def _attach_semantic_section_tags(
+    rows: list[dict[str, Any]],
+    *,
+    doc_map: dict[str, Any] | None,
+    doc_id: str,
+) -> list[dict[str, Any]]:
+    section_ranges = _doc_section_ranges(doc_map or {}, doc_id=doc_id)
+    if not section_ranges:
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    tagged_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        output = dict(row)
+        location = output.get("location") if isinstance(output.get("location"), dict) else {}
+        block_index = location.get("block_index") if isinstance(location, dict) else None
+        section_tag = _lookup_section_tag(block_index, section_ranges)
+        if section_tag is not None:
+            output["section_tag"] = section_tag
+            if isinstance(location, dict):
+                location_out = dict(location)
+                location_out["section_tag"] = section_tag
+                output["location"] = location_out
+        tagged_rows.append(output)
+    return tagged_rows
+
+
+def _preferred_section_tags(*values: Any) -> list[str]:
+    text = " ".join(str(value or "") for value in values)
+    compact = _normalize_search_text(text)
+    if not compact:
+        return []
+    tags: list[str] = []
+    seen: set[str] = set()
+
+    def _push(tag: str) -> None:
+        if tag in seen:
+            return
+        seen.add(tag)
+        tags.append(tag)
+
+    if any(token in compact for token in ("评标", "评审", "评分", "否决", "废标", "资格审查")):
+        _push("evaluation_risk")
+    if any(token in compact for token in ("合同", "付款", "结算", "违约", "质保", "交货", "履约", "商务")):
+        _push("business_contract")
+    if any(token in compact for token in ("技术", "参数", "规格", "性能", "接口", "配置", "方案")):
+        _push("technical_spec")
+    if any(token in compact for token in ("投标人须知", "须知前附表", "投标须知", "须知")):
+        _push("bidder_instruction")
+    if any(token in compact for token in ("格式", "附件", "附表", "模板", "封面")):
+        _push("format_appendix")
+    return tags
+
+
 def _harvest_evidence_refs(
     evidence_index: dict[str, Any],
     *,
@@ -1707,7 +1869,7 @@ class _PipelineTaskReviewer:
         self._default_confidence = default_confidence
 
     def review_task(self, task: dict[str, Any]) -> dict[str, Any]:
-        status = str(task.get("rule_status") or task.get("status") or self._default_status or "insufficient_evidence")
+        status = _normalize_status(task.get("rule_status") or task.get("status") or self._default_status or "missing")
         reason = str(task.get("rule_reason") or task.get("reason") or self._default_reason or "Rule fallback")
         confidence = _safe_float(task.get("rule_confidence"))
         if confidence is None:
@@ -1795,7 +1957,7 @@ class _PipelineDeepSeekTaskReviewer:
             rule_tier=str(task.get("priority") or "general"),
             source={"task_id": task.get("task_id")},
         )
-        rule_status = str(task.get("rule_status") or task.get("status") or "insufficient_evidence")
+        rule_status = _normalize_status(task.get("rule_status") or task.get("status") or "missing")
         rule_reason = str(task.get("rule_reason") or task.get("reason") or "task rule fallback")
         finding = Finding(
             requirement_id=requirement_id,
@@ -1819,15 +1981,15 @@ class _PipelineDeepSeekTaskReviewer:
 def _aggregate_task_verdicts(task_verdicts: list[dict[str, Any]]) -> dict[str, Any]:
     if not task_verdicts:
         return {
-            "status": "insufficient_evidence",
+            "status": "missing",
             "reason": "未生成任务判决",
-            "confidence": _status_confidence_hint("insufficient_evidence"),
+            "confidence": _status_confidence_hint("missing"),
             "status_counts": {},
         }
 
-    status_order = ("fail", "needs_ocr", "risk", "insufficient_evidence", "pass")
-    status_counts = Counter(str(row.get("status") or "insufficient_evidence") for row in task_verdicts)
-    selected_status = "insufficient_evidence"
+    status_order = ("fail", "needs_ocr", "missing", "risk", "pass")
+    status_counts = Counter(_normalize_status(row.get("status") or "missing") for row in task_verdicts)
+    selected_status = "missing"
     for status in status_order:
         if status_counts.get(status):
             selected_status = status
@@ -1887,13 +2049,13 @@ def _derive_task_rule_decision(
     has_any_support = support_score > 0
     has_any_counter = counter_score > 0
 
-    status = default_status or "insufficient_evidence"
+    status = _normalize_status(default_status or "missing")
     reason = default_reason or "任务规则判定"
     if not has_any_support and not has_any_counter:
-        status = "insufficient_evidence"
+        status = "missing"
         reason = "任务未检索到有效证据"
     elif support_reference_only and not has_any_counter:
-        status = "needs_ocr" if mandatory else "insufficient_evidence"
+        status = "needs_ocr" if mandatory else "missing"
         reason = "任务仅命中附件/扫描件引用，需OCR复核"
     elif has_any_counter and counter_score >= max(6, support_score + 2):
         if has_any_support:
@@ -2005,7 +2167,7 @@ def verdict(
     verdicts_path = out_dir / "verdicts.jsonl"
     if path_ready(verdicts_path, resume):
         rows = list(read_jsonl(verdicts_path))
-        counts = Counter(str(row.get("status") or "") for row in rows)
+        counts = Counter(_normalize_status(row.get("status")) for row in rows)
         llm_coverage = _safe_ratio(
             sum(
                 1
@@ -2031,13 +2193,23 @@ def verdict(
                 tasks_by_requirement.setdefault(requirement_id, []).append(row)
 
     bid_block_rows = list(read_jsonl(bid_blocks_path)) if bid_blocks_path.exists() else []
-    unified_evidence_index = build_unified_evidence_index(bid_block_rows)
-    task_evidence_index = build_task_evidence_index(bid_block_rows)
+    doc_map_path = out_dir / "ingest" / "doc-map.json"
+    doc_map_data: dict[str, Any] = {}
+    if doc_map_path.exists():
+        try:
+            doc_map_data = json.loads(doc_map_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            doc_map_data = {}
+    tagged_bid_rows = _attach_semantic_section_tags(bid_block_rows, doc_map=doc_map_data, doc_id="bid")
+    unified_evidence_index = build_unified_evidence_index(tagged_bid_rows)
+    task_evidence_index = build_task_evidence_index(tagged_bid_rows)
     source_type_counts = Counter(str(item.get("source_type") or "unknown") for item in unified_evidence_index)
+    section_tag_counts = Counter(str(item.get("section_tag") or "other") for item in unified_evidence_index)
     evidence_index_stats = {
         "unified_blocks_indexed": len(unified_evidence_index),
         "harvest_blocks_indexed": len(task_evidence_index),
         "source_type_counts": dict(source_type_counts),
+        "section_tag_counts": dict(section_tag_counts),
     }
     requirements_rows = list(read_jsonl(requirements_path)) if requirements_path.exists() else []
     requirements_by_id: dict[str, dict[str, Any]] = {}
@@ -2097,7 +2269,7 @@ def verdict(
     for index, requirement_id in enumerate(requirement_order, start=1):
         finding = finding_by_requirement.get(requirement_id, {})
         task_rows = list(tasks_by_requirement.get(requirement_id, []))
-        fallback_status = str(finding.get("status") or "insufficient_evidence")
+        fallback_status = _normalize_status(finding.get("status") or "missing")
         llm = finding.get("llm") if isinstance(finding.get("llm"), dict) else {}
         llm_confidence = _safe_float((llm or {}).get("confidence"))
         mandatory = bool((requirements_by_id.get(requirement_id) or {}).get("mandatory", False))
@@ -2117,6 +2289,7 @@ def verdict(
                 }
             ]
         base_reason = str(finding.get("reason") or "规则判定结果")
+        requirement_row = requirements_by_id.get(requirement_id) or {}
 
         task_pack_rows: list[dict[str, Any]] = []
         for task in task_rows:
@@ -2127,13 +2300,26 @@ def verdict(
                 counter_k=2,
             )
             query = str(task.get("query") or "")
-            retrieved_candidates = retrieve_evidence_candidates(unified_evidence_index, query, top_k=3)
+            preferred_tags = _preferred_section_tags(
+                requirement_row.get("text"),
+                requirement_row.get("category"),
+                task.get("task_type"),
+                query,
+                base_reason,
+            )
+            retrieved_candidates = retrieve_evidence_candidates(
+                unified_evidence_index,
+                query,
+                top_k=3,
+                preferred_section_tags=preferred_tags,
+            )
             retrieved_refs = [_to_evidence_ref(item, source="evidence_index_retrieval") for item in retrieved_candidates]
             pack["evidence_refs"] = _merge_evidence_refs(list(pack.get("evidence_refs") or []), retrieved_refs)
             trace = pack.get("retrieval_trace")
             if not isinstance(trace, dict):
                 trace = {}
             trace["retriever_candidates"] = len(retrieved_candidates)
+            trace["soft_routing_tags"] = preferred_tags
             pack["retrieval_trace"] = trace
             task_pack_rows.append(pack)
 
@@ -2185,7 +2371,7 @@ def verdict(
             max_workers=task_llm_workers,
         )
         aggregated = _aggregate_task_verdicts(task_verdict_rows)
-        status = str(aggregated.get("status") or "insufficient_evidence")
+        status = _normalize_status(aggregated.get("status") or "missing")
         confidence = max(0.0, min(1.0, _safe_float(aggregated.get("confidence")) or _status_confidence_hint(status)))
 
         task_support_refs: list[dict[str, Any]] = []
@@ -2309,7 +2495,7 @@ def verdict(
 
     write_evidence_packs_jsonl(evidence_packs_path, evidence_pack_rows)
     write_verdicts_jsonl(verdicts_path, verdict_rows)
-    counts = Counter(str(row.get("status") or "") for row in verdict_rows)
+    counts = Counter(_normalize_status(row.get("status")) for row in verdict_rows)
     llm_coverage = _safe_ratio(
         sum(
             1
@@ -2353,7 +2539,7 @@ def _sync_findings_from_verdicts(out_dir: Path) -> dict[str, Any]:
         if not requirement_id:
             continue
         base = existing_by_requirement.get(requirement_id, {})
-        status = str(row.get("status") or base.get("status") or "insufficient_evidence")
+        status = _normalize_status(row.get("status") or base.get("status") or "missing")
         decision_trace = row.get("decision_trace") if isinstance(row.get("decision_trace"), dict) else {}
 
         evidence: list[dict[str, Any]] = []
@@ -2410,7 +2596,7 @@ def _sync_findings_from_verdicts(out_dir: Path) -> dict[str, Any]:
         )
 
     write_jsonl(findings_path, synced_rows)
-    counts = Counter(str(item.get("status") or "") for item in synced_rows)
+    counts = Counter(_normalize_status(item.get("status")) for item in synced_rows)
     return {"synced": True, "findings": len(synced_rows), "status_counts": dict(counts)}
 
 
@@ -2497,6 +2683,8 @@ def gate(
     }
 
     auto_review_coverage = _safe_ratio(len(verdict_requirement_ids), requirements_total)
+    missing_total = sum(1 for row in verdict_rows if _normalize_status(row.get("status")) == "missing")
+    missing_rate = _safe_ratio(missing_total, requirements_total)
     findings_with_traceable_evidence = sum(1 for row in finding_rows if _finding_has_traceable_evidence(row))
     evidence_traceability = _safe_ratio(
         findings_with_traceable_evidence,
@@ -2543,6 +2731,12 @@ def gate(
             "value": llm_coverage,
             "threshold": thresholds["llm_coverage"],
             "ok": llm_coverage >= thresholds["llm_coverage"],
+        },
+        {
+            "name": "missing_rate",
+            "value": missing_rate,
+            "threshold": thresholds["missing_rate"],
+            "ok": missing_rate <= thresholds["missing_rate"],
         },
     ]
     checks: list[dict[str, Any]] = []
@@ -2600,6 +2794,8 @@ def gate(
             "false_positive_fail_rate": false_positive_fail_rate,
             "evidence_traceability": evidence_traceability,
             "llm_coverage": llm_coverage,
+            "missing_total": missing_total,
+            "missing_rate": missing_rate,
             "eval_metrics": eval_metrics or {},
         },
         "checks": checks,
@@ -2620,12 +2816,12 @@ def report(out_dir: Path) -> dict[str, Any]:
     manual_review_total = 0
     if manual_review_path.exists():
         manual_review_total = sum(1 for _ in read_jsonl(manual_review_path))
-    counts = Counter(item["status"] for item in findings)
+    counts = Counter(_normalize_status(item.get("status")) for item in findings)
     blocking_findings = [item for item in findings if _is_blocking_finding_status(str(item.get("status") or ""))]
     tier_counts = Counter(str(item.get("rule_tier") or "general") for item in requirements)
     req_tier_map = {item.get("requirement_id"): str(item.get("rule_tier") or "general") for item in requirements}
     hard_fail_status = Counter(
-        item["status"]
+        _normalize_status(item.get("status"))
         for item in findings
         if req_tier_map.get(item.get("requirement_id")) == "hard_fail"
     )
@@ -2645,12 +2841,14 @@ def report(out_dir: Path) -> dict[str, Any]:
         f"- fail: {counts.get('fail', 0)}",
         f"- risk: {counts.get('risk', 0)}",
         f"- needs_ocr: {counts.get('needs_ocr', 0)}",
-        f"- insufficient_evidence: {counts.get('insufficient_evidence', 0)}",
+        f"- missing: {counts.get('missing', 0)}",
+        f"- insufficient_evidence(legacy): {counts.get('insufficient_evidence', 0)}",
         f"- hard_fail_pass: {hard_fail_status.get('pass', 0)}",
         f"- hard_fail_fail: {hard_fail_status.get('fail', 0)}",
         f"- hard_fail_risk: {hard_fail_status.get('risk', 0)}",
         f"- hard_fail_needs_ocr: {hard_fail_status.get('needs_ocr', 0)}",
-        f"- hard_fail_insufficient_evidence: {hard_fail_status.get('insufficient_evidence', 0)}",
+        f"- hard_fail_missing: {hard_fail_status.get('missing', 0)}",
+        f"- hard_fail_insufficient_evidence(legacy): {hard_fail_status.get('insufficient_evidence', 0)}",
         f"- consistency_findings: {len(consistency_findings)}",
         f"- manual_review_items: {manual_review_total}",
         "",
@@ -2744,6 +2942,9 @@ def run_pipeline(
     ai_base_url: str = "https://api.deepseek.com/v1",
     ai_workers: int = 4,
     ai_min_confidence: float = 0.65,
+    extract_batch_size: int = 8,
+    extract_batch_max_chars: int = 8000,
+    extract_timeout_seconds: int = 45,
     release_mode: str = "assist_only",
     gate_threshold_overrides: dict[str, Any] | None = None,
     gate_fail_fast: str = "off",
@@ -2770,6 +2971,9 @@ def run_pipeline(
         ai_api_key_file=ai_api_key_file,
         ai_base_url=ai_base_url,
         ai_min_confidence=ai_min_confidence,
+        extract_batch_size=extract_batch_size,
+        extract_batch_max_chars=extract_batch_max_chars,
+        extract_timeout_seconds=extract_timeout_seconds,
     )
     summary["plan_tasks"] = plan_tasks(out_dir=out_dir, resume=resume)
     summary["review"] = review(
@@ -2827,6 +3031,9 @@ def run_pipeline(
         ai_base_url=ai_base_url,
         ai_workers=ai_workers,
         ai_min_confidence=ai_min_confidence,
+        extract_batch_size=extract_batch_size,
+        extract_batch_max_chars=extract_batch_max_chars,
+        extract_timeout_seconds=extract_timeout_seconds,
         requested_release_mode=requested_release_mode,
         canary_min_streak=min_streak_value,
     )

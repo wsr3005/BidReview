@@ -108,6 +108,21 @@ class LlmJudgeTests(unittest.TestCase):
         self.assertEqual((trace.get("fallback") or {}).get("type"), "llm_error")
         self.assertIn("error", trace.get("llm_review", {}))
 
+    def test_judge_tasks_legacy_insufficient_status_normalizes_to_missing(self) -> None:
+        tasks = [
+            {
+                "task_id": "T0001",
+                "clause_id": "R0001",
+                "rule_status": "insufficient_evidence",
+                "rule_reason": "缺少证明材料",
+            }
+        ]
+
+        verdicts = judge_tasks_with_llm(tasks, _ErrorReviewer())
+        self.assertEqual(verdicts[0]["status"], "missing")
+        trace = verdicts[0]["decision_trace"] or {}
+        self.assertEqual((trace.get("decision") or {}).get("source"), "rule_fallback")
+
     def test_judge_tasks_invalid_llm_status_fallback_has_trace(self) -> None:
         tasks = [{"task_id": "T0001", "clause_id": "R0001", "rule_status": "risk", "rule_reason": "rule check"}]
 
@@ -166,14 +181,23 @@ class LlmJudgeTests(unittest.TestCase):
                     "evidence_refs": [],
                     "decision_trace": {},
                 },
+                {
+                    "task_id": "T0003",
+                    "status": "missing",
+                    "reason": "missing",
+                    "confidence": 0.4,
+                    "evidence_refs": [],
+                    "decision_trace": {},
+                },
             ]
             count = write_verdicts_jsonl(path, rows)
             loaded = list(read_jsonl(path))
 
-        self.assertEqual(count, 2)
-        self.assertEqual(len(loaded), 2)
+        self.assertEqual(count, 3)
+        self.assertEqual(len(loaded), 3)
         self.assertEqual(loaded[0]["status"], "pass")
         self.assertEqual(loaded[1]["status"], "needs_ocr")
+        self.assertEqual(loaded[2]["status"], "missing")
 
     def test_write_verdicts_jsonl_rejects_unknown_status(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

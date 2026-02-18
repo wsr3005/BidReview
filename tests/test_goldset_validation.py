@@ -31,7 +31,7 @@ class GoldsetValidationTests(unittest.TestCase):
         self.assertSetEqual(set(summary["tier_counts"].keys()), {"hard_fail", "scored", "general"})
         self.assertSetEqual(
             set(summary["status_counts"].keys()),
-            {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"},
+            {"pass", "risk", "fail", "needs_ocr", "missing"},
         )
 
     def test_validate_goldset_script_outputs_summary(self) -> None:

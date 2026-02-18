@@ -59,6 +59,39 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(stats.get("items_accepted"), 1)
         self.assertEqual(stats.get("items_rejected"), 1)
 
+    def test_extract_requirements_with_llm_timeout_batch_falls_back_to_rule(self) -> None:
+        class _TimeoutExtractor:
+            provider = "mock"
+            model = "mock-model"
+            prompt_version = "mock-v1"
+
+            def extract_requirements(self, *, block_text: str, focus: str) -> list[dict[str, Any]]:
+                raise RuntimeError("request timeout")
+
+        blocks = [
+            Block(
+                doc_id="tender",
+                text="投标人必须提供有效营业执照。",
+                location=Location(block_index=1),
+            ),
+            Block(
+                doc_id="tender",
+                text="投标人必须提供保证金缴纳凭证。",
+                location=Location(block_index=2),
+            ),
+        ]
+        requirements, stats = extract_requirements_with_llm(
+            blocks,
+            focus="business",
+            extractor=_TimeoutExtractor(),
+            batch_size=2,
+            batch_max_chars=4000,
+        )
+        self.assertGreaterEqual(len(requirements), 1)
+        self.assertEqual(stats.get("fallback_batches"), 1)
+        self.assertEqual(stats.get("timeout_fallback_batches"), 1)
+        self.assertGreaterEqual(int(stats.get("fallback_items") or 0), 1)
+
     def test_extract_business_requirements_filters_technical(self) -> None:
         blocks = [
             Block(

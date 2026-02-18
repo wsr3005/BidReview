@@ -326,6 +326,7 @@ class PipelineReviewTests(unittest.TestCase):
 
             result = gate(out_dir=out_dir, requested_release_mode="auto_final")
             self.assertEqual(result["release_mode"], "auto_final")
+            self.assertIn("missing_rate", result.get("metrics") or {})
             self.assertTrue((out_dir / "gate-result.json").exists())
 
     def test_gate_forces_assist_only_when_metrics_fail(self) -> None:
@@ -595,6 +596,47 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertEqual((trace.get("evidence_index") or {}).get("unified_blocks_indexed"), 1)
             self.assertIsInstance((trace.get("evidence_harvest") or {}).get("query_terms"), list)
 
+    def test_verdict_normalizes_legacy_insufficient_status_to_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ingest_dir = out_dir / "ingest"
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+
+            write_jsonl(
+                out_dir / "requirements.jsonl",
+                [{"requirement_id": "R0001", "text": "必须提供营业执照", "mandatory": True}],
+            )
+            write_jsonl(
+                ingest_dir / "bid_blocks.jsonl",
+                [
+                    {
+                        "doc_id": "bid",
+                        "text": "本段未给出营业执照证明材料。",
+                        "location": {"block_index": 1, "page": 1, "section": "BODY"},
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "insufficient_evidence",
+                        "score": 0,
+                        "severity": "medium",
+                        "reason": "证据不足",
+                        "llm": {"provider": "rule_fallback", "model": "rule-only", "confidence": 0.35},
+                        "evidence": [],
+                    }
+                ],
+            )
+
+            plan_tasks(out_dir=out_dir, resume=False)
+            result = verdict(out_dir=out_dir, resume=False)
+            self.assertEqual(result["verdicts"], 1)
+            rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
+            self.assertEqual(rows[0]["status"], "missing")
+
     def test_verdict_task_level_decision_not_blindly_inherits_requirement_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)
@@ -645,7 +687,7 @@ class PipelineReviewTests(unittest.TestCase):
             rows = list(read_jsonl(out_dir / "verdicts.jsonl"))
             self.assertEqual(len(rows), 1)
             self.assertNotEqual(rows[0]["status"], "pass")
-            self.assertIn(rows[0]["status"], {"risk", "needs_ocr", "insufficient_evidence", "fail"})
+            self.assertIn(rows[0]["status"], {"risk", "needs_ocr", "missing", "fail"})
 
     def test_verdict_uses_task_level_llm_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

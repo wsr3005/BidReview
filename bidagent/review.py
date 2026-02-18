@@ -574,42 +574,103 @@ def extract_requirements(
     return merged_requirements
 
 
+def _iter_extraction_batches(
+    tender_blocks: Iterable[Block],
+    *,
+    batch_size: int,
+    batch_max_chars: int,
+) -> Iterable[list[Block]]:
+    current_batch: list[Block] = []
+    current_chars = 0
+    for block in tender_blocks:
+        text = str(block.text or "").strip()
+        if not text:
+            continue
+        block_chars = len(text)
+        should_flush = bool(current_batch) and (
+            len(current_batch) >= batch_size or current_chars + block_chars > batch_max_chars
+        )
+        if should_flush:
+            yield current_batch
+            current_batch = []
+            current_chars = 0
+        current_batch.append(block)
+        current_chars += block_chars
+    if current_batch:
+        yield current_batch
+
+
+def _merge_batch_text(batch: list[Block]) -> str:
+    rows: list[str] = []
+    for block in batch:
+        text = str(block.text or "").strip()
+        if text:
+            rows.append(text)
+    return "\n\n".join(rows)
+
+
 def extract_requirements_with_llm(
     tender_blocks: Iterable[Block],
     focus: str,
     extractor: RequirementExtractor,
     *,
     min_confidence: float = 0.6,
+    batch_size: int = 8,
+    batch_max_chars: int = 8000,
 ) -> tuple[list[Requirement], dict[str, Any]]:
     merged_requirements: list[Requirement] = []
+    resolved_batch_size = max(1, int(batch_size))
+    resolved_batch_max_chars = max(2000, int(batch_max_chars))
     stats: dict[str, Any] = {
         "provider": extractor.provider,
         "model": extractor.model,
         "prompt_version": extractor.prompt_version,
         "blocks_total": 0,
         "blocks_with_items": 0,
+        "batches_total": 0,
+        "batches_with_items": 0,
+        "batch_size": resolved_batch_size,
+        "batch_max_chars": resolved_batch_max_chars,
+        "fallback_batches": 0,
+        "timeout_fallback_batches": 0,
+        "fallback_items": 0,
         "items_raw": 0,
         "items_accepted": 0,
         "items_rejected": 0,
         "errors": 0,
     }
-    for block in tender_blocks:
-        text = str(block.text or "").strip()
-        if not text:
+    for batch in _iter_extraction_batches(
+        tender_blocks,
+        batch_size=resolved_batch_size,
+        batch_max_chars=resolved_batch_max_chars,
+    ):
+        merged_text = _merge_batch_text(batch)
+        if not merged_text:
             continue
-        stats["blocks_total"] = int(stats["blocks_total"]) + 1
+        stats["batches_total"] = int(stats["batches_total"]) + 1
+        stats["blocks_total"] = int(stats["blocks_total"]) + len(batch)
         try:
-            raw_items = extractor.extract_requirements(block_text=text, focus=focus)
-        except Exception:  # noqa: BLE001
+            raw_items = extractor.extract_requirements(block_text=merged_text, focus=focus)
+        except Exception as exc:  # noqa: BLE001
             stats["errors"] = int(stats["errors"]) + 1
+            stats["fallback_batches"] = int(stats["fallback_batches"]) + 1
+            message = str(exc).lower()
+            if "timeout" in message or "timed out" in message:
+                stats["timeout_fallback_batches"] = int(stats["timeout_fallback_batches"]) + 1
+            fallback_requirements = extract_requirements(batch, focus=focus)
+            stats["fallback_items"] = int(stats["fallback_items"]) + len(fallback_requirements)
+            for requirement in fallback_requirements:
+                _append_or_merge_requirement(merged_requirements, requirement)
             continue
         normalized_items = [item for item in raw_items if isinstance(item, dict)]
         if normalized_items:
-            stats["blocks_with_items"] = int(stats["blocks_with_items"]) + 1
+            stats["batches_with_items"] = int(stats["batches_with_items"]) + 1
+            stats["blocks_with_items"] = int(stats["blocks_with_items"]) + len(batch)
+        anchor_block = batch[0]
         for raw_item in normalized_items:
             stats["items_raw"] = int(stats["items_raw"]) + 1
             candidate = _build_validated_requirement_from_llm(
-                block=block,
+                block=anchor_block,
                 raw_item=raw_item,
                 focus=focus,
                 extractor=extractor,

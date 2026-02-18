@@ -8,9 +8,10 @@ from typing import Any
 
 from bidagent.io_utils import ensure_dir, read_jsonl
 
-VALID_GOLD_STATUSES = {"pass", "risk", "fail", "needs_ocr", "insufficient_evidence"}
+VALID_GOLD_STATUSES = {"pass", "risk", "fail", "needs_ocr", "missing", "insufficient_evidence"}
+CANONICAL_GOLD_STATUSES = {"pass", "risk", "fail", "needs_ocr", "missing"}
 VALID_GOLD_TIERS = {"hard_fail", "scored", "general"}
-HARD_FAIL_BLOCKING_STATUSES = {"fail", "risk", "needs_ocr", "insufficient_evidence"}
+HARD_FAIL_BLOCKING_STATUSES = {"fail", "risk", "needs_ocr", "missing", "insufficient_evidence"}
 
 
 @dataclass(slots=True)
@@ -32,6 +33,13 @@ class EvalMetrics:
 
 def _normalize_gold_tier(row: dict[str, Any]) -> str:
     return str(row.get("tier") or row.get("rule_tier") or "general").strip()
+
+
+def _normalize_status(value: Any) -> str:
+    status = str(value or "").strip()
+    if status == "insufficient_evidence":
+        return "missing"
+    return status
 
 
 def validate_gold_rows(
@@ -63,7 +71,7 @@ def validate_gold_rows(
             requirement_ids.add(requirement_id)
 
         tier = _normalize_gold_tier(row)
-        expected_status = str(row.get("expected_status") or "").strip()
+        expected_status = _normalize_status(row.get("expected_status"))
 
         if tier not in VALID_GOLD_TIERS:
             errors.append(
@@ -93,7 +101,7 @@ def validate_gold_rows(
             errors.append(f"missing tiers: {', '.join(missing_tiers)}")
 
     if require_all_statuses:
-        missing_statuses = sorted(VALID_GOLD_STATUSES - set(status_counts.keys()))
+        missing_statuses = sorted(CANONICAL_GOLD_STATUSES - set(status_counts.keys()))
         if missing_statuses:
             errors.append(f"missing expected_status labels: {', '.join(missing_statuses)}")
 
@@ -111,7 +119,7 @@ def validate_gold_rows(
     if min_per_status > 0:
         low_statuses = sorted(
             status
-            for status in VALID_GOLD_STATUSES
+            for status in CANONICAL_GOLD_STATUSES
             if int(status_counts.get(status, 0)) < int(min_per_status)
         )
         if low_statuses:
@@ -140,7 +148,7 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
 
     Expects `run_dir/eval/gold.jsonl` with rows:
       - requirement_id: str
-      - expected_status: pass|risk|fail|needs_ocr|insufficient_evidence
+      - expected_status: pass|risk|fail|needs_ocr|missing|insufficient_evidence
       - tier: hard_fail|scored|general (optional)
       - note: optional
     """
@@ -170,9 +178,9 @@ def evaluate_run(run_dir: Path, *, out_path: Path | None = None) -> dict[str, An
     per_item: list[dict[str, Any]] = []
     for req_id, gold in gold_map.items():
         pred = pred_map.get(req_id, {})
-        expected = str(gold.get("expected_status") or "")
+        expected = _normalize_status(gold.get("expected_status"))
         tier = str(gold.get("tier") or gold.get("rule_tier") or "general")
-        got = str(pred.get("status") or "")
+        got = _normalize_status(pred.get("status"))
         total += 1
 
         if tier == "hard_fail":

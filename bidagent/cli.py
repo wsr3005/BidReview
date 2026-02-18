@@ -47,6 +47,12 @@ def _add_gate_options(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="override gate threshold for llm_coverage",
     )
+    parser.add_argument(
+        "--gate-threshold-missing-rate",
+        type=float,
+        default=None,
+        help="override gate threshold for missing_rate",
+    )
 
 
 def _gate_threshold_overrides_from_args(args: argparse.Namespace) -> dict[str, float]:
@@ -56,6 +62,7 @@ def _gate_threshold_overrides_from_args(args: argparse.Namespace) -> dict[str, f
         "gate_threshold_false_positive_fail_rate": "false_positive_fail_rate",
         "gate_threshold_evidence_traceability": "evidence_traceability",
         "gate_threshold_llm_coverage": "llm_coverage",
+        "gate_threshold_missing_rate": "missing_rate",
     }
     overrides: dict[str, float] = {}
     for attr_name, threshold_name in mapping.items():
@@ -87,7 +94,24 @@ def _common_parent() -> argparse.ArgumentParser:
         help="OCR mode for image-only evidence in documents (required for real bid review)",
     )
     parent.add_argument("--workers", type=int, default=2, help="reserved for parallel stage workers")
-    parent.add_argument("--batch-size", type=int, default=500, help="reserved for future batch operations")
+    parent.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="LLM extraction batch size (tender blocks per batch window)",
+    )
+    parent.add_argument(
+        "--extract-batch-max-chars",
+        type=int,
+        default=8000,
+        help="max chars per extraction batch window",
+    )
+    parent.add_argument(
+        "--extract-timeout-seconds",
+        type=int,
+        default=45,
+        help="per-batch timeout for extraction LLM request",
+    )
     parent.add_argument(
         "--ai-provider",
         choices=["none", "deepseek"],
@@ -198,6 +222,9 @@ def main(argv: list[str] | None = None) -> int:
                 ai_api_key_file=ai_api_key_file,
                 ai_base_url=args.ai_base_url,
                 ai_min_confidence=args.ai_min_confidence,
+                extract_batch_size=args.batch_size,
+                extract_batch_max_chars=args.extract_batch_max_chars,
+                extract_timeout_seconds=args.extract_timeout_seconds,
             )
         elif args.command == "plan-tasks":
             result = plan_tasks(out_dir=out_dir, resume=args.resume)
@@ -259,6 +286,9 @@ def main(argv: list[str] | None = None) -> int:
                 ai_base_url=args.ai_base_url,
                 ai_workers=args.ai_workers,
                 ai_min_confidence=args.ai_min_confidence,
+                extract_batch_size=args.batch_size,
+                extract_batch_max_chars=args.extract_batch_max_chars,
+                extract_timeout_seconds=args.extract_timeout_seconds,
                 release_mode=args.release_mode,
                 gate_threshold_overrides=gate_threshold_overrides,
                 gate_fail_fast=args.gate_fail_fast,

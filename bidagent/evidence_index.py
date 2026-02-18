@@ -60,6 +60,15 @@ _QUERY_STOP_TERMS = {
     "whether",
 }
 
+_SECTION_TAG_ALIASES = {
+    "evaluationrisk": "evaluation_risk",
+    "businesscontract": "business_contract",
+    "technicalspec": "technical_spec",
+    "bidderinstruction": "bidder_instruction",
+    "formatappendix": "format_appendix",
+    "other": "other",
+}
+
 
 def _normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
@@ -74,6 +83,25 @@ def _normalize_source_type(value: Any) -> str | None:
     if not token:
         return None
     return _SOURCE_TYPE_ALIASES.get(token)
+
+
+def _normalize_section_tag(value: Any) -> str | None:
+    token = _normalize_compact(str(value or ""))
+    if not token:
+        return None
+    if token in _SECTION_TAG_ALIASES:
+        return _SECTION_TAG_ALIASES[token]
+    if any(key in token for key in ("评标", "评审", "评分", "否决", "废标", "资格审查")):
+        return "evaluation_risk"
+    if any(key in token for key in ("合同", "付款", "结算", "违约", "质保", "交货", "履约", "商务")):
+        return "business_contract"
+    if any(key in token for key in ("技术", "参数", "规格", "性能", "接口", "配置", "方案")):
+        return "technical_spec"
+    if any(key in token for key in ("投标人须知", "须知前附表", "投标须知", "须知")):
+        return "bidder_instruction"
+    if any(key in token for key in ("格式", "附件", "附表", "模板", "封面")):
+        return "format_appendix"
+    return "other"
 
 
 def _looks_like_table_text(text: str) -> bool:
@@ -157,6 +185,11 @@ def build_unified_evidence_index(rows: Iterable[dict[str, Any]]) -> list[dict[st
         block_index = _safe_positive_int(location_dict.get("block_index"))
         page = _safe_positive_int(location_dict.get("page"))
         section = str(location_dict.get("section") or row.get("section") or "").strip() or None
+        section_tag = (
+            _normalize_section_tag(row.get("section_tag"))
+            or _normalize_section_tag(location_dict.get("section_tag"))
+            or _normalize_section_tag(section)
+        )
 
         doc_id = _sanitize_doc_id(row.get("doc_id"))
         source_type = infer_source_type(row)
@@ -182,6 +215,7 @@ def build_unified_evidence_index(rows: Iterable[dict[str, Any]]) -> list[dict[st
                 "evidence_id": evidence_id,
                 "doc_id": doc_id,
                 "source_type": source_type,
+                "section_tag": section_tag,
                 "location": location_out,
                 "excerpt": text[:240],
                 "excerpt_hash": _build_excerpt_hash(text),
@@ -244,7 +278,13 @@ def _semantic_similarity(query: str, text: str, terms: list[str]) -> float:
     return max(0.0, min(1.0, token_overlap * 0.6 + phrase_overlap * 0.4))
 
 
-def _score_candidate(candidate: dict[str, Any], *, query: str, terms: list[str]) -> float:
+def _score_candidate(
+    candidate: dict[str, Any],
+    *,
+    query: str,
+    terms: list[str],
+    preferred_section_tags: set[str] | None,
+) -> float:
     text = str(candidate.get("text") or "")
     compact_text = _normalize_compact(text)
     compact_query = _normalize_compact(query)
@@ -264,10 +304,17 @@ def _score_candidate(candidate: dict[str, Any], *, query: str, terms: list[str])
         source_bonus = 0.3
     if source_type == SOURCE_OCR and any(token in query.lower() for token in _OCR_QUERY_HINTS):
         source_bonus = 0.3
+    section_bonus = 0.0
+    if preferred_section_tags:
+        section_tag = _normalize_section_tag(candidate.get("section_tag"))
+        if section_tag in preferred_section_tags:
+            section_bonus = 0.45
+        elif section_tag and section_tag != "other":
+            section_bonus = 0.05
 
     length_bonus = min(len(text), 300) / 1000.0
     semantic_bonus = _semantic_similarity(query, text, terms) * 2.5
-    return float(overlap) + phrase_bonus + source_bonus + length_bonus + semantic_bonus
+    return float(overlap) + phrase_bonus + source_bonus + section_bonus + length_bonus + semantic_bonus
 
 
 def retrieve_evidence_candidates(
@@ -276,6 +323,7 @@ def retrieve_evidence_candidates(
     *,
     top_k: int = 5,
     source_types: Iterable[str] | None = None,
+    preferred_section_tags: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     if top_k <= 0:
         return []
@@ -292,6 +340,15 @@ def retrieve_evidence_candidates(
         }
         allowed_types = normalized_types
 
+    section_tags: set[str] | None = None
+    if preferred_section_tags is not None:
+        normalized_tags = {
+            tag
+            for tag in (_normalize_section_tag(value) for value in preferred_section_tags)
+            if tag is not None
+        }
+        section_tags = normalized_tags or None
+
     terms = _extract_query_terms(normalized_query)
     scored: list[dict[str, Any]] = []
     for row in index_rows:
@@ -300,7 +357,12 @@ def retrieve_evidence_candidates(
         source_type = str(row.get("source_type") or SOURCE_TEXT)
         if allowed_types is not None and source_type not in allowed_types:
             continue
-        score = _score_candidate(row, query=normalized_query, terms=terms)
+        score = _score_candidate(
+            row,
+            query=normalized_query,
+            terms=terms,
+            preferred_section_tags=section_tags,
+        )
         if score <= 0:
             continue
         candidate = dict(row)

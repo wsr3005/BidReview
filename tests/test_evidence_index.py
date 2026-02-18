@@ -102,6 +102,38 @@ class EvidenceIndexTests(unittest.TestCase):
         self.assertEqual(len(ranked), 1)
         self.assertEqual(ranked[0]["location"]["block_index"], 1)
 
+    def test_retrieve_evidence_candidates_soft_routing_section_tag_boost(self) -> None:
+        indexed = build_unified_evidence_index(
+            [
+                {
+                    "doc_id": "bid",
+                    "text": "合同付款周期为30天，逾期承担违约责任。",
+                    "location": {"block_index": 1, "page": 2},
+                    "section_tag": "business_contract",
+                },
+                {
+                    "doc_id": "bid",
+                    "text": "付款周期为30天。",
+                    "location": {"block_index": 2, "page": 3},
+                    "section_tag": "other",
+                },
+            ]
+        )
+        plain = retrieve_evidence_candidates(indexed, "付款周期30天", top_k=2)
+        routed = retrieve_evidence_candidates(
+            indexed,
+            "付款周期30天",
+            top_k=2,
+            preferred_section_tags=["business_contract"],
+        )
+
+        plain_score = {row["evidence_id"]: float(row["score"]) for row in plain}
+        routed_score = {row["evidence_id"]: float(row["score"]) for row in routed}
+        self.assertGreater(
+            routed_score.get("E-bid-p2-b1-text", 0.0),
+            plain_score.get("E-bid-p2-b1-text", 0.0),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
