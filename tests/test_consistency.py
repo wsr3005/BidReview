@@ -109,6 +109,94 @@ class ConsistencyTests(unittest.TestCase):
         findings = find_inconsistencies(blocks)
         self.assertIn("uscc", {item.type for item in findings})
 
+    def test_detects_tender_no_conflict_inside_bid(self) -> None:
+        blocks = [
+            Block(
+                doc_id="bid",
+                text="根据贵公司招标编号：25AT187076602200 招标，我方决定参加。",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="招标编号：25AT187076602232",
+                location=Location(block_index=2, page=2, section="Normal"),
+            ),
+        ]
+        findings = find_inconsistencies(blocks)
+        self.assertIn("tender_no", {item.type for item in findings})
+
+    def test_detects_placeholder_legal_representative_name(self) -> None:
+        blocks = [
+            Block(
+                doc_id="bid",
+                text="法定代表人身份证明",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="姓名：张三 性别：女",
+                location=Location(block_index=2, page=1, section="Normal"),
+            ),
+        ]
+        findings = find_inconsistencies(blocks)
+        self.assertIn("legal_representative_name_placeholder", {item.type for item in findings})
+
+    def test_detects_cross_doc_tender_no_mismatch(self) -> None:
+        bid_blocks = [
+            Block(
+                doc_id="bid",
+                text="根据贵公司招标编号：25AT187076602200 招标，我方决定参加。",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+        ]
+        tender_blocks = [
+            Block(
+                doc_id="tender",
+                text="项目编号：25AT187076602232",
+                location=Location(block_index=10, page=3, section="Normal"),
+            )
+        ]
+        findings = find_inconsistencies(bid_blocks, tender_blocks=tender_blocks)
+        types = {item.type for item in findings}
+        self.assertIn("tender_no_cross_doc", types)
+
+    def test_detects_bidder_name_authorization_company_mismatch(self) -> None:
+        blocks = [
+            Block(
+                doc_id="bid",
+                text="投标人：北京为是科技有限公司",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="我方授权王某代表我方北京好玩科技有限公司(投标单位的名称)全权处理本项目投标事宜。",
+                location=Location(block_index=2, page=1, section="Normal"),
+            ),
+        ]
+        findings = find_inconsistencies(blocks)
+        self.assertIn("bidder_name_authorization_mismatch", {item.type for item in findings})
+
+    def test_detects_bank_receipt_unreadable_when_branch_missing(self) -> None:
+        blocks = [
+            Block(
+                doc_id="bid",
+                text="开 户 行 ：中国民生银行股份有限公司北京真我支行",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="账号：610820402",
+                location=Location(block_index=2, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="CHINA MINSHENG BANK 账号610820402 电子回单",
+                location=Location(block_index=100, page=None, section="OCR_MEDIA"),
+            ),
+        ]
+        findings = find_inconsistencies(blocks)
+        self.assertIn("account_bank_receipt_unreadable", {item.type for item in findings})
+
 
 if __name__ == "__main__":
     unittest.main()
