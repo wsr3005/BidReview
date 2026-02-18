@@ -63,6 +63,8 @@ class PipelineReviewTests(unittest.TestCase):
             self.assertEqual(result.get("extract_engine"), "llm_schema_validated")
             self.assertEqual(len(rows), 1)
             self.assertIn("营业执照", rows[0]["text"])
+            self.assertTrue((out_dir / "requirements.atomic.jsonl").exists())
+            self.assertGreaterEqual(result.get("atomic_requirements", 0), 1)
 
     def test_extract_req_falls_back_when_llm_coverage_low(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -104,6 +106,8 @@ class PipelineReviewTests(unittest.TestCase):
             rows = list(read_jsonl(out_dir / "requirements.jsonl"))
             self.assertEqual(result.get("extract_engine"), "rule_fallback")
             self.assertEqual(len(rows), 4)
+            self.assertTrue((out_dir / "requirements.atomic.jsonl").exists())
+            self.assertGreaterEqual(result.get("atomic_requirements", 0), 1)
 
     def test_resume_ai_partial_llm_triggers_refill(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -852,6 +856,7 @@ class PipelineReviewTests(unittest.TestCase):
 
             self.assertIn(result["gate"]["release_mode"], {"assist_only", "auto_final"})
             self.assertTrue((out_dir / "review-tasks.jsonl").exists())
+            self.assertTrue((out_dir / "requirements.atomic.jsonl").exists())
             self.assertTrue((out_dir / "evidence-packs.jsonl").exists())
             self.assertTrue((out_dir / "verdicts.jsonl").exists())
             self.assertTrue((out_dir / "gate-result.json").exists())

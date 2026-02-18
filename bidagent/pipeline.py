@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from bidagent import __version__
+from bidagent.atomic import build_atomic_requirements
 from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
 from bidagent.consistency import find_inconsistencies
 from bidagent.document import iter_document_blocks
@@ -395,6 +396,7 @@ def _sha256_file(path: Path) -> str:
 def _collect_release_artifacts(out_dir: Path) -> list[dict[str, Any]]:
     files = [
         "requirements.jsonl",
+        "requirements.atomic.jsonl",
         "review-tasks.jsonl",
         "evidence-packs.jsonl",
         "findings.jsonl",
@@ -523,6 +525,7 @@ def _run_canary(
 
         required_files = [
             out_dir / "requirements.jsonl",
+            out_dir / "requirements.atomic.jsonl",
             out_dir / "review-tasks.jsonl",
             out_dir / "evidence-packs.jsonl",
             out_dir / "findings.jsonl",
@@ -810,9 +813,21 @@ def extract_req(
     ingest_dir = out_dir / "ingest"
     tender_path = ingest_dir / "tender_blocks.jsonl"
     req_path = out_dir / "requirements.jsonl"
+    atomic_path = out_dir / "requirements.atomic.jsonl"
     if path_ready(req_path, resume):
-        total = sum(1 for _ in read_jsonl(req_path))
-        return {"requirements": total}
+        requirement_rows = list(read_jsonl(req_path))
+        total = len(requirement_rows)
+        if atomic_path.exists():
+            atomic_rows = list(read_jsonl(atomic_path))
+        else:
+            atomic_rows = build_atomic_requirements(_row_to_requirement(row) for row in requirement_rows)
+            write_jsonl(atomic_path, atomic_rows)
+        classification_counts = Counter(str(item.get("classification") or "") for item in atomic_rows)
+        return {
+            "requirements": total,
+            "atomic_requirements": len(atomic_rows),
+            "atomic_classification_counts": dict(classification_counts),
+        }
 
     tender_blocks = list(_iter_blocks_from_jsonl(tender_path))
     requirements = extract_requirements(tender_blocks, focus=focus)
@@ -849,6 +864,12 @@ def extract_req(
             summary["extract_fallback_reason"] = str(exc)
 
     total = write_jsonl(req_path, (item.to_dict() for item in requirements))
+    atomic_rows = build_atomic_requirements(requirements)
+    atomic_total = write_jsonl(atomic_path, atomic_rows)
+    summary["atomic_requirements"] = atomic_total
+    summary["atomic_classification_counts"] = dict(
+        Counter(str(item.get("classification") or "") for item in atomic_rows)
+    )
     summary["requirements"] = total
     return summary
 
