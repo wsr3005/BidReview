@@ -536,9 +536,30 @@ def _looks_like_bank_receipt_ocr(text: str, account_numbers: set[str]) -> bool:
     compact = _compact(text).upper()
     if not compact:
         return False
-    if any(token in compact for token in ("BANK", "MINSHENG", "回单", "流水", "付款人", "收款人", "账号", "账户", "民生")):
+    has_receipt_token = any(
+        token in compact
+        for token in (
+            "回单",
+            "电子回单",
+            "银行回单",
+            "流水号",
+            "业务回单",
+            "开户许可证",
+            "基本存款账户",
+            "存款账户编号",
+            "付款人",
+            "收款人",
+        )
+    )
+    has_bank_token = any(token in compact for token in ("BANK", "银行", "MINSHENG", "招行", "民生"))
+    has_account_token = any(token in compact for token in ("账号", "账户", "ACCOUNT"))
+    has_account_hit = any(number in compact for number in account_numbers)
+    contract_noise = any(token in compact for token in ("服务合同", "合同条款", "甲方", "乙方", "违约"))
+
+    # Receipt-like OCR should have explicit receipt semantics, not generic contract bank metadata.
+    if has_receipt_token and (has_bank_token or has_account_token or has_account_hit):
         return True
-    if any(number in compact for number in account_numbers):
+    if (has_account_hit and has_bank_token and has_account_token) and not contract_noise:
         return True
     return False
 

@@ -265,6 +265,32 @@ class ConsistencyTests(unittest.TestCase):
         self.assertNotIn("account_bank", by_type)
         self.assertNotIn("account_bank_receipt_mismatch", by_type)
 
+    def test_contract_bank_metadata_in_ocr_does_not_count_as_receipt(self) -> None:
+        blocks = [
+            Block(
+                doc_id="bid",
+                text="开 户 行 ：中国民生银行股份有限公司北京真我支行",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="账号：610820402",
+                location=Location(block_index=2, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text=(
+                    "基于工业互联网平台开发服务合同：乙方开户行名称：招商银行股份有限公司北京首体科技金融支行，"
+                    "账号：610820402，甲方按合同条款付款。"
+                ),
+                location=Location(block_index=120, page=None, section="OCR_MEDIA"),
+            ),
+        ]
+        findings = find_inconsistencies(blocks)
+        by_type = {item.type: item for item in findings}
+        self.assertNotIn("account_bank_receipt_mismatch", by_type)
+        self.assertNotIn("account_bank_receipt_unreadable", by_type)
+
 
 if __name__ == "__main__":
     unittest.main()
