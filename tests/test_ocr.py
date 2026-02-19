@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from bidagent.ocr import iter_pdf_ocr_blocks, load_ocr_engine
+from bidagent.ocr import _resolve_tesseract_lang, iter_pdf_ocr_blocks, load_ocr_engine
 
 
 class OcrBackendSelectionTests(unittest.TestCase):
@@ -40,6 +40,12 @@ class OcrBackendSelectionTests(unittest.TestCase):
             engine = load_ocr_engine("tesseract")
         self.assertIsNotNone(engine)
         self.assertEqual(engine(b"demo"), "tesseract")
+
+    def test_resolve_tesseract_lang_falls_back_when_chinese_pack_missing(self) -> None:
+        with patch("bidagent.ocr._tesseract_available_langs", return_value={"eng", "osd"}):
+            effective, meta = _resolve_tesseract_lang("tesseract", "chi_sim+eng")
+        self.assertEqual(effective, "eng")
+        self.assertTrue(bool(meta.get("lang_degraded")))
 
 
 @unittest.skipUnless(importlib.util.find_spec("pypdf") is not None, "pypdf is required")
@@ -114,6 +120,7 @@ class OcrPdfTests(unittest.TestCase):
             self.assertGreaterEqual(int(stats.get("images_succeeded", 0)), 1)
             self.assertEqual(int(stats.get("images_failed", 0)), 0)
             self.assertIn("tesseract", (stats.get("backend_used_counts") or {}))
+            self.assertIn("paddle:RuntimeError", (stats.get("backend_fallback_errors") or {}))
 
 
 if __name__ == "__main__":

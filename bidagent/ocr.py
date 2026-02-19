@@ -23,6 +23,7 @@ DEFAULT_TESSERACT_CANDIDATES = [
 DEFAULT_TESSERACT_LANG = "chi_sim+eng"
 DEFAULT_TESSERACT_CONFIG = "--oem 1 --psm 6"
 OCR_BACKEND_CANDIDATES = ("paddle", "tesseract")
+_TESSERACT_LANG_CACHE: tuple[str, str, frozenset[str]] | None = None
 
 
 def _resolve_backend_preference(mode: str) -> str:
@@ -59,6 +60,76 @@ def _resolve_tesseract_cmd() -> str | None:
     return None
 
 
+def _resolve_tessdata_prefix() -> str | None:
+    env_prefix = str(os.getenv("TESSDATA_PREFIX") or "").strip()
+    if env_prefix and Path(env_prefix).exists():
+        return str(Path(env_prefix).resolve())
+    local_prefix = Path.cwd() / "tools" / "tessdata"
+    if local_prefix.exists():
+        return str(local_prefix.resolve())
+    return None
+
+
+def _tesseract_available_langs(cmd: str, tessdata_prefix: str | None = None) -> set[str]:
+    global _TESSERACT_LANG_CACHE
+    prefix_key = str(tessdata_prefix or "")
+    cached = _TESSERACT_LANG_CACHE
+    if cached and cached[0] == cmd and cached[1] == prefix_key:
+        return set(cached[2])
+    env = os.environ.copy()
+    if tessdata_prefix:
+        env["TESSDATA_PREFIX"] = str(tessdata_prefix)
+    try:
+        proc = subprocess.run(
+            [cmd, "--list-langs"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            encoding="utf-8",
+            errors="ignore",
+            env=env,
+        )
+    except Exception:
+        return set()
+    payload = proc.stdout or proc.stderr or ""
+    langs: set[str] = set()
+    for line in payload.splitlines():
+        text = str(line or "").strip()
+        if not text:
+            continue
+        if text.lower().startswith("list of available languages"):
+            continue
+        langs.add(text)
+    _TESSERACT_LANG_CACHE = (cmd, prefix_key, frozenset(langs))
+    return langs
+
+
+def _resolve_tesseract_lang(
+    cmd: str,
+    requested_lang: str,
+    *,
+    tessdata_prefix: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    available_langs = _tesseract_available_langs(cmd, tessdata_prefix=tessdata_prefix)
+    requested_tokens = [token.strip() for token in str(requested_lang or "").split("+") if token.strip()]
+    selected_tokens = [token for token in requested_tokens if token in available_langs] if available_langs else requested_tokens
+    if not selected_tokens and available_langs:
+        if "eng" in available_langs:
+            selected_tokens = ["eng"]
+        else:
+            selected_tokens = [sorted(available_langs)[0]]
+    effective_lang = "+".join(selected_tokens).strip() or str(requested_lang or "").strip() or "eng"
+    meta = {
+        "requested_lang": str(requested_lang or "").strip(),
+        "effective_lang": effective_lang,
+        "available_langs": sorted(available_langs),
+        "lang_degraded": bool(selected_tokens) and "+".join(requested_tokens) != "+".join(selected_tokens),
+        "tessdata_prefix": str(tessdata_prefix or ""),
+    }
+    return effective_lang, meta
+
+
 def _tesseract_selfcheck() -> dict[str, Any]:
     payload: dict[str, Any] = {"engine": "tesseract"}
 
@@ -92,22 +163,41 @@ def _tesseract_selfcheck() -> dict[str, Any]:
         payload.update({"engine_available": False, "reason": "tesseract binary detected but version check failed"})
         return payload
 
-    payload.update({"engine_available": True, "tesseract_version": version})
+    requested = str(os.getenv("BIDAGENT_TESSERACT_LANG") or DEFAULT_TESSERACT_LANG).strip() or DEFAULT_TESSERACT_LANG
+    tessdata_prefix = _resolve_tessdata_prefix()
+    effective_lang, lang_meta = _resolve_tesseract_lang(cmd, requested, tessdata_prefix=tessdata_prefix)
+    payload.update(
+        {
+            "engine_available": True,
+            "tesseract_version": version,
+            "requested_lang": requested,
+            "effective_lang": effective_lang,
+            "available_langs": lang_meta.get("available_langs"),
+            "lang_degraded": bool(lang_meta.get("lang_degraded")),
+            "tessdata_prefix": str(lang_meta.get("tessdata_prefix") or ""),
+        }
+    )
     return payload
 
 
 def _paddle_selfcheck() -> dict[str, Any]:
     payload: dict[str, Any] = {"engine": "paddle"}
     try:
-        import numpy  # noqa: F401
-        from PIL import Image  # noqa: F401
-        import paddleocr
+        import numpy as np
+        from paddleocr import PaddleOCR, __version__ as paddleocr_version
     except ModuleNotFoundError as exc:
         payload.update({"engine_available": False, "reason": f"missing python deps: {exc.name}"})
         return payload
 
-    version = getattr(paddleocr, "__version__", None)
-    payload.update({"engine_available": True, "paddleocr_version": version})
+    try:
+        ocr = PaddleOCR(lang="ch")
+        probe = np.zeros((32, 128, 3), dtype="uint8")
+        _ = list(ocr.predict(probe))
+    except Exception as exc:  # noqa: BLE001
+        payload.update({"engine_available": False, "paddleocr_version": paddleocr_version, "reason": f"runtime_error:{exc.__class__.__name__}"})
+        return payload
+
+    payload.update({"engine_available": True, "paddleocr_version": paddleocr_version})
     return payload
 
 
@@ -158,14 +248,33 @@ def _load_tesseract_engine() -> Callable[[bytes], str] | None:
     if not cmd:
         return None
     pytesseract.pytesseract.tesseract_cmd = cmd
-    lang = str(os.getenv("BIDAGENT_TESSERACT_LANG") or DEFAULT_TESSERACT_LANG).strip() or DEFAULT_TESSERACT_LANG
+    requested_lang = str(os.getenv("BIDAGENT_TESSERACT_LANG") or DEFAULT_TESSERACT_LANG).strip() or DEFAULT_TESSERACT_LANG
+    tessdata_prefix = _resolve_tessdata_prefix()
+    lang, lang_meta = _resolve_tesseract_lang(cmd, requested_lang, tessdata_prefix=tessdata_prefix)
     extra_config = str(os.getenv("BIDAGENT_TESSERACT_CONFIG") or DEFAULT_TESSERACT_CONFIG).strip()
+    if tessdata_prefix:
+        # Use project-local tessdata when available, so Chinese models can be versioned with the repo.
+        # Prefer POSIX-style path to avoid Windows quoting edge cases in tesseract CLI parsing.
+        tessdata_cli = str(Path(tessdata_prefix).as_posix())
+        extra_config = f"{extra_config} --tessdata-dir {tessdata_cli}".strip()
 
     def _extract(image_bytes: bytes) -> str:
         with Image.open(io.BytesIO(image_bytes)) as image:
             rgb = image.convert("RGB")
             return pytesseract.image_to_string(rgb, lang=lang, config=extra_config)
 
+    setattr(
+        _extract,
+        "_meta",
+        {
+            "engine": "tesseract",
+            "requested_lang": requested_lang,
+            "effective_lang": lang,
+            "available_langs": lang_meta.get("available_langs"),
+            "lang_degraded": bool(lang_meta.get("lang_degraded")),
+            "tessdata_prefix": str(lang_meta.get("tessdata_prefix") or ""),
+        },
+    )
     return _extract
 
 
@@ -177,26 +286,51 @@ def _load_paddle_engine() -> Callable[[bytes], str] | None:
     except ModuleNotFoundError:
         return None
 
-    ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+    try:
+        ocr = PaddleOCR(lang="ch")
+    except Exception:
+        return None
+
+    # Fail fast for environments where PaddleOCR initializes but cannot run inference.
+    try:
+        probe = np.zeros((32, 128, 3), dtype="uint8")
+        _ = list(ocr.predict(probe))
+    except Exception:
+        return None
 
     def _extract(image_bytes: bytes) -> str:
         with Image.open(io.BytesIO(image_bytes)) as image:
             rgb = image.convert("RGB")
             image_array = np.array(rgb)
-        result = ocr.ocr(image_array, cls=True)
+        result = ocr.predict(image_array)
         lines: list[str] = []
         for page in result or []:
             if not page:
                 continue
-            for item in page:
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
-                    continue
-                rec = item[1]
-                if not isinstance(rec, (list, tuple)) or not rec:
-                    continue
-                text = str(rec[0] or "").strip()
-                if text:
-                    lines.append(text)
+            if hasattr(page, "to_dict"):
+                try:
+                    page = page.to_dict()
+                except Exception:  # noqa: BLE001
+                    pass
+            if isinstance(page, dict):
+                rec_texts = page.get("rec_texts")
+                if isinstance(rec_texts, list):
+                    for text in rec_texts:
+                        text = str(text or "").strip()
+                        if text:
+                            lines.append(text)
+                continue
+            # Backward-compatible structure for older PaddleOCR outputs.
+            if isinstance(page, (list, tuple)):
+                for item in page:
+                    if not isinstance(item, (list, tuple)) or len(item) < 2:
+                        continue
+                    rec = item[1]
+                    if not isinstance(rec, (list, tuple)) or not rec:
+                        continue
+                    text = str(rec[0] or "").strip()
+                    if text:
+                        lines.append(text)
         return "\n".join(lines)
 
     return _extract
@@ -242,7 +376,15 @@ def iter_docx_ocr_blocks(
         stats["backend_order"] = backend_names
         stats.setdefault("backend_used_counts", {})
         stats.setdefault("backend_failures", {})
+        stats.setdefault("backend_fallback_errors", {})
         stats.setdefault("sample_errors", [])
+        backend_meta: dict[str, Any] = {}
+        for name, engine in engines:
+            meta = getattr(engine, "_meta", None)
+            if isinstance(meta, dict):
+                backend_meta[name] = meta
+        if backend_meta:
+            stats["backend_meta"] = backend_meta
 
     current_index = start_index
     if max_workers is None:
@@ -255,15 +397,15 @@ def iter_docx_ocr_blocks(
             max_workers = max(1, min(4, cpu // 2))
     max_in_flight = max(2, int(max_workers) * 2)
 
-    def _ocr_bytes(image_bytes: bytes) -> tuple[str, bool, str]:
+    def _ocr_bytes(image_bytes: bytes) -> tuple[str, bool, str, list[str]]:
         errors: list[str] = []
         for backend_name, engine in engines:
             try:
                 text = engine(image_bytes) or ""
-                return text, True, backend_name
+                return text, True, backend_name, errors
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{backend_name}:{exc.__class__.__name__}")
-        return "", False, "; ".join(errors)
+        return "", False, "; ".join(errors), errors
 
     seen_hashes: set[str] = set()
     with zipfile.ZipFile(path, "r") as archive:
@@ -286,7 +428,7 @@ def iter_docx_ocr_blocks(
                 nonlocal in_flight
                 name, fut = in_flight.pop(expected_seq)
                 try:
-                    text, ok, backend_or_error = fut.result()
+                    text, ok, backend_or_error, fallback_errors = fut.result()
                 except Exception:  # noqa: BLE001
                     if isinstance(stats, dict):
                         stats["images_failed"] = int(stats.get("images_failed", 0)) + 1
@@ -296,11 +438,18 @@ def iter_docx_ocr_blocks(
                         stats["images_succeeded"] = int(stats.get("images_succeeded", 0)) + 1
                         used_counts = stats.setdefault("backend_used_counts", {})
                         used_counts[backend_or_error] = int(used_counts.get(backend_or_error, 0)) + 1
+                        if fallback_errors:
+                            fallback_counts = stats.setdefault("backend_fallback_errors", {})
+                            for token in fallback_errors:
+                                token = str(token or "").strip()
+                                if not token:
+                                    continue
+                                fallback_counts[token] = int(fallback_counts.get(token, 0)) + 1
                     else:
                         stats["images_failed"] = int(stats.get("images_failed", 0)) + 1
                         failure_counts = stats.setdefault("backend_failures", {})
-                        for token in str(backend_or_error or "").split(";"):
-                            token = token.strip()
+                        for token in fallback_errors or str(backend_or_error or "").split(";"):
+                            token = str(token or "").strip()
                             if not token:
                                 continue
                             failure_counts[token] = int(failure_counts.get(token, 0)) + 1
@@ -390,7 +539,15 @@ def iter_pdf_ocr_blocks(
         stats["backend_order"] = backend_names
         stats.setdefault("backend_used_counts", {})
         stats.setdefault("backend_failures", {})
+        stats.setdefault("backend_fallback_errors", {})
         stats.setdefault("sample_errors", [])
+        backend_meta: dict[str, Any] = {}
+        for name, engine in engines:
+            meta = getattr(engine, "_meta", None)
+            if isinstance(meta, dict):
+                backend_meta[name] = meta
+        if backend_meta:
+            stats["backend_meta"] = backend_meta
 
     try:
         from pypdf import PdfReader
@@ -405,15 +562,15 @@ def iter_pdf_ocr_blocks(
             max_workers = max(1, min(4, cpu // 2))
     max_in_flight = max(2, int(max_workers) * 2)
 
-    def _ocr_bytes(image_bytes: bytes) -> tuple[str, bool, str]:
+    def _ocr_bytes(image_bytes: bytes) -> tuple[str, bool, str, list[str]]:
         errors: list[str] = []
         for backend_name, engine in engines:
             try:
                 text = engine(image_bytes) or ""
-                return text, True, backend_name
+                return text, True, backend_name, errors
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{backend_name}:{exc.__class__.__name__}")
-        return "", False, "; ".join(errors)
+        return "", False, "; ".join(errors), errors
 
     reader = PdfReader(str(path))
     total_pages = len(reader.pages)
@@ -435,7 +592,7 @@ def iter_pdf_ocr_blocks(
         def _drain_one(expected_seq: int) -> Iterator[tuple[int, str]]:
             page_no, fut = in_flight.pop(expected_seq)
             try:
-                text, ok, backend_or_error = fut.result()
+                text, ok, backend_or_error, fallback_errors = fut.result()
             except Exception:  # noqa: BLE001
                 if isinstance(stats, dict):
                     stats["images_failed"] = int(stats.get("images_failed", 0)) + 1
@@ -445,11 +602,18 @@ def iter_pdf_ocr_blocks(
                     stats["images_succeeded"] = int(stats.get("images_succeeded", 0)) + 1
                     used_counts = stats.setdefault("backend_used_counts", {})
                     used_counts[backend_or_error] = int(used_counts.get(backend_or_error, 0)) + 1
+                    if fallback_errors:
+                        fallback_counts = stats.setdefault("backend_fallback_errors", {})
+                        for token in fallback_errors:
+                            token = str(token or "").strip()
+                            if not token:
+                                continue
+                            fallback_counts[token] = int(fallback_counts.get(token, 0)) + 1
                 else:
                     stats["images_failed"] = int(stats.get("images_failed", 0)) + 1
                     failure_counts = stats.setdefault("backend_failures", {})
-                    for token in str(backend_or_error or "").split(";"):
-                        token = token.strip()
+                    for token in fallback_errors or str(backend_or_error or "").split(";"):
+                        token = str(token or "").strip()
                         if not token:
                             continue
                         failure_counts[token] = int(failure_counts.get(token, 0)) + 1

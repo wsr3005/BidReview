@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any, Iterable
@@ -561,6 +562,41 @@ def _extract_branch_candidates(text: str) -> list[str]:
     return deduped
 
 
+def _normalize_branch_value(value: str) -> str:
+    compact = _compact(value)
+    compact = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", compact)
+    compact = compact.replace("中国民生银行股份有限公司", "民生银行")
+    compact = compact.replace("中国民生银行", "民生银行")
+    match = re.search(r"(.*?支行)", compact)
+    if match:
+        compact = match.group(1)
+    return compact
+
+
+def _branch_match(left: str, right: str) -> bool:
+    left_norm = _normalize_branch_value(left)
+    right_norm = _normalize_branch_value(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    if left_norm.endswith(right_norm) or right_norm.endswith(left_norm):
+        return True
+    if left_norm in right_norm or right_norm in left_norm:
+        return True
+    similarity = SequenceMatcher(None, left_norm, right_norm).ratio()
+    return similarity >= 0.72
+
+
+def _branch_candidate_confident(value: str) -> bool:
+    compact = _normalize_branch_value(value)
+    if "支行" not in compact:
+        return False
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", compact))
+    # Require enough CJK signal to avoid OCR fragments turning into hard-fail mismatches.
+    return cjk >= 6 and len(compact) >= 8
+
+
 def find_inconsistencies(
     bid_blocks: Iterable[Block],
     *,
@@ -583,6 +619,9 @@ def find_inconsistencies(
         occ = _collect_occurrence(block)
         if str(block.location.section or "").upper() == "OCR_MEDIA":
             ocr_blocks.append(block)
+            # OCR blocks are noisy for core consistency fields. We only use them in
+            # dedicated cross-evidence checks (e.g., bank receipt parsing) below.
+            continue
 
         company_mentions = _extract_company_mentions(text)
         for fact_type, values in company_mentions.items():
@@ -733,42 +772,74 @@ def find_inconsistencies(
                 account_value, account_data = account_top
                 receipt_value, receipt_data = receipt_top
 
-                account_norm = _compact(account_value)
-                receipt_norm = _compact(receipt_value)
-                matched = bool(
-                    account_norm == receipt_norm
-                    or account_norm.endswith(receipt_norm)
-                    or receipt_norm.endswith(account_norm)
-                    or account_norm in receipt_norm
-                    or receipt_norm in account_norm
-                )
+                matched = _branch_match(account_value, receipt_value)
                 if not matched:
-                    pairs = [_make_pair(account_value, account_data, receipt_value, receipt_data)]
-                    values = _format_values(
-                        {
-                            account_value: account_data,
-                            receipt_value: receipt_data,
-                        },
-                        max_examples_per_value=max_examples_per_value,
-                    )
-                    reason = (
-                        f"{_field_label('account_bank_receipt_mismatch')}核验："
-                        f"证据A=“{account_value}”({_loc_text(pairs[0]['left'])})，"
-                        f"证据B=“{receipt_value}”({_loc_text(pairs[0]['right'])})，"
-                        "结论：不一致"
-                    )
-                    findings.append(
-                        ConsistencyFinding(
-                            type="account_bank_receipt_mismatch",
-                            status=_status_for("account_bank_receipt_mismatch"),
-                            severity=_severity_for("account_bank_receipt_mismatch"),
-                            reason=reason,
-                            values=values,
-                            pairs=pairs,
-                            comparison=_comparison_from_pair(pairs[0], "不一致"),
-                            scope="cross_evidence",
+                    if not _branch_candidate_confident(receipt_value):
+                        pair = _make_pair(
+                            account_value,
+                            account_data,
+                            "回单图片（OCR支行识别不稳定）",
+                            {"count": 1, "examples": receipt_data.get("examples") or []},
                         )
-                    )
+                        account_values = _format_values(
+                            {
+                                account_value: account_data,
+                            },
+                            max_examples_per_value=max_examples_per_value,
+                        )
+                        account_values.append(
+                            {
+                                "value_norm": "receipt_branch_low_confidence",
+                                "value_raw_examples": [receipt_value],
+                                "count": int(receipt_data.get("count") or 1),
+                                "examples": list((receipt_data.get("examples") or [])[:max_examples_per_value]),
+                            }
+                        )
+                        reason = (
+                            f"{_field_label('account_bank_receipt_unreadable')}核验："
+                            f"证据A=“{account_value}”({_loc_text(pair['left'])})，"
+                            f"证据B=“回单图片（OCR支行识别不稳定）”({_loc_text(pair['right'])})，"
+                            "结论：需人工核验回单原图"
+                        )
+                        findings.append(
+                            ConsistencyFinding(
+                                type="account_bank_receipt_unreadable",
+                                status=_status_for("account_bank_receipt_unreadable"),
+                                severity=_severity_for("account_bank_receipt_unreadable"),
+                                reason=reason,
+                                values=account_values,
+                                pairs=[pair],
+                                comparison=_comparison_from_pair(pair, "需人工核验"),
+                                scope="cross_evidence",
+                            )
+                        )
+                    else:
+                        pairs = [_make_pair(account_value, account_data, receipt_value, receipt_data)]
+                        values = _format_values(
+                            {
+                                account_value: account_data,
+                                receipt_value: receipt_data,
+                            },
+                            max_examples_per_value=max_examples_per_value,
+                        )
+                        reason = (
+                            f"{_field_label('account_bank_receipt_mismatch')}核验："
+                            f"证据A=“{account_value}”({_loc_text(pairs[0]['left'])})，"
+                            f"证据B=“{receipt_value}”({_loc_text(pairs[0]['right'])})，"
+                            "结论：不一致"
+                        )
+                        findings.append(
+                            ConsistencyFinding(
+                                type="account_bank_receipt_mismatch",
+                                status=_status_for("account_bank_receipt_mismatch"),
+                                severity=_severity_for("account_bank_receipt_mismatch"),
+                                reason=reason,
+                                values=values,
+                                pairs=pairs,
+                                comparison=_comparison_from_pair(pairs[0], "不一致"),
+                                scope="cross_evidence",
+                            )
+                        )
         else:
             account_top = _top_value(account_bank_map)
             receipt_block = receipt_blocks[0]

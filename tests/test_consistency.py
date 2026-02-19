@@ -242,6 +242,29 @@ class ConsistencyTests(unittest.TestCase):
         self.assertEqual(by_type["account_number"].status, "fail")
         self.assertEqual((by_type["account_number"].comparison or {}).get("conclusion"), "不一致")
 
+    def test_ocr_bank_noise_does_not_trigger_internal_account_bank_conflict(self) -> None:
+        blocks = [
+            Block(
+                doc_id="bid",
+                text="开 户 行 ：中国民生银行股份有限公司北京真我支行",
+                location=Location(block_index=1, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="账号：610820402",
+                location=Location(block_index=2, page=1, section="Normal"),
+            ),
+            Block(
+                doc_id="bid",
+                text="回单 开户行 中国民生银行股份有限公司北京真我支行方原流水 账号610820402",
+                location=Location(block_index=100, page=None, section="OCR_MEDIA"),
+            ),
+        ]
+        findings = find_inconsistencies(blocks)
+        by_type = {item.type: item for item in findings}
+        self.assertNotIn("account_bank", by_type)
+        self.assertNotIn("account_bank_receipt_mismatch", by_type)
+
 
 if __name__ == "__main__":
     unittest.main()
