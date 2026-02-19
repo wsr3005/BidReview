@@ -1058,6 +1058,111 @@ def _review_action_for_status(status: str) -> str:
     return "请补充可定位证据后复核。"
 
 
+def _consistency_evidence_candidates(
+    row: dict[str, Any],
+    *,
+    preferred_doc_id: str | None = "bid",
+) -> list[dict[str, Any]]:
+    fact_type = str(row.get("type") or "consistency").strip() or "consistency"
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, int | None, int | None, str]] = set()
+
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _append_candidate(
+        *,
+        doc_id: Any,
+        location: Any,
+        excerpt: Any,
+        score: Any = 0,
+        reference_only: bool = False,
+    ) -> None:
+        if not isinstance(location, dict):
+            return
+        doc = str(doc_id or "").strip()
+        if not doc:
+            return
+        if preferred_doc_id and doc != str(preferred_doc_id).strip():
+            return
+        block_index = location.get("block_index")
+        page = location.get("page")
+        if not (isinstance(block_index, int) and block_index > 0) and not (isinstance(page, int) and page > 0):
+            return
+        excerpt_text = str(excerpt or "").strip()
+        key = (
+            doc,
+            block_index if isinstance(block_index, int) else None,
+            page if isinstance(page, int) else None,
+            excerpt_text[:80],
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(
+            {
+                "evidence_id": f"C-{fact_type}-{len(candidates) + 1}",
+                "doc_id": doc,
+                "location": location,
+                "excerpt": excerpt_text,
+                "score": _safe_int(score),
+                "reference_only": bool(reference_only),
+                "has_action": len(excerpt_text) >= 12,
+            }
+        )
+
+    comparison = row.get("comparison")
+    if isinstance(comparison, dict):
+        evidence_a = comparison.get("evidence_a")
+        if isinstance(evidence_a, dict):
+            _append_candidate(
+                doc_id=evidence_a.get("doc_id"),
+                location=evidence_a.get("location"),
+                excerpt=evidence_a.get("excerpt"),
+                score=3,
+            )
+        evidence_b = comparison.get("evidence_b")
+        if isinstance(evidence_b, dict):
+            _append_candidate(
+                doc_id=evidence_b.get("doc_id"),
+                location=evidence_b.get("location"),
+                excerpt=evidence_b.get("excerpt"),
+                score=2,
+            )
+
+    for pair in row.get("pairs") or []:
+        if not isinstance(pair, dict):
+            continue
+        for side in ("left", "right"):
+            item = pair.get(side)
+            if not isinstance(item, dict):
+                continue
+            _append_candidate(
+                doc_id=item.get("doc_id"),
+                location=item.get("location"),
+                excerpt=item.get("excerpt"),
+                score=item.get("count"),
+            )
+
+    for value in row.get("values") or []:
+        if not isinstance(value, dict):
+            continue
+        value_score = value.get("count")
+        for example in value.get("examples") or []:
+            if not isinstance(example, dict):
+                continue
+            _append_candidate(
+                doc_id=example.get("doc_id"),
+                location=example.get("location"),
+                excerpt=example.get("excerpt"),
+                score=value_score,
+            )
+    return candidates
+
+
 def annotate(
     out_dir: Path,
     resume: bool = False,
@@ -1067,6 +1172,8 @@ def annotate(
     annotations_path = out_dir / "annotations.jsonl"
     markdown_path = out_dir / "annotations.md"
     findings_path = out_dir / "findings.jsonl"
+    consistency_path = out_dir / "consistency-findings.jsonl"
+    annotation_doc_id = "bid"
 
     source_path = _resolve_bid_source(out_dir=out_dir, bid_source=bid_source)
     annotated_dir = out_dir / "annotated"
@@ -1104,7 +1211,7 @@ def annotate(
             response["annotated_copy"] = str(last_copy)
         return response
 
-    findings = list(read_jsonl(findings_path))
+    findings = list(read_jsonl(findings_path)) if findings_path.exists() else []
     issue_rows = []
     for row in findings:
         if row["status"] == "pass":
@@ -1112,7 +1219,11 @@ def annotate(
         if blocking_only and not _is_blocking_finding_status(str(row.get("status") or "")):
             continue
         evidence = row.get("evidence", [])
-        primary = _choose_primary_evidence(evidence, status=str(row.get("status") or ""))
+        primary = _choose_primary_evidence(
+            evidence,
+            status=str(row.get("status") or ""),
+            preferred_doc_id=annotation_doc_id,
+        )
         if not primary:
             primary = {}
         alternates = []
@@ -1120,6 +1231,7 @@ def annotate(
             evidence,
             primary,
             status=str(row.get("status") or ""),
+            preferred_doc_id=annotation_doc_id,
             limit=2,
         ):
             alternates.append(
@@ -1150,6 +1262,62 @@ def annotate(
                 ),
             }
         )
+
+    if consistency_path.exists():
+        for row in read_jsonl(consistency_path):
+            status = str(row.get("status") or "").strip()
+            if not status or status == "pass":
+                continue
+            if blocking_only and not _is_blocking_finding_status(status):
+                continue
+            evidence = _consistency_evidence_candidates(row, preferred_doc_id=annotation_doc_id)
+            primary = _choose_primary_evidence(
+                evidence,
+                status=status,
+                preferred_doc_id=annotation_doc_id,
+            )
+            if not primary:
+                primary = {}
+            alternates = []
+            for item in _choose_alternate_evidence(
+                evidence,
+                primary,
+                status=status,
+                preferred_doc_id=annotation_doc_id,
+                limit=2,
+            ):
+                alternates.append(
+                    {
+                        "doc_id": item.get("doc_id", annotation_doc_id),
+                        "location": item.get("location"),
+                        "excerpt": item.get("excerpt"),
+                        "score": item.get("score"),
+                    }
+                )
+            issue_id = f"C-{str(row.get('type') or 'consistency').strip() or 'consistency'}"
+            severity = str(row.get("severity") or "medium")
+            reason = str(row.get("reason") or "一致性核验发现异常")
+            issue_rows.append(
+                {
+                    "requirement_id": issue_id,
+                    "status": status,
+                    "severity": severity,
+                    "reason": reason,
+                    "review_action": _review_action_for_status(status),
+                    "target": {
+                        "doc_id": primary.get("doc_id", annotation_doc_id),
+                        "location": primary.get("location"),
+                        "excerpt": primary.get("excerpt"),
+                        "score": primary.get("score"),
+                    },
+                    "alternate_targets": alternates,
+                    "source": "consistency",
+                    "note": (
+                        f"[{severity}] {issue_id} {status}: "
+                        f"{reason} | 复核动作：{_review_action_for_status(status)}"
+                    ),
+                }
+            )
 
     write_jsonl(annotations_path, issue_rows)
 
@@ -1338,11 +1506,22 @@ def _is_mappable_location(location: Any) -> bool:
     return (isinstance(block_index, int) and block_index > 0) or (isinstance(page, int) and page > 0)
 
 
-def _choose_primary_evidence(evidence: Any, *, status: str | None = None) -> dict[str, Any]:
+def _choose_primary_evidence(
+    evidence: Any,
+    *,
+    status: str | None = None,
+    preferred_doc_id: str | None = None,
+) -> dict[str, Any]:
     if not isinstance(evidence, list) or not evidence:
         return {}
 
     candidates = [item for item in evidence if isinstance(item, dict)]
+    if preferred_doc_id:
+        preferred = [
+            item for item in candidates if str(item.get("doc_id") or "").strip() == str(preferred_doc_id).strip()
+        ]
+        if preferred:
+            candidates = preferred
     if status == "needs_ocr":
         reference_candidates = [item for item in candidates if item.get("reference_only")]
         if reference_candidates:
@@ -1410,6 +1589,7 @@ def _choose_alternate_evidence(
     primary: dict[str, Any],
     *,
     status: str | None = None,
+    preferred_doc_id: str | None = None,
     limit: int = 2,
 ) -> list[dict[str, Any]]:
     def _safe_int(value: Any) -> int:
@@ -1421,9 +1601,16 @@ def _choose_alternate_evidence(
     if not isinstance(evidence, list) or not evidence:
         return []
     primary_id = primary.get("evidence_id")
+    candidates = [item for item in evidence if isinstance(item, dict)]
+    if preferred_doc_id:
+        preferred = [
+            item for item in candidates if str(item.get("doc_id") or "").strip() == str(preferred_doc_id).strip()
+        ]
+        if preferred:
+            candidates = preferred
     alternates: list[dict[str, Any]] = []
     for item in sorted(
-        (item for item in evidence if isinstance(item, dict)),
+        candidates,
         key=lambda item: (
             1 if _is_mappable_location(item.get("location")) else 0,
             0 if status == "needs_ocr" and item.get("reference_only") else 1,

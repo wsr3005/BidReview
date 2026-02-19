@@ -290,6 +290,68 @@ class AnnotateOutputTests(unittest.TestCase):
             row = next(read_jsonl(out_dir / "annotations.jsonl"))
             self.assertEqual((row.get("target") or {}).get("location", {}).get("block_index"), 2)
 
+    def test_annotate_includes_consistency_findings_and_prefers_bid_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            bid_docx = base / "bid.docx"
+            tender_txt = base / "tender.txt"
+            _create_minimal_docx(bid_docx, ["投标文件正文", "其他内容"])
+            tender_txt.write_text("招标文件正文", encoding="utf-8")
+
+            ingest(
+                tender_path=tender_txt,
+                bid_path=bid_docx,
+                out_dir=out_dir,
+                resume=False,
+            )
+
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "pass",
+                        "severity": "none",
+                        "reason": "ok",
+                        "evidence": [{"doc_id": "bid", "location": {"block_index": 1}}],
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "consistency-findings.jsonl",
+                [
+                    {
+                        "type": "tender_no_cross_doc",
+                        "status": "fail",
+                        "severity": "high",
+                        "reason": "招标编号（招投标对照）核验不一致",
+                        "comparison": {
+                            "evidence_a": {
+                                "doc_id": "bid",
+                                "location": {"block_index": 1, "page": None},
+                                "excerpt": "招标编号：25AT187076602200",
+                            },
+                            "evidence_b": {
+                                "doc_id": "tender",
+                                "location": {"block_index": 1, "page": 1},
+                                "excerpt": "项目编号：25AT187076602232",
+                            },
+                        },
+                    }
+                ],
+            )
+
+            result = annotate(out_dir=out_dir, resume=False)
+            self.assertEqual(result["annotations"], 1)
+            row = next(read_jsonl(out_dir / "annotations.jsonl"))
+            self.assertEqual(row.get("source"), "consistency")
+            self.assertEqual(row.get("requirement_id"), "C-tender_no_cross_doc")
+            self.assertEqual((row.get("target") or {}).get("doc_id"), "bid")
+            self.assertEqual((row.get("target") or {}).get("location", {}).get("block_index"), 1)
+
     def test_resolve_manifest_relative_path_after_cwd_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
