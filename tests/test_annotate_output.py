@@ -352,6 +352,98 @@ class AnnotateOutputTests(unittest.TestCase):
             self.assertEqual((row.get("target") or {}).get("doc_id"), "bid")
             self.assertEqual((row.get("target") or {}).get("location", {}).get("block_index"), 1)
 
+    def test_annotate_consistency_prefers_outlier_value_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            out_dir = base / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            bid_docx = base / "bid.docx"
+            tender_txt = base / "tender.txt"
+            _create_minimal_docx(
+                bid_docx,
+                [
+                    "单位名称：北京为是科技有限公司",
+                    "投标人：北京二维码科技有限公司",
+                    "其他内容",
+                ],
+            )
+            tender_txt.write_text("招标文件正文", encoding="utf-8")
+
+            ingest(
+                tender_path=tender_txt,
+                bid_path=bid_docx,
+                out_dir=out_dir,
+                resume=False,
+            )
+
+            write_jsonl(
+                out_dir / "findings.jsonl",
+                [
+                    {
+                        "requirement_id": "R0001",
+                        "status": "pass",
+                        "severity": "none",
+                        "reason": "ok",
+                        "evidence": [{"doc_id": "bid", "location": {"block_index": 1}}],
+                    }
+                ],
+            )
+            write_jsonl(
+                out_dir / "consistency-findings.jsonl",
+                [
+                    {
+                        "type": "bidder_name",
+                        "status": "fail",
+                        "severity": "high",
+                        "reason": "投标主体名称核验不一致",
+                        "values": [
+                            {
+                                "value_norm": "北京为是科技有限公司",
+                                "count": 7,
+                                "examples": [
+                                    {
+                                        "doc_id": "bid",
+                                        "location": {"block_index": 1, "page": None},
+                                        "excerpt": "单位名称：北京为是科技有限公司",
+                                    }
+                                ],
+                            },
+                            {
+                                "value_norm": "北京二维码科技有限公司",
+                                "count": 1,
+                                "examples": [
+                                    {
+                                        "doc_id": "bid",
+                                        "location": {"block_index": 2, "page": None},
+                                        "excerpt": "投标人：北京二维码科技有限公司",
+                                    }
+                                ],
+                            },
+                        ],
+                        "comparison": {
+                            "evidence_a": {
+                                "doc_id": "bid",
+                                "location": {"block_index": 1, "page": None},
+                                "excerpt": "单位名称：北京为是科技有限公司",
+                            },
+                            "evidence_b": {
+                                "doc_id": "bid",
+                                "location": {"block_index": 2, "page": None},
+                                "excerpt": "投标人：北京二维码科技有限公司",
+                            },
+                        },
+                    }
+                ],
+            )
+
+            result = annotate(out_dir=out_dir, resume=False)
+            self.assertEqual(result["annotations"], 1)
+            row = next(read_jsonl(out_dir / "annotations.jsonl"))
+            self.assertEqual(row.get("source"), "consistency")
+            self.assertEqual((row.get("target") or {}).get("location", {}).get("block_index"), 2)
+            self.assertIn("北京二维码科技有限公司", (row.get("target") or {}).get("excerpt") or "")
+
     def test_resolve_manifest_relative_path_after_cwd_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

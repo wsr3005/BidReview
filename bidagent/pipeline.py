@@ -1163,6 +1163,109 @@ def _consistency_evidence_candidates(
     return candidates
 
 
+def _choose_consistency_primary_evidence(
+    row: dict[str, Any],
+    evidence: Any,
+    *,
+    status: str | None = None,
+    preferred_doc_id: str | None = None,
+) -> dict[str, Any]:
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _location_rank(location: Any) -> tuple[int, int]:
+        if not isinstance(location, dict):
+            return (1, 1)
+        section = str(location.get("section") or "").strip().upper()
+        is_ocr_media = 1 if section == "OCR_MEDIA" else 0
+        block_index = _safe_int(location.get("block_index"), default=0)
+        return (is_ocr_media, -block_index)
+
+    if isinstance(row, dict):
+        value_candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, int | None, int | None, str]] = set()
+        for value in row.get("values") or []:
+            if not isinstance(value, dict):
+                continue
+            conflict_count = max(0, _safe_int(value.get("count"), default=0))
+            for example in value.get("examples") or []:
+                if not isinstance(example, dict):
+                    continue
+                doc_id = str(example.get("doc_id") or "").strip()
+                if not doc_id:
+                    continue
+                if preferred_doc_id and doc_id != str(preferred_doc_id).strip():
+                    continue
+                location = example.get("location")
+                if not _is_mappable_location(location):
+                    continue
+                excerpt = str(example.get("excerpt") or "").strip()
+                block_index = location.get("block_index") if isinstance(location, dict) else None
+                page = location.get("page") if isinstance(location, dict) else None
+                key = (
+                    doc_id,
+                    block_index if isinstance(block_index, int) else None,
+                    page if isinstance(page, int) else None,
+                    excerpt[:80],
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                value_candidates.append(
+                    {
+                        "doc_id": doc_id,
+                        "location": location,
+                        "excerpt": excerpt,
+                        "score": conflict_count,
+                        "reference_only": False,
+                        "has_action": len(excerpt) >= 12,
+                        "_conflict_count": conflict_count,
+                    }
+                )
+        if value_candidates:
+            # For consistency issues, annotate the outlier value first so reviewers jump
+            # to the suspicious edit instead of the dominant repeated value.
+            value_candidates.sort(
+                key=lambda item: (
+                    int(item.get("_conflict_count") or 0),
+                    _location_rank(item.get("location")),
+                    -len(str(item.get("excerpt") or "")),
+                )
+            )
+            chosen = value_candidates[0]
+            chosen_doc = str(chosen.get("doc_id") or "").strip()
+            chosen_location = chosen.get("location") if isinstance(chosen.get("location"), dict) else {}
+            chosen_excerpt = str(chosen.get("excerpt") or "").strip()
+            chosen_block = chosen_location.get("block_index") if isinstance(chosen_location, dict) else None
+            chosen_page = chosen_location.get("page") if isinstance(chosen_location, dict) else None
+            for item in evidence if isinstance(evidence, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                item_doc = str(item.get("doc_id") or "").strip()
+                if item_doc != chosen_doc:
+                    continue
+                item_location = item.get("location") if isinstance(item.get("location"), dict) else {}
+                item_block = item_location.get("block_index")
+                item_page = item_location.get("page")
+                if item_block != chosen_block or item_page != chosen_page:
+                    continue
+                item_excerpt = str(item.get("excerpt") or "").strip()
+                if chosen_excerpt and item_excerpt and item_excerpt[:80] != chosen_excerpt[:80]:
+                    continue
+                return item
+            chosen.pop("_conflict_count", None)
+            return chosen
+
+    return _choose_primary_evidence(
+        evidence,
+        status=status,
+        preferred_doc_id=preferred_doc_id,
+    )
+
+
 def annotate(
     out_dir: Path,
     resume: bool = False,
@@ -1271,7 +1374,8 @@ def annotate(
             if blocking_only and not _is_blocking_finding_status(status):
                 continue
             evidence = _consistency_evidence_candidates(row, preferred_doc_id=annotation_doc_id)
-            primary = _choose_primary_evidence(
+            primary = _choose_consistency_primary_evidence(
+                row,
                 evidence,
                 status=status,
                 preferred_doc_id=annotation_doc_id,
