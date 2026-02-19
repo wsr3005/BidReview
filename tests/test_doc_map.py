@@ -84,6 +84,36 @@ class DocMapTests(unittest.TestCase):
         tags = {str(item.get("semantic_tag") or "") for item in sections}
         self.assertIn("evaluation_risk", tags)
 
+    def test_build_ingest_doc_map_extracts_anchor_from_table_like_long_line(self) -> None:
+        tender_rows = [
+            {
+                "doc_id": "tender",
+                "text": "序号 | 所属章节 | 说明",
+                "location": {"block_index": 8, "page": 2, "section": "Table"},
+            },
+            {
+                "doc_id": "tender",
+                "text": "1 | 第三章 评标办法及定标原则 | 本章用于资格审查与评分细则说明",
+                "location": {"block_index": 9, "page": 2, "section": "Table"},
+            },
+            {
+                "doc_id": "tender",
+                "text": "2 | 第四章 合同条款 | 本章用于商务履约约定",
+                "location": {"block_index": 10, "page": 2, "section": "Table"},
+            },
+        ]
+        bid_rows = [{"doc_id": "bid", "text": "投标文件正文", "location": {"block_index": 1, "page": 1}}]
+
+        payload = build_ingest_doc_map(tender_rows=tender_rows, bid_rows=bid_rows)
+        tender = next(item for item in (payload.get("docs") or []) if item.get("doc_id") == "tender")
+        anchors = tender.get("anchors") or []
+        self.assertGreaterEqual(len(anchors), 2)
+        tags = {str(item.get("semantic_tag") or "") for item in anchors}
+        self.assertIn("evaluation_risk", tags)
+        self.assertIn("business_contract", tags)
+        block_type_counts = tender.get("block_type_counts") or {}
+        self.assertGreaterEqual(int(block_type_counts.get("table") or 0), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

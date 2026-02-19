@@ -13,6 +13,9 @@ _CHAPTER_HEADING_PATTERN = re.compile(
 _CHAPTER_IN_TEXT_PATTERN = re.compile(r"第[一二三四五六七八九十百零0-9]+[章节编部分篇卷]")
 _LONG_ANCHOR_HINT_PATTERN = re.compile(r"(投标人须知|评标办法|合同条款|技术规范|商务条款|资格审查)")
 _TOC_LINE_PATTERN = re.compile(r"^(?P<title>.+?)(?:[\.·•…\-—]{2,}|\s{2,})(?P<page>\d{1,4})$")
+_TABLE_DELIMITER_PATTERN = re.compile(r"[|｜│]")
+_TABLE_COLUMN_HINT_PATTERN = re.compile(r"\S+\s{2,}\S+")
+_TABLE_KEYWORD_PATTERN = re.compile(r"(序号|条款|项目|内容|参数|规格|数量|单位|偏离|响应)")
 _SPACE_PATTERN = re.compile(r"\s+")
 
 
@@ -59,10 +62,23 @@ def _extract_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(row, dict):
             continue
         location = row.get("location") if isinstance(row.get("location"), dict) else {}
+        text = _normalize_space(row.get("text"))
+        block_type = str(row.get("block_type") or "").strip().lower()
+        if block_type not in {"text", "ocr", "table"}:
+            raw_text = str(row.get("text") or "")
+            delimiter_hits = len(_TABLE_DELIMITER_PATTERN.findall(raw_text))
+            has_tab = "\t" in raw_text
+            spaced_columns = bool(_TABLE_COLUMN_HINT_PATTERN.search(raw_text))
+            table_keyword = bool(_TABLE_KEYWORD_PATTERN.search(raw_text))
+            if delimiter_hits >= 2 or has_tab or (spaced_columns and table_keyword):
+                block_type = "table"
+            else:
+                block_type = "text"
         normalized_rows.append(
             {
                 "doc_id": str(row.get("doc_id") or ""),
-                "text": _normalize_space(row.get("text")),
+                "text": text,
+                "block_type": block_type,
                 "location": {
                     "block_index": _safe_int(location.get("block_index")),
                     "page": _safe_int(location.get("page")),
@@ -96,10 +112,12 @@ def _build_anchor_candidates(rows: list[dict[str, Any]]) -> list[_Anchor]:
         if not text:
             continue
         location = row.get("location") if isinstance(row.get("location"), dict) else {}
+        block_type = str(row.get("block_type") or "text")
         section = _normalize_space(location.get("section")) or None
         compact = re.sub(r"\s+", "", text)
-        prefix = compact[:140]
-        long_heading_hint = bool(_CHAPTER_IN_TEXT_PATTERN.search(prefix) or _LONG_ANCHOR_HINT_PATTERN.search(prefix))
+        prefix = compact[:240]
+        chapter_in_text = bool(_CHAPTER_IN_TEXT_PATTERN.search(compact))
+        long_heading_hint = bool(chapter_in_text or _LONG_ANCHOR_HINT_PATTERN.search(prefix))
         if len(compact) > 220 and not long_heading_hint:
             continue
         if _TOC_LINE_PATTERN.match(compact):
@@ -113,6 +131,8 @@ def _build_anchor_candidates(rows: list[dict[str, Any]]) -> list[_Anchor]:
             score += 4
         if long_heading_hint:
             score += 3
+        if block_type == "table" and long_heading_hint:
+            score += 2
         if compact.startswith("第") and any(token in compact[:8] for token in ("章", "节", "篇", "编")):
             score += 2
         if compact.startswith("目录"):
@@ -275,10 +295,12 @@ def _build_doc_entry(*, doc_id: str, rows: list[dict[str, Any]]) -> dict[str, An
             if page is not None
         }
     )
+    block_type_counts = dict(Counter(str(row.get("block_type") or "text") for row in rows))
     return {
         "doc_id": doc_id,
         "total_blocks": len(rows),
         "total_pages": len(pages),
+        "block_type_counts": block_type_counts,
         "anchors": [
             {
                 "anchor_id": f"A-{index:03d}",
