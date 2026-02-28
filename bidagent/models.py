@@ -10,6 +10,8 @@ class Location:
     page: int | None = None
     section: str | None = None
     section_tag: str | None = None
+    image_index: int | None = None
+    image_name: str | None = None
 
 
 @dataclass(slots=True)

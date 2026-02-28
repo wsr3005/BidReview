@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import posixpath
 import shutil
 import subprocess
 import zipfile
@@ -9,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from pathlib import Path
 from typing import Any, Callable, Iterator
+import xml.etree.ElementTree as etree
+from collections import defaultdict
 
 from bidagent.review import normalize_compact
 from bidagent.document import split_text_blocks
@@ -24,6 +27,11 @@ DEFAULT_TESSERACT_LANG = "chi_sim+eng"
 DEFAULT_TESSERACT_CONFIG = "--oem 1 --psm 6"
 OCR_BACKEND_CANDIDATES = ("paddle", "tesseract")
 _TESSERACT_LANG_CACHE: tuple[str, str, frozenset[str]] | None = None
+DOCX_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+DOCX_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+DOCX_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+DOCX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+DOCX_NS = {"w": DOCX_W_NS, "a": DOCX_A_NS}
 
 
 def _resolve_backend_preference(mode: str) -> str:
@@ -357,6 +365,261 @@ def load_ocr_engine(mode: str) -> Callable[[bytes], str] | None:
     return engines[0][1] if engines else None
 
 
+def _matrix_unit_rect(ctm: object) -> tuple[float, float, float, float] | None:
+    if not isinstance(ctm, (list, tuple)) or len(ctm) < 6:
+        return None
+    try:
+        a, b, c, d, e, f = (float(ctm[i]) for i in range(6))
+    except (TypeError, ValueError):
+        return None
+
+    def _transform(x: float, y: float) -> tuple[float, float]:
+        return (a * x + c * y + e, b * x + d * y + f)
+
+    points = [_transform(0.0, 0.0), _transform(1.0, 0.0), _transform(0.0, 1.0), _transform(1.0, 1.0)]
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _pdf_page_geometry(page: Any) -> dict[str, float]:
+    box = getattr(page, "cropbox", None) or getattr(page, "mediabox", None)
+    if box is None:
+        left = 0.0
+        bottom = 0.0
+        right = 0.0
+        top = 0.0
+    else:
+        left = float(getattr(box, "left", 0.0))
+        bottom = float(getattr(box, "bottom", 0.0))
+        right = float(getattr(box, "right", left))
+        top = float(getattr(box, "top", bottom))
+    width = max(0.0, right - left)
+    height = max(0.0, top - bottom)
+    try:
+        rotation = int(getattr(page, "rotation", 0) or 0) % 360
+    except Exception:  # noqa: BLE001
+        rotation = 0
+    if rotation not in {0, 90, 180, 270}:
+        rotation = 0
+    display_width = height if rotation in {90, 270} else width
+    display_height = width if rotation in {90, 270} else height
+    return {
+        "left": left,
+        "bottom": bottom,
+        "width": width,
+        "height": height,
+        "rotation": float(rotation),
+        "display_width": display_width,
+        "display_height": display_height,
+    }
+
+
+def _rotate_pdf_point_for_display(
+    x: float,
+    y: float,
+    *,
+    width: float,
+    height: float,
+    rotation: int,
+) -> tuple[float, float]:
+    if rotation == 90:
+        return (y, width - x)
+    if rotation == 180:
+        return (width - x, height - y)
+    if rotation == 270:
+        return (height - y, x)
+    return (x, y)
+
+
+def _derotate_pdf_display_point(
+    x: float,
+    y: float,
+    *,
+    width: float,
+    height: float,
+    rotation: int,
+) -> tuple[float, float]:
+    if rotation == 90:
+        return (width - y, x)
+    if rotation == 180:
+        return (width - x, height - y)
+    if rotation == 270:
+        return (y, height - x)
+    return (x, y)
+
+
+def normalize_pdf_rect_for_display(
+    rect: tuple[float, float, float, float],
+    page: Any,
+) -> tuple[float, float, float, float] | None:
+    if not isinstance(rect, (list, tuple)) or len(rect) < 4:
+        return None
+    try:
+        left, bottom, right, top = (float(rect[idx]) for idx in range(4))
+    except (TypeError, ValueError):
+        return None
+
+    geometry = _pdf_page_geometry(page)
+    box_left = geometry["left"]
+    box_bottom = geometry["bottom"]
+    width = geometry["width"]
+    height = geometry["height"]
+    rotation = int(geometry["rotation"])
+    display_width = geometry["display_width"]
+    display_height = geometry["display_height"]
+
+    local_points = [
+        (left - box_left, bottom - box_bottom),
+        (right - box_left, bottom - box_bottom),
+        (left - box_left, top - box_bottom),
+        (right - box_left, top - box_bottom),
+    ]
+    rotated = [
+        _rotate_pdf_point_for_display(x, y, width=width, height=height, rotation=rotation)
+        for x, y in local_points
+    ]
+    xs = [point[0] for point in rotated]
+    ys = [point[1] for point in rotated]
+    display_rect = (min(xs), min(ys), max(xs), max(ys))
+
+    clipped = (
+        max(0.0, min(display_width, display_rect[0])),
+        max(0.0, min(display_height, display_rect[1])),
+        max(0.0, min(display_width, display_rect[2])),
+        max(0.0, min(display_height, display_rect[3])),
+    )
+    if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
+        return clipped
+    return display_rect
+
+
+def denormalize_pdf_display_rect(
+    rect: tuple[float, float, float, float],
+    page: Any,
+) -> tuple[float, float, float, float] | None:
+    if not isinstance(rect, (list, tuple)) or len(rect) < 4:
+        return None
+    try:
+        left, bottom, right, top = (float(rect[idx]) for idx in range(4))
+    except (TypeError, ValueError):
+        return None
+
+    geometry = _pdf_page_geometry(page)
+    box_left = geometry["left"]
+    box_bottom = geometry["bottom"]
+    width = geometry["width"]
+    height = geometry["height"]
+    rotation = int(geometry["rotation"])
+    points = [
+        _derotate_pdf_display_point(left, bottom, width=width, height=height, rotation=rotation),
+        _derotate_pdf_display_point(right, bottom, width=width, height=height, rotation=rotation),
+        _derotate_pdf_display_point(left, top, width=width, height=height, rotation=rotation),
+        _derotate_pdf_display_point(right, top, width=width, height=height, rotation=rotation),
+    ]
+    xs = [point[0] + box_left for point in points]
+    ys = [point[1] + box_bottom for point in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def list_pdf_page_image_anchors(page: Any) -> list[dict[str, Any]]:
+    try:
+        resources = page.get("/Resources") or {}
+        xobjects = resources.get("/XObject") or {}
+    except Exception:  # noqa: BLE001
+        xobjects = {}
+
+    anchors: list[dict[str, Any]] = []
+    per_resource_count: dict[str, int] = defaultdict(int)
+    inline_image_count = 0
+
+    def _visit_operand(op: Any, args: Any, ctm: Any, _tm: Any) -> None:
+        nonlocal inline_image_count
+        resource_name = ""
+        if op == b"Do":
+            if not isinstance(args, (list, tuple)) or not args:
+                return
+            resource_name = str(args[0] or "").strip()
+            if not resource_name:
+                return
+            try:
+                xobj = xobjects[resource_name]
+                subtype = str(xobj.get("/Subtype") or "")
+            except Exception:  # noqa: BLE001
+                return
+            if subtype != "/Image":
+                return
+        elif op == b"INLINE IMAGE":
+            resource_name = f"~{inline_image_count}~"
+            inline_image_count += 1
+        else:
+            return
+        per_resource_count[resource_name] = int(per_resource_count.get(resource_name, 0)) + 1
+        rect = _matrix_unit_rect(ctm)
+        anchors.append(
+            {
+                "image_index": len(anchors) + 1,
+                "resource_name": resource_name,
+                "resource_ordinal": per_resource_count[resource_name],
+                "rect": rect,
+                "rect_display": normalize_pdf_rect_for_display(rect, page) if rect is not None else None,
+            }
+        )
+
+    try:
+        page.extract_text(visitor_operand_before=_visit_operand)
+    except Exception:  # noqa: BLE001
+        return []
+    return anchors
+
+
+def _resolve_docx_rel_target(target: str) -> str:
+    normalized = str(target or "").strip().replace("\\", "/")
+    if not normalized:
+        return ""
+    if normalized.startswith("/"):
+        return normalized.lstrip("/")
+    return posixpath.normpath(posixpath.join("word", normalized))
+
+
+def _iter_docx_image_refs(path: Path) -> Iterator[tuple[int, str]]:
+    with zipfile.ZipFile(path, "r") as archive:
+        valid_media = [
+            name
+            for name in archive.namelist()
+            if name.startswith("word/media/") and Path(name).suffix.lower() in OCR_IMAGE_EXTENSIONS
+        ]
+
+        rel_targets: dict[str, str] = {}
+        rels_path = "word/_rels/document.xml.rels"
+        if rels_path in archive.namelist():
+            rels_root = etree.fromstring(archive.read(rels_path))
+            for rel in rels_root.findall(f"{{{DOCX_PKG_REL_NS}}}Relationship"):
+                rel_id = str(rel.attrib.get("Id") or "").strip()
+                target = _resolve_docx_rel_target(str(rel.attrib.get("Target") or ""))
+                if rel_id and target:
+                    rel_targets[rel_id] = target
+
+        ordered: list[str] = []
+        if "word/document.xml" in archive.namelist():
+            document_root = etree.fromstring(archive.read("word/document.xml"))
+            for drawing in document_root.findall(".//w:drawing", DOCX_NS):
+                for blip in drawing.findall(".//a:blip", DOCX_NS):
+                    rel_id = (
+                        blip.attrib.get(f"{{{DOCX_R_NS}}}embed")
+                        or blip.attrib.get(f"{{{DOCX_R_NS}}}link")
+                        or ""
+                    ).strip()
+                    target = rel_targets.get(rel_id)
+                    if target in valid_media:
+                        ordered.append(target)
+
+        referenced = set(ordered)
+        ordered.extend(name for name in valid_media if name not in referenced)
+        for image_index, name in enumerate(ordered, start=1):
+            yield image_index, name
+
+
 def iter_docx_ocr_blocks(
     path: Path,
     doc_id: str,
@@ -408,10 +671,8 @@ def iter_docx_ocr_blocks(
         return "", False, "; ".join(errors), errors
 
     seen_hashes: set[str] = set()
+    image_refs = list(_iter_docx_image_refs(path))
     with zipfile.ZipFile(path, "r") as archive:
-        media_names = [name for name in archive.namelist() if name.startswith("word/media/")]
-        image_names = [name for name in media_names if Path(name).suffix.lower() in OCR_IMAGE_EXTENSIONS]
-
         if isinstance(stats, dict):
             stats.setdefault("images_total", 0)
             stats.setdefault("images_skipped_duplicate", 0)
@@ -420,13 +681,13 @@ def iter_docx_ocr_blocks(
 
         # Tesseract is external-process based; threads are sufficient here.
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            in_flight: dict[int, tuple[str, Any]] = {}
+            in_flight: dict[int, tuple[int, str, Any]] = {}
             next_seq = 0
             seq = 0
 
-            def _drain_one(expected_seq: int) -> Iterator[str]:
+            def _drain_one(expected_seq: int) -> Iterator[tuple[int, str, str]]:
                 nonlocal in_flight
-                name, fut = in_flight.pop(expected_seq)
+                image_index, name, fut = in_flight.pop(expected_seq)
                 try:
                     text, ok, backend_or_error, fallback_errors = fut.result()
                 except Exception:  # noqa: BLE001
@@ -455,14 +716,16 @@ def iter_docx_ocr_blocks(
                             failure_counts[token] = int(failure_counts.get(token, 0)) + 1
                         sample_errors = stats.setdefault("sample_errors", [])
                         if isinstance(sample_errors, list) and len(sample_errors) < 5:
-                            sample_errors.append({"image": name, "error": backend_or_error})
+                            sample_errors.append(
+                                {"image": name, "image_index": image_index, "error": backend_or_error}
+                            )
                         return iter(())
                 # Some images are logos/stamps with no useful text; filter noise.
                 if not normalize_compact(text):
                     return iter(())
-                return iter((text,))
+                return iter(((image_index, name, text),))
 
-            for name in image_names:
+            for image_index, name in image_refs:
                 image_bytes = archive.read(name)
                 digest = hashlib.sha256(image_bytes).hexdigest()
 
@@ -476,12 +739,12 @@ def iter_docx_ocr_blocks(
                     stats["images_total"] = int(stats.get("images_total", 0)) + 1
 
                 fut = executor.submit(_ocr_bytes, image_bytes)
-                in_flight[seq] = (name, fut)
+                in_flight[seq] = (image_index, name, fut)
                 seq += 1
 
                 # Keep in-flight bounded and preserve deterministic output order.
                 while len(in_flight) >= max_in_flight and next_seq in in_flight:
-                    for text in _drain_one(next_seq):
+                    for image_for_text, image_name, text in _drain_one(next_seq):
                         for chunk in split_text_blocks(text):
                             if isinstance(stats, dict):
                                 stats["chars_total"] = int(stats.get("chars_total", 0)) + len(chunk)
@@ -491,7 +754,12 @@ def iter_docx_ocr_blocks(
                             yield Block(
                                 doc_id=doc_id,
                                 text=chunk,
-                                location=Location(block_index=current_index, section="OCR_MEDIA"),
+                                location=Location(
+                                    block_index=current_index,
+                                    section="OCR_MEDIA",
+                                    image_index=image_for_text,
+                                    image_name=Path(image_name).name,
+                                ),
                                 block_type="ocr",
                                 section_hint="OCR_MEDIA",
                             )
@@ -502,7 +770,7 @@ def iter_docx_ocr_blocks(
                 if next_seq not in in_flight:
                     next_seq += 1
                     continue
-                for text in _drain_one(next_seq):
+                for image_for_text, image_name, text in _drain_one(next_seq):
                     for chunk in split_text_blocks(text):
                         if isinstance(stats, dict):
                             stats["chars_total"] = int(stats.get("chars_total", 0)) + len(chunk)
@@ -512,7 +780,12 @@ def iter_docx_ocr_blocks(
                         yield Block(
                             doc_id=doc_id,
                             text=chunk,
-                            location=Location(block_index=current_index, section="OCR_MEDIA"),
+                            location=Location(
+                                block_index=current_index,
+                                section="OCR_MEDIA",
+                                image_index=image_for_text,
+                                image_name=Path(image_name).name,
+                            ),
                             block_type="ocr",
                             section_hint="OCR_MEDIA",
                         )
@@ -585,12 +858,12 @@ def iter_pdf_ocr_blocks(
         stats.setdefault("images_succeeded", 0)
         stats.setdefault("images_failed", 0)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        in_flight: dict[int, tuple[int, Any]] = {}
+        in_flight: dict[int, tuple[int, int, str | None, Any]] = {}
         next_seq = 0
         seq = 0
 
-        def _drain_one(expected_seq: int) -> Iterator[tuple[int, str]]:
-            page_no, fut = in_flight.pop(expected_seq)
+        def _drain_one(expected_seq: int) -> Iterator[tuple[int, int, str | None, str]]:
+            page_no, image_index, image_name, fut = in_flight.pop(expected_seq)
             try:
                 text, ok, backend_or_error, fallback_errors = fut.result()
             except Exception:  # noqa: BLE001
@@ -619,30 +892,69 @@ def iter_pdf_ocr_blocks(
                         failure_counts[token] = int(failure_counts.get(token, 0)) + 1
                     sample_errors = stats.setdefault("sample_errors", [])
                     if isinstance(sample_errors, list) and len(sample_errors) < 5:
-                        sample_errors.append({"page": page_no, "error": backend_or_error})
+                        sample_errors.append(
+                            {
+                                "page": page_no,
+                                "image_index": image_index,
+                                "image_name": image_name,
+                                "error": backend_or_error,
+                            }
+                        )
                     return iter(())
             if not normalize_compact(text):
                 return iter(())
-            return iter(((page_no, text),))
+            return iter(((page_no, image_index, image_name, text),))
 
         for page_no in range(start_page, end_page + 1):
             page = reader.pages[page_no - 1]
-            try:
-                images = list(page.images)
-            except Exception:  # noqa: BLE001
-                images = []
-            for image in images:
-                data = getattr(image, "data", None)
-                if not isinstance(data, (bytes, bytearray)):
-                    continue
+            anchors = list_pdf_page_image_anchors(page)
+            if anchors:
+                image_specs: list[tuple[int, str | None, bytes]] = []
+                for anchor in anchors:
+                    resource_name = str(anchor.get("resource_name") or "").strip()
+                    if not resource_name:
+                        continue
+                    try:
+                        image = page._get_image(resource_name)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    data = getattr(image, "data", None)
+                    if not isinstance(data, (bytes, bytearray)):
+                        continue
+                    image_specs.append(
+                        (
+                            int(anchor.get("image_index") or 0),
+                            str(getattr(image, "name", "") or "").strip() or None,
+                            bytes(data),
+                        )
+                    )
+            else:
+                try:
+                    images = list(page.images)
+                except Exception:  # noqa: BLE001
+                    images = []
+                image_specs = []
+                for image_index, image in enumerate(images, start=1):
+                    data = getattr(image, "data", None)
+                    if not isinstance(data, (bytes, bytearray)):
+                        continue
+                    image_specs.append(
+                        (
+                            image_index,
+                            str(getattr(image, "name", "") or "").strip() or None,
+                            bytes(data),
+                        )
+                    )
+
+            for image_index, image_name, image_bytes in image_specs:
                 if isinstance(stats, dict):
                     stats["images_total"] = int(stats.get("images_total", 0)) + 1
-                fut = executor.submit(_ocr_bytes, bytes(data))
-                in_flight[seq] = (page_no, fut)
+                fut = executor.submit(_ocr_bytes, image_bytes)
+                in_flight[seq] = (page_no, image_index, image_name, fut)
                 seq += 1
 
                 while len(in_flight) >= max_in_flight and next_seq in in_flight:
-                    for page_for_text, text in _drain_one(next_seq):
+                    for page_for_text, image_for_text, image_name, text in _drain_one(next_seq):
                         for chunk in split_text_blocks(text):
                             if isinstance(stats, dict):
                                 stats["chars_total"] = int(stats.get("chars_total", 0)) + len(chunk)
@@ -652,7 +964,13 @@ def iter_pdf_ocr_blocks(
                             yield Block(
                                 doc_id=doc_id,
                                 text=chunk,
-                                location=Location(block_index=current_index, page=page_for_text, section="OCR_MEDIA"),
+                                location=Location(
+                                    block_index=current_index,
+                                    page=page_for_text,
+                                    section="OCR_MEDIA",
+                                    image_index=image_for_text,
+                                    image_name=image_name,
+                                ),
                                 block_type="ocr",
                                 section_hint="OCR_MEDIA",
                             )
@@ -662,7 +980,7 @@ def iter_pdf_ocr_blocks(
             if next_seq not in in_flight:
                 next_seq += 1
                 continue
-            for page_for_text, text in _drain_one(next_seq):
+            for page_for_text, image_for_text, image_name, text in _drain_one(next_seq):
                 for chunk in split_text_blocks(text):
                     if isinstance(stats, dict):
                         stats["chars_total"] = int(stats.get("chars_total", 0)) + len(chunk)
@@ -672,7 +990,13 @@ def iter_pdf_ocr_blocks(
                     yield Block(
                         doc_id=doc_id,
                         text=chunk,
-                        location=Location(block_index=current_index, page=page_for_text, section="OCR_MEDIA"),
+                        location=Location(
+                            block_index=current_index,
+                            page=page_for_text,
+                            section="OCR_MEDIA",
+                            image_index=image_for_text,
+                            image_name=image_name,
+                        ),
                         block_type="ocr",
                         section_hint="OCR_MEDIA",
                     )

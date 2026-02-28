@@ -193,6 +193,8 @@ def build_unified_evidence_index(rows: Iterable[dict[str, Any]]) -> list[dict[st
         location_dict = dict(location) if isinstance(location, dict) else {}
         block_index = _safe_positive_int(location_dict.get("block_index"))
         page = _safe_positive_int(location_dict.get("page"))
+        image_index = _safe_positive_int(location_dict.get("image_index"))
+        image_name = str(location_dict.get("image_name") or "").strip() or None
         section = str(location_dict.get("section") or row.get("section") or "").strip() or None
         section_tag = (
             _normalize_section_tag(row.get("section_tag"))
@@ -218,6 +220,10 @@ def build_unified_evidence_index(rows: Iterable[dict[str, Any]]) -> list[dict[st
             location_out["block_index"] = block_index
         if page is not None:
             location_out["page"] = page
+        if image_index is not None:
+            location_out["image_index"] = image_index
+        if image_name:
+            location_out["image_name"] = image_name
         if section:
             location_out["section"] = section
 

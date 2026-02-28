@@ -113,6 +113,8 @@ def _row_to_block(row: dict[str, Any]) -> Block:
             page=location.get("page"),
             section=location.get("section"),
             section_tag=section_tag,
+            image_index=location.get("image_index"),
+            image_name=location.get("image_name"),
         ),
         block_id=row.get("block_id"),
         block_type=str(row.get("block_type") or "text"),
@@ -1412,11 +1414,18 @@ def annotate(
     for item in issue_rows:
         location = item["target"].get("location") or {}
         alt_count = len(item.get("alternate_targets", []))
+        image_index = location.get("image_index")
+        image_name = location.get("image_name")
+        image_suffix = ""
+        if image_index is not None:
+            image_suffix = f" image={image_index}"
+            if image_name:
+                image_suffix += f" image_name={image_name}"
         lines.append(
             "- "
             + (
                 f"{item['note']} | block={location.get('block_index')} page={location.get('page')} "
-                f"score={item['target'].get('score')} alt={alt_count}"
+                f"score={item['target'].get('score')} alt={alt_count}{image_suffix}"
             )
         )
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

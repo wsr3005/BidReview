@@ -4,9 +4,12 @@ import json
 import importlib.util
 import tempfile
 import unittest
+import xml.etree.ElementTree as etree
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
+from bidagent.annotators import annotate_docx_copy, annotate_pdf_copy
 from bidagent.io_utils import read_jsonl, write_jsonl
 from bidagent.pipeline import annotate, ingest
 
@@ -51,6 +54,65 @@ def _create_minimal_docx(path: Path, paragraphs: list[str]) -> None:
             ),
         )
         archive.writestr("word/document.xml", document_xml)
+
+
+def _create_minimal_docx_with_image_paragraph(path: Path) -> None:
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document '
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        "<w:body>"
+        "<w:p><w:r><w:t>前文</w:t></w:r></w:p>"
+        "<w:p><w:r><w:drawing>"
+        "<wp:inline><a:graphic><a:graphicData>"
+        "<pic:pic><pic:blipFill><a:blip r:embed=\"rIdImg1\"/></pic:blipFill></pic:pic>"
+        "</a:graphicData></a:graphic></wp:inline>"
+        "</w:drawing></w:r></w:p>"
+        "<w:p><w:r><w:t>后文</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    )
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Default Extension="png" ContentType="image/png"/>'
+                '<Override PartName="/word/document.xml" '
+                'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+                "</Types>"
+            ),
+        )
+        archive.writestr(
+            "_rels/.rels",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+                'Target="word/document.xml"/>'
+                "</Relationships>"
+            ),
+        )
+        archive.writestr(
+            "word/_rels/document.xml.rels",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rIdImg1" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                'Target="media/image1.png"/>'
+                "</Relationships>"
+            ),
+        )
+        archive.writestr("word/document.xml", document_xml)
+        archive.writestr("word/media/image1.png", b"fake-image")
 
 
 class AnnotateOutputTests(unittest.TestCase):
@@ -101,6 +163,38 @@ class AnnotateOutputTests(unittest.TestCase):
                 self.assertIn("commentReference", document_xml)
                 self.assertIn("R0001", comments_xml)
                 self.assertIn("relationships/comments", rels_xml)
+
+    def test_annotate_docx_copy_prefers_image_anchor_paragraph(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source_path = base / "bid.docx"
+            output_path = base / "annotated.docx"
+            _create_minimal_docx_with_image_paragraph(source_path)
+
+            stats = annotate_docx_copy(
+                source_path=source_path,
+                output_path=output_path,
+                issues=[
+                    {
+                        "requirement_id": "R0001",
+                        "severity": "high",
+                        "reason": "图片证据需复核",
+                        "target": {
+                            "location": {"block_index": 99, "image_index": 1, "image_name": "image1.png"}
+                        },
+                    }
+                ],
+            )
+
+            self.assertEqual(stats["annotated_notes"], 1)
+            with zipfile.ZipFile(output_path, "r") as archive:
+                root = etree.fromstring(archive.read("word/document.xml"))
+            ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            paragraphs = root.findall(".//w:p", ns)
+            self.assertEqual(len(paragraphs), 3)
+            self.assertNotIn("commentRangeStart", etree.tostring(paragraphs[0], encoding="unicode"))
+            self.assertIn("commentRangeStart", etree.tostring(paragraphs[1], encoding="unicode"))
+            self.assertNotIn("commentRangeStart", etree.tostring(paragraphs[2], encoding="unicode"))
 
     def test_annotate_returns_none_copy_when_locations_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -564,6 +658,47 @@ class AnnotateOutputTests(unittest.TestCase):
             reader = PdfReader(str(annotated_path))
             annots = reader.pages[0].get("/Annots")
             self.assertIsNotNone(annots)
+
+    @unittest.skipUnless(importlib.util.find_spec("pypdf") is not None, "pypdf is required")
+    def test_annotate_pdf_copy_uses_image_rect_for_anchor(self) -> None:
+        from pypdf import PdfReader, PdfWriter
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            source_path = base / "bid.pdf"
+            output_path = base / "annotated.pdf"
+
+            writer = PdfWriter()
+            writer.add_blank_page(width=595, height=842)
+            with source_path.open("wb") as handle:
+                writer.write(handle)
+
+            with patch(
+                "bidagent.annotators.list_pdf_page_image_anchors",
+                return_value=[{"image_index": 1, "rect": (40.0, 120.0, 180.0, 220.0)}],
+            ):
+                stats = annotate_pdf_copy(
+                    source_path=source_path,
+                    output_path=output_path,
+                    issues=[
+                        {
+                            "requirement_id": "R0001",
+                            "severity": "high",
+                            "reason": "图片证据需复核",
+                            "target": {"location": {"page": 1, "image_index": 1}},
+                        }
+                    ],
+                )
+
+            self.assertEqual(stats["annotated_notes"], 1)
+            reader = PdfReader(str(output_path))
+            annots = reader.pages[0]["/Annots"]
+            annot = annots[0].get_object()
+            rect = [float(value) for value in annot["/Rect"]]
+            self.assertAlmostEqual(rect[0], 192.0)
+            self.assertAlmostEqual(rect[1], 224.0)
+            self.assertAlmostEqual(rect[2], 430.0)
+            self.assertAlmostEqual(rect[3], 244.0)
 
 
 if __name__ == "__main__":

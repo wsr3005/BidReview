@@ -54,6 +54,25 @@ class EvidenceIndexTests(unittest.TestCase):
         self.assertEqual(indexed[0]["evidence_id"], "E-bid-p2-b7-text")
         self.assertEqual(indexed[1]["evidence_id"], "E-bid-p2-b7-text-n2")
 
+    def test_build_unified_evidence_index_preserves_image_anchor_fields(self) -> None:
+        rows = [
+            {
+                "doc_id": "bid",
+                "text": "营业执照扫描件",
+                "source_type": "ocr",
+                "location": {
+                    "block_index": 3,
+                    "page": 7,
+                    "image_index": 2,
+                    "image_name": "image2.png",
+                },
+            }
+        ]
+
+        indexed = build_unified_evidence_index(rows)
+        self.assertEqual(indexed[0]["location"]["image_index"], 2)
+        self.assertEqual(indexed[0]["location"]["image_name"], "image2.png")
+
     def test_retrieve_evidence_candidates_top_k_and_source_filter(self) -> None:
         indexed = build_unified_evidence_index(
             [

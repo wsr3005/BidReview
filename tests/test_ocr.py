@@ -7,7 +7,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from bidagent.ocr import _resolve_tesseract_lang, iter_pdf_ocr_blocks, load_ocr_engine
+from bidagent.ocr import (
+    _resolve_tesseract_lang,
+    denormalize_pdf_display_rect,
+    iter_pdf_ocr_blocks,
+    list_pdf_page_image_anchors,
+    load_ocr_engine,
+    normalize_pdf_rect_for_display,
+)
 
 
 class OcrBackendSelectionTests(unittest.TestCase):
@@ -81,9 +88,82 @@ class OcrPdfTests(unittest.TestCase):
             self.assertGreaterEqual(len(rows), 1)
             self.assertEqual(rows[0].location.section, "OCR_MEDIA")
             self.assertEqual(rows[0].location.page, 1)
+            self.assertEqual(rows[0].location.image_index, 1)
             self.assertGreaterEqual(int(stats.get("images_total", 0)), 1)
             self.assertGreaterEqual(int(stats.get("images_succeeded", 0)), 1)
             self.assertEqual(int(stats.get("images_failed", 0)), 0)
+
+    def test_list_pdf_page_image_anchors_reads_image_rect_from_content_stream(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            image_path = base / "evidence.png"
+            bid_pdf = base / "bid.pdf"
+
+            image = Image.new("RGB", (220, 80), "white")
+            image.save(image_path)
+            image.save(bid_pdf, "PDF")
+
+            from pypdf import PdfReader
+
+            page = PdfReader(str(bid_pdf)).pages[0]
+            anchors = list_pdf_page_image_anchors(page)
+
+            self.assertEqual(len(anchors), 1)
+            self.assertEqual(anchors[0]["image_index"], 1)
+            self.assertEqual(tuple(float(v) for v in anchors[0]["rect"]), (0.0, 0.0, 220.0, 80.0))
+
+    def test_list_pdf_page_image_anchors_supports_inline_images(self) -> None:
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import DecodedStreamObject
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            bid_pdf = base / "inline.pdf"
+
+            writer = PdfWriter()
+            page = writer.add_blank_page(width=200, height=200)
+            raw = (
+                b"q\n10 0 0 10 50 60 cm\nBI\n/W 1\n/H 1\n/BPC 8\n/CS /RGB\nID\n"
+                + bytes([255, 0, 0])
+                + b"\nEI\nQ\n"
+            )
+            stream = DecodedStreamObject()
+            stream.set_data(raw)
+            page.replace_contents(stream)
+            with bid_pdf.open("wb") as handle:
+                writer.write(handle)
+
+            page = PdfReader(str(bid_pdf)).pages[0]
+            anchors = list_pdf_page_image_anchors(page)
+
+            self.assertEqual(len(anchors), 1)
+            self.assertEqual(anchors[0]["image_index"], 1)
+            self.assertEqual(anchors[0]["resource_name"], "~0~")
+            self.assertEqual(tuple(float(v) for v in anchors[0]["rect"]), (50.0, 60.0, 60.0, 70.0))
+
+    def test_pdf_rect_display_normalization_respects_page_rotation(self) -> None:
+        from pypdf import PdfReader, PdfWriter
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            bid_pdf = base / "rotated.pdf"
+
+            writer = PdfWriter()
+            page = writer.add_blank_page(width=200, height=300)
+            page.rotate(90)
+            with bid_pdf.open("wb") as handle:
+                writer.write(handle)
+
+            page = PdfReader(str(bid_pdf)).pages[0]
+            display_rect = normalize_pdf_rect_for_display((30.0, 50.0, 50.0, 90.0), page)
+
+            self.assertEqual(display_rect, (50.0, 150.0, 90.0, 170.0))
+            self.assertEqual(
+                denormalize_pdf_display_rect(display_rect, page),
+                (30.0, 50.0, 50.0, 90.0),
+            )
 
     def test_iter_pdf_ocr_blocks_falls_back_to_secondary_engine(self) -> None:
         from PIL import Image

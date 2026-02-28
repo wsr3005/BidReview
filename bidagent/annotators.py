@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from bidagent.document import split_text_blocks
+from bidagent.ocr import denormalize_pdf_display_rect, list_pdf_page_image_anchors
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS = {"w": W_NS}
@@ -142,6 +143,15 @@ def _first_positive_block_index(location: object) -> int | None:
     return None
 
 
+def _first_positive_image_index(location: object) -> int | None:
+    if not isinstance(location, dict):
+        return None
+    image_index = location.get("image_index")
+    if isinstance(image_index, int) and image_index > 0:
+        return image_index
+    return None
+
+
 def _resolve_issue_anchor_block(
     issue: dict,
     *,
@@ -181,6 +191,36 @@ def _resolve_issue_anchor_block(
     return None
 
 
+def _resolve_issue_anchor_paragraph(
+    issue: dict,
+    *,
+    block_to_paragraph: dict[int, etree.Element],
+    image_to_paragraph: dict[int, etree.Element],
+) -> etree.Element | None:
+    candidate_images: list[int] = []
+
+    primary_image = _first_positive_image_index((issue.get("target") or {}).get("location"))
+    if primary_image is not None:
+        candidate_images.append(primary_image)
+
+    for alternate in issue.get("alternate_targets", []):
+        if not isinstance(alternate, dict):
+            continue
+        alternate_image = _first_positive_image_index(alternate.get("location"))
+        if alternate_image is not None:
+            candidate_images.append(alternate_image)
+
+    for image_index in candidate_images:
+        paragraph = image_to_paragraph.get(image_index)
+        if paragraph is not None:
+            return paragraph
+
+    anchor_block = _resolve_issue_anchor_block(issue, block_to_paragraph=block_to_paragraph)
+    if anchor_block is None:
+        return None
+    return block_to_paragraph.get(anchor_block)
+
+
 def annotate_docx_copy(
     source_path: Path,
     output_path: Path,
@@ -201,8 +241,13 @@ def annotate_docx_copy(
         _ensure_comments_rel(rels_root)
 
         block_to_paragraph: dict[int, etree.Element] = {}
+        image_to_paragraph: dict[int, etree.Element] = {}
         block_index = 0
+        image_index = 0
         for paragraph in document_root.findall(".//w:p", NS):
+            for _ in paragraph.iterfind(".//w:drawing", NS):
+                image_index += 1
+                image_to_paragraph[image_index] = paragraph
             text_parts = []
             for text_node in paragraph.iterfind(".//w:t", NS):
                 if text_node.text:
@@ -220,10 +265,11 @@ def annotate_docx_copy(
         next_comment_id = _next_comment_id(comments_root)
 
         for issue in issue_list:
-            anchor_block = _resolve_issue_anchor_block(issue, block_to_paragraph=block_to_paragraph)
-            if anchor_block is None:
-                continue
-            paragraph = block_to_paragraph.get(anchor_block)
+            paragraph = _resolve_issue_anchor_paragraph(
+                issue,
+                block_to_paragraph=block_to_paragraph,
+                image_to_paragraph=image_to_paragraph,
+            )
             if paragraph is None:
                 continue
             paragraph_identity = id(paragraph)
@@ -236,6 +282,9 @@ def annotate_docx_copy(
             _attach_comment_to_paragraph(paragraph, comment_id)
             _append_comment_entry(comments_root, comment_id, note)
             annotated_notes += 1
+
+        if annotated_notes <= 0:
+            return {"annotated_notes": 0, "annotated_paragraphs": 0}
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
@@ -279,12 +328,12 @@ def annotate_pdf_copy(
             "PDF annotation requires optional dependency `pypdf`. Install with: pip install pypdf"
         ) from exc
 
-    issues_by_page: dict[int, list[str]] = defaultdict(list)
+    issues_by_page: dict[int, list[tuple[str, int | None]]] = defaultdict(list)
     for issue in issues:
         location = (issue.get("target") or {}).get("location") or {}
         page = location.get("page")
         if isinstance(page, int) and page > 0:
-            issues_by_page[page].append(build_issue_note(issue))
+            issues_by_page[page].append((build_issue_note(issue), _first_positive_image_index(location)))
 
     if not issues_by_page:
         return {"annotated_notes": 0, "annotated_pages": 0}
@@ -294,6 +343,21 @@ def annotate_pdf_copy(
     for page in reader.pages:
         writer.add_page(page)
 
+    page_image_anchors: dict[int, dict[int, tuple[float, float, float, float]]] = {}
+    for page_no, page in enumerate(reader.pages, start=1):
+        anchors_by_index: dict[int, tuple[float, float, float, float]] = {}
+        for anchor in list_pdf_page_image_anchors(page):
+            image_index = _first_positive_image_index(anchor)
+            rect = anchor.get("rect_display") or anchor.get("rect")
+            if image_index is None or not isinstance(rect, (list, tuple)) or len(rect) < 4:
+                continue
+            try:
+                anchors_by_index[image_index] = tuple(float(rect[idx]) for idx in range(4))
+            except (TypeError, ValueError):
+                continue
+        if anchors_by_index:
+            page_image_anchors[page_no] = anchors_by_index
+
     annotated_notes = 0
     annotated_pages = 0
     for page_no, notes in issues_by_page.items():
@@ -302,13 +366,42 @@ def annotate_pdf_copy(
         page = writer.pages[page_no - 1]
         width = float(page.mediabox.right) - float(page.mediabox.left)
         height = float(page.mediabox.top) - float(page.mediabox.bottom)
-        y_top = height - 36
+        if int(getattr(page, "rotation", 0) or 0) % 360 in {90, 270}:
+            display_width = height
+            display_height = width
+        else:
+            display_width = width
+            display_height = height
+        max_image_slot = max((image_index or 0) for _, image_index in notes) or len(notes)
+        slot_height = max(84.0, (display_height - 84.0) / max(1, max_image_slot))
+        slot_offsets: dict[int, int] = defaultdict(int)
+        image_rect_offsets: dict[int, int] = defaultdict(int)
         page_touched = False
-        for idx, note in enumerate(notes):
-            top = y_top - (idx * 28)
-            if top < 48:
-                break
-            rect = (36, top - 20, min(width - 36, 340), top)
+        for idx, (note, image_index) in enumerate(notes, start=1):
+            rect: tuple[float, float, float, float] | None = None
+            anchor_rect = None
+            if image_index is not None:
+                anchor_rect = (page_image_anchors.get(page_no) or {}).get(image_index)
+            if anchor_rect is not None:
+                image_rect_offsets[image_index] += 1
+                display_rect = _pdf_note_rect_for_image_anchor(
+                    page_width=display_width,
+                    page_height=display_height,
+                    image_rect=anchor_rect,
+                    stack_index=image_rect_offsets[image_index] - 1,
+                )
+                rect = denormalize_pdf_display_rect(display_rect, page)
+            if rect is None:
+                anchor_slot = image_index if image_index is not None else idx
+                anchor_slot = min(max(anchor_slot, 1), max_image_slot)
+                top = display_height - 36.0 - ((anchor_slot - 1) * slot_height) - (slot_offsets[anchor_slot] * 28.0)
+                slot_offsets[anchor_slot] += 1
+                if top < 48:
+                    continue
+                fallback_display_rect = (36, top - 20, min(display_width - 36, 340), top)
+                rect = denormalize_pdf_display_rect(fallback_display_rect, page)
+            if rect is None:
+                continue
             annotation = Text(
                 rect=rect,
                 text=note,
@@ -325,3 +418,36 @@ def annotate_pdf_copy(
         writer.write(handle)
 
     return {"annotated_notes": annotated_notes, "annotated_pages": annotated_pages}
+
+
+def _pdf_note_rect_for_image_anchor(
+    *,
+    page_width: float,
+    page_height: float,
+    image_rect: tuple[float, float, float, float],
+    stack_index: int,
+) -> tuple[float, float, float, float]:
+    left, bottom, right, top = image_rect
+    note_width = min(304.0, max(160.0, page_width * 0.4))
+    note_height = 20.0
+    vertical_shift = float(max(0, stack_index)) * 24.0
+
+    preferred_left = min(max(24.0, right + 12.0), max(24.0, page_width - note_width - 24.0))
+    preferred_top = min(page_height - 24.0, top + 24.0 - vertical_shift)
+    if preferred_top < 44.0:
+        preferred_top = min(page_height - 24.0, top - vertical_shift)
+    if preferred_top < 44.0:
+        preferred_top = min(page_height - 24.0, max(top, bottom + note_height) - vertical_shift)
+    if preferred_top < 44.0:
+        preferred_top = page_height - 24.0
+
+    left_pos = max(24.0, min(preferred_left, page_width - note_width - 24.0))
+    right_pos = min(page_width - 24.0, left_pos + note_width)
+    if right_pos - left_pos < 60.0:
+        left_pos = max(24.0, page_width - note_width - 24.0)
+        right_pos = min(page_width - 24.0, left_pos + note_width)
+
+    bottom_pos = max(24.0, preferred_top - note_height)
+    top_pos = min(page_height - 24.0, max(bottom_pos + note_height, preferred_top))
+    bottom_pos = max(24.0, top_pos - note_height)
+    return (left_pos, bottom_pos, right_pos, top_pos)
