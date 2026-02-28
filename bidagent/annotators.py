@@ -133,19 +133,61 @@ def _attach_comment_to_paragraph(paragraph: etree.Element, comment_id: int) -> N
     paragraph.append(ref_run)
 
 
+def _first_positive_block_index(location: object) -> int | None:
+    if not isinstance(location, dict):
+        return None
+    block_index = location.get("block_index")
+    if isinstance(block_index, int) and block_index > 0:
+        return block_index
+    return None
+
+
+def _resolve_issue_anchor_block(
+    issue: dict,
+    *,
+    block_to_paragraph: dict[int, etree.Element],
+) -> int | None:
+    if not block_to_paragraph:
+        return None
+
+    max_text_block = max(block_to_paragraph)
+    candidate_indexes: list[int] = []
+
+    primary_index = _first_positive_block_index((issue.get("target") or {}).get("location"))
+    if primary_index is not None:
+        candidate_indexes.append(primary_index)
+
+    for alternate in issue.get("alternate_targets", []):
+        if not isinstance(alternate, dict):
+            continue
+        alternate_index = _first_positive_block_index(alternate.get("location"))
+        if alternate_index is not None:
+            candidate_indexes.append(alternate_index)
+
+    for block_index in candidate_indexes:
+        if block_index in block_to_paragraph:
+            return block_index
+
+    # OCR-derived blocks are appended after the original text blocks and cannot be
+    # annotated directly in the DOCX XML. When no text block maps cleanly, anchor
+    # the note to the nearest available text block instead of dropping it.
+    for block_index in candidate_indexes:
+        if block_index > max_text_block:
+            return max_text_block
+        if block_index < 1:
+            continue
+        return min(max(1, block_index), max_text_block)
+
+    return None
+
+
 def annotate_docx_copy(
     source_path: Path,
     output_path: Path,
     issues: Iterable[dict],
 ) -> dict:
-    issues_by_block: dict[int, list[str]] = defaultdict(list)
-    for issue in issues:
-        location = (issue.get("target") or {}).get("location") or {}
-        block_index = location.get("block_index")
-        if isinstance(block_index, int) and block_index > 0:
-            issues_by_block[block_index].append(build_issue_note(issue))
-
-    if not issues_by_block:
+    issue_list = [issue for issue in issues if isinstance(issue, dict)]
+    if not issue_list:
         return {"annotated_notes": 0, "annotated_paragraphs": 0}
 
     with zipfile.ZipFile(source_path, "r") as zin:
@@ -177,20 +219,23 @@ def annotate_docx_copy(
         touched_paragraph_ids: set[int] = set()
         next_comment_id = _next_comment_id(comments_root)
 
-        for idx, notes in issues_by_block.items():
-            paragraph = block_to_paragraph.get(idx)
+        for issue in issue_list:
+            anchor_block = _resolve_issue_anchor_block(issue, block_to_paragraph=block_to_paragraph)
+            if anchor_block is None:
+                continue
+            paragraph = block_to_paragraph.get(anchor_block)
             if paragraph is None:
                 continue
             paragraph_identity = id(paragraph)
             if paragraph_identity not in touched_paragraph_ids:
                 annotated_paragraphs += 1
                 touched_paragraph_ids.add(paragraph_identity)
-            for note in notes:
-                comment_id = next_comment_id
-                next_comment_id += 1
-                _attach_comment_to_paragraph(paragraph, comment_id)
-                _append_comment_entry(comments_root, comment_id, note)
-                annotated_notes += 1
+            note = build_issue_note(issue)
+            comment_id = next_comment_id
+            next_comment_id += 1
+            _attach_comment_to_paragraph(paragraph, comment_id)
+            _append_comment_entry(comments_root, comment_id, note)
+            annotated_notes += 1
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:

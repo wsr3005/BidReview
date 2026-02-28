@@ -1763,6 +1763,72 @@ def _format_primary_evidence(finding: dict[str, Any], limit: int = 80) -> str:
     )
 
 
+def _resolve_trace_evidence_refs(finding: dict[str, Any], ref_key: str) -> list[dict[str, Any]]:
+    trace = finding.get("decision_trace")
+    if not isinstance(trace, dict):
+        return []
+    refs = trace.get(ref_key)
+    if not isinstance(refs, list):
+        return []
+
+    evidence = finding.get("evidence", [])
+    evidence_by_id: dict[str, dict[str, Any]] = {}
+    if isinstance(evidence, list):
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            evidence_id = str(item.get("evidence_id") or "").strip()
+            if evidence_id and evidence_id not in evidence_by_id:
+                evidence_by_id[evidence_id] = item
+
+    resolved: list[dict[str, Any]] = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        merged = dict(ref)
+        detailed = evidence_by_id.get(str(ref.get("evidence_id") or "").strip())
+        if isinstance(detailed, dict):
+            for key in ("doc_id", "location", "score", "excerpt", "reference_only", "has_action"):
+                if merged.get(key) in (None, "", {}):
+                    merged[key] = detailed.get(key)
+        resolved.append(merged)
+    return resolved
+
+
+def _format_evidence_entry(prefix: str, item: dict[str, Any], *, limit: int = 60) -> str:
+    if not item:
+        return f"{prefix}: none"
+    location = item.get("location")
+    excerpt = _sanitize_md_text(item.get("excerpt") or "", limit=limit)
+    line = (
+        f"{prefix}: "
+        + f"{item.get('evidence_id', 'N/A')} "
+        + f"{_format_trace_location(location)} "
+        + f"score={item.get('score', 'N/A')}"
+    )
+    if excerpt:
+        line += f' "{excerpt}"'
+    return line
+
+
+def _format_evidence_summary(finding: dict[str, Any], limit: int = 80) -> str:
+    support_evidence = _resolve_trace_evidence_refs(finding, "evidence_refs")
+    counter_evidence = _resolve_trace_evidence_refs(finding, "counter_evidence_refs")
+    if counter_evidence:
+        support = _choose_primary_evidence(
+            support_evidence or finding.get("evidence", []),
+            status=str(finding.get("status") or ""),
+        )
+        counter = _choose_primary_evidence(counter_evidence)
+        return " | ".join(
+            (
+                _format_evidence_entry("support", support, limit=max(40, limit // 2)),
+                _format_evidence_entry("counter", counter, limit=max(40, limit // 2)),
+            )
+        )
+    return _format_primary_evidence(finding, limit=limit)
+
+
 def _safe_ratio(numerator: int, denominator: int) -> float:
     if denominator <= 0:
         return 0.0
@@ -3269,7 +3335,7 @@ def report(out_dir: Path) -> dict[str, Any]:
     for item in blocking_findings:
         requirement = req_map.get(item["requirement_id"], {})
         trace_text = _format_finding_trace(item)
-        evidence_text = _format_primary_evidence(item)
+        evidence_text = _format_evidence_summary(item)
         tier = str(requirement.get("rule_tier") or "general")
         lines.append(
             "- "
@@ -3407,6 +3473,7 @@ def run_pipeline(
     # Even when resuming expensive upstream stages, keep downstream deliverables fresh.
     # This also guarantees a new timestamped annotated copy after each `run`.
     downstream_resume = False
+    summary["consistency"] = consistency(out_dir=out_dir, resume=downstream_resume)
     summary["annotate"] = annotate(
         out_dir=out_dir,
         resume=downstream_resume,
@@ -3414,7 +3481,6 @@ def run_pipeline(
         blocking_only=True,
     )
     summary["checklist"] = checklist(out_dir=out_dir, resume=downstream_resume)
-    summary["consistency"] = consistency(out_dir=out_dir, resume=downstream_resume)
     summary["report"] = report(out_dir=out_dir)
     eval_metrics = _load_eval_metrics(out_dir)
     summary["eval"] = {
